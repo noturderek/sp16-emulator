@@ -16,7 +16,7 @@ The firmware talks to its hardware through a small set of interfaces. The emulat
 | Analog board: filter send/return loop, high-pass DAC, MAIN OUT, INPUT LEVEL, CUTOFF, RESONANCE | `hardware_stub.c` board model (see [Analog board model](#analog-board-model)); host-only pot positions from `panel.py` through a shared state file |
 | GPIO lines (filter select, input limiter, MIDI thru, USB-A power and over-current) | `hardware_stub.c` serves `/dev/gpiodrv` (one byte per line); changes are logged and reported in `metrics.guest.board.gpio` |
 | DIN MIDI (factory test only) | `hardware_stub.c` serves `/dev/ttymxc1` and `/dev/din_midi` as one OUT-to-IN loopback cable when the firmware runs its factory test mode |
-| Internal storage | a per-firmware 1 GB data image (`data/emmc.img`), formatted once |
+| Internal storage | a per-firmware 1 GB data image (`data/emmc.img`), formatted once; `./sp16 run --ephemeral` uses a disposable one with no saved project and no lock, so a second app can run the same firmware |
 | USB stick | an optional raw image attached at launch (`--usb-image`), FAT32 |
 | Backlight, media notifications, helper processes | `hardware_stub.c` (unknown device nodes and ioctls fail loudly and are counted) |
 
@@ -29,14 +29,14 @@ profile ([profiles.md](profiles.md)).
 | Part | Files (in `emulator/`) |
 |---|---|
 | One command for all of the below | `sp16emu.py` (`./sp16`; `make` for the common configurations) |
-| Build, launch and firmware commands | `native.py` |
+| Build, launch and firmware commands | `native.py`; `qemu_reaper.py` (started with QEMU: stops it, after a clean guest stop, when the app quits, crashes or is killed) |
 | Firmware library and importer, host side (stdlib only) | `firmware.py`, `profiles.py`, `recipes.py`, `fwpack.py` |
 | Diagnostics for bug reports (stdlib only; the app bundles a copy) | `diagnostics.py` |
-| Linux guest base image | `Dockerfile.native-base`, `pack-guest.sh`, `guest-init.sh`, `guest-firmware.py` (import and repack in the guest), `guest-bridge.py`, `enter.py`, `input.py` |
+| Linux guest base image | `Dockerfile.native-base`, `pack-guest.sh`, `guest-init.sh`, `guest-firmware.py` (import and repack in the guest), `prepare.py` (unpacks an update's layers without running its programs), `guest-bridge.py`, `enter.py`, `input.py` |
 | Hardware shim (ARM preload library) | `hardware_stub.c` |
 | Panel model and wire protocol | `panel.py`, `panel_map.py`, `protocol.py` |
 | macOS app | `native-window.swift`, `panel-view.swift`, `panel-layout.json`, `firmware-window.swift`, `firmware-library.swift`, `app-diagnostics.swift`, `data-image.swift`, `audio-sink.swift`, `audio-output.swift`, `make-icon.swift` |
-| Developer tools | `fwdev.py`, `sessionctl.py`, `e2e-screen.py`, `pcm-tap-analyze.py`, `arm-contracts.sh` |
+| Developer tools | `fwdev.py`, `sessionctl.py`, `e2e-screen.py`, `pcm-tap-analyze.py`, `arm-contracts.sh`, `exectrace.py` (reads `--trace exec` output), `gdb-bridge.py` (host side of `--trace gdb`), `audio-selftest.swift` (`./sp16 audio selftest`) |
 | Hardware conformance suite | `hwsuite.py` |
 | Data | `profiles/*.json`, `profiles/products/sp16.json` |
 
@@ -49,7 +49,12 @@ audio paths run as on the hardware:
   ADC). The shim queues the send frames and returns them one period later through a two-pole low-pass (CUTOFF and
   RESONANCE, pots no microcontroller reads) and a two-pole high-pass whose cutoff follows the 12-bit code the
   firmware writes to `/dev/dac_spi4.0` (one 2-byte write per change of the HP CUTOFF pot word). ACTIVE drives the filter
-  select GPIO line; how the firmware uses the return (and when it feeds the send) is not yet understood.
+  select GPIO line. **Open item:** the firmware decides what feeds the send, and in the sessions tried normal sampler
+  playback has not put signal there, so the loop only carries the research `filter_tone` and LP CUTOFF, RESONANCE, HP
+  CUTOFF and ACTIVE have no audible effect on playback yet. `metrics.guest.board.filter_loop` is absent while the loop
+  carries nothing.
+- **DRIVE** has no model here: the firmware reads the pot as an ADC word (`0x26`) and applies it itself. The emulator
+  only supplies the word, and it leaves the DAC code alone (HW-30 checks that).
 - **MAIN OUT** is an analog volume after the master DAC: the shim scales the master channels the host receives (the
   firmware still gets the pot position as an ADC word). **INPUT LEVEL** scales the input capture.
 - A control the host never moved is neutral (unity gain, low-pass open), so a session that does not touch them sounds
@@ -167,6 +172,12 @@ A research build (`--research`) can add one opt-in qemu-user trace of the OEM ap
 `strace` streams the syscalls to `console.txt`, `gdb` opens the qemu-user gdb stub (`-g 1234`) for lldb, `pcmtap`
 records the first 4 s of each playback stream, and `exec` records which translation blocks the app executes.
 
+For `gdb` the guest has no network beyond loopback, so the stub is tunnelled out over a dedicated virtio-serial port
+to a unix socket next to the session's control socket. `emulator/gdb-bridge.py --build <name>` (or `--socket PATH`)
+listens on `127.0.0.1:1234` and splices one client at a time to it; then `lldb` and `gdb-remote 127.0.0.1:1234`
+attach. The app stays halted at its entry point until the debugger continues it, so attach before expecting the
+firmware's screen. The bridge keeps running, so you can detach and attach again.
+
 `exec` runs the app with `-d exec,nochain -dfilter 0x116f8..0x831ca8` (the 1.60 app's text range; `SP16_EXEC_RANGE` in
 `guest-init.sh`). The raw log is one line per executed block, far too much for the serial console, so it goes to a fifo
 that a small guest filter reads. Every app start (including `app-restart`) is a new qemu-user that numbers its guest
@@ -197,7 +208,8 @@ not activate itself, so it takes no focus. Only the app's gate stops the scroll;
 not. The research socket, LCD snapshots and panelshots are unchanged (they never pass through the panel's input
 handlers), the window still closes and Cmd-Q still quits, and the session's `runtime.json` records `"ui_input": false`.
 
-An audio build (`--audio file` or `both`) writes three WAVs of about 9.5 MB a minute each into the session folder.
+An audio build (`--audio file` or `both`) writes three WAVs of about 21 MB a minute each (about 64 MB a minute together)
+into the session folder.
 `./sp16 run --no-audio-files` keeps the audio sink (it still reads every PCM packet from the guest and keeps the
 counters that `metrics` reports, so the guest's audio path and timing are those of a file build) but opens no WAV:
 for unattended runs that read no audio. A `both` build keeps playing through CoreAudio. The metrics' audio `mode` says

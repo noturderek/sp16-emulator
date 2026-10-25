@@ -144,8 +144,11 @@ It runs these steps in order, skips what is already done and says so, and can be
 unpacked safely into a temporary folder that is deleted again), launch. The first build takes a few minutes (QEMU is
 compiled, then Docker builds the guest image). If it stops, read the message: it names the fix, and the same command
 continues where it stopped. An existing build made with another audio mode is not touched unless you add `--rebuild`.
+`--stick-size SIZE` sizes a new stick (64M to 32G; default: the smallest of 1G to 32G that holds the files),
+`--firmware-name TEXT` names the imported firmware, and `--no-run` does everything except the launch.
 
-If the user cannot hear anything: raise the track VOLUME in the emulator, check the Mac's output device, and see the
+If the user cannot hear anything: raise the track VOLUME in the emulator (the first launch of a firmware has no saved
+project, and the mixer then starts at volume 0), check the Mac's output device, and see the
 README's "Audio" section and the sp16-emulator-setup skill's troubleshooting table ("Slow tempo or crackling").
 
 ## 8. You are running: checklist for the user

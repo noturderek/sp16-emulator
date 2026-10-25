@@ -154,5 +154,11 @@ made any other way (edited by hand, a changed byte, a different tool) can be imp
 it is intact and was encrypted with the correct key, and runs as **unverified** with the reason recorded in the
 library. Repacked updates take recipes only (`files/` and `preload/` stay developer overlays).
 
+An update made by other means can carry its own preload library. The emulator starts the application directly and never
+runs the firmware's `apl_start`, so it honours that launcher itself: when the application's folder holds
+`sp16-preload.so` and the firmware's `apl_start` contains the marker line `# SP16_PRELOAD_LAUNCHER`, the library is
+loaded after the hardware shim (and before any developer-overlay libraries), and the console shows `SP16_FW_LAUNCHER
+preload=<path>`. Both come from the hash-checked firmware image. A stock update carries neither, so it boots unchanged.
+
 A repacked update contains the vendor's firmware. Keep it in `private/`, never distribute it and never flash it to a
 device.

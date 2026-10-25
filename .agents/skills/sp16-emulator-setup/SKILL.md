@@ -97,7 +97,7 @@ shows the panel; the LCD settles on the home screen after about 10 seconds.
 For an unattended, scripted run of a research build (driven by `./sp16 ctl` or the control socket), add
 `--no-ui-input`: the window then ignores clicks, scrolling, keys and accessibility actions and opens without taking
 focus, so someone using the Mac cannot change what the script measures (details: `docs/architecture.md`, Bench mode).
-If the run reads no audio, add `--no-audio-files` too: an audio build then writes no WAVs (about 28 MB a minute
+If the run reads no audio, add `--no-audio-files` too: an audio build then writes no WAVs (about 64 MB a minute
 otherwise) while its audio counters keep counting.
 
 ## 5a. Samples on the virtual USB stick

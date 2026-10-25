@@ -33,7 +33,7 @@ titles, probe coordinates, lamp roles). A check whose profile data is missing is
 | Driver coverage | HW-45 | every device node and ioctl the firmware uses is served; unknown ones are reported |
 | Analog board model | HW-46 | ACTIVE drives the filter select line; the shim's filter loop carries a tone injected at the filter input; headphone levels with ACTIVE on/off and CUTOFF open/lowest are recorded, not judged (how the firmware uses the return is still open) |
 
-Tiers: **smoke** (16 checks, about 6 minutes), **core** (all but the soak), **full** (all 46, about 31 minutes).
+Tiers: **smoke** (16 checks, about 8 minutes), **core** (all but the soak), **full** (all 46, about 31 minutes).
 Only a full-tier run can mark a profile verified.
 
 ## Running it
@@ -66,6 +66,10 @@ stick images; no firmware content), and writes `hwsuite-result.json` and `hwsuit
 Timing checks record the host load and are reported `BLOCKED` when the Mac is too busy (more than three emulators,
 or a high load average). Run the suite on an otherwise idle Mac.
 
+HW-24 (pad calibration state) compares against the control build above. Without it the suite prints that the control
+check is not run, reports HW-24 as `BLOCKED` ("no --control-build given") and exits 2 even when every other check
+passes; that is a missing build, not a failure.
+
 ## Marking a profile verified
 
 `./sp16 hwsuite --tier full --mark-verified` writes the profile's verification block, and nothing else may. It requires one
@@ -75,5 +79,7 @@ profile declares absent, on the exact firmware image and profile being marked.
 ## Not in this suite
 
 Firmware features (menus, sequencer editing, effects, scales, project workflows) belong to a per-version feature
-check, not to hardware verification. Hardware that is not emulated is listed as such in every compatibility report:
-MIDI, sync, audio inputs and live sampling, output routing beyond the main stereo pair, the analog filter, network.
+check, not to hardware verification. Hardware that is not emulated is listed as such in every suite report: MIDI beyond
+the factory test's DIN loopback and USB-B MIDI, sync sources and PRO DJ LINK, audio input and live sampling (a research
+tone stands in for the input), output routing beyond the main stereo pair, the analog filter acting on sampler playback
+(the filter loop exists but only carries a research tone), network and physical pad force.

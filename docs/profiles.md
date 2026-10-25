@@ -42,6 +42,13 @@ What every update of the product shares; used by the importer before a version h
 `device_nodes`, `device_nodes_unserved`, `ioctl_set`, `hardware.absent`. `null` means "not yet measured"; the
 checks that need it are `BLOCKED` until it is.
 
+Lamp and button data the suite checks every button and lamp against: `button_effects` (the visible effect of each
+button role, or of a raw bit, which HW-09 looks for after a press), `lamp_unassigned` (channels and extra flags known
+never to be driven, with a note), `lamp_required` (roles that must be seen in two states), `lamp_extra_driven` (the
+extra flags the firmware does drive) and `ioctl_set_note` / `lamp_required_note` (why the lists are what they are);
+HW-14 fails on a driven channel the profile does not account for. `derived_from` is written by `./sp16 firmware
+profile` and names the profile whose measurements a candidate started from.
+
 ### Verification record
 
 `verification` = `{method, result, date, evidence}`. A candidate carries `result: pending`. `./sp16 hwsuite --tier

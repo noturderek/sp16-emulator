@@ -127,6 +127,14 @@ firmware; projects and settings persist there across launches. Close the window 
 under another name, `./sp16 run --name <name>` launches that one; if the build does not exist, the error says
 which `./sp16 build` command creates it.
 
+**What a start looks like.** The panel starts with the filter wide open (DRIVE, RESONANCE and HIGH PASS CUTOFF at
+minimum, LOW PASS CUTOFF at maximum, MAIN OUT centred) and ACTIVE off: the firmware lights ACTIVE at every start, so the
+emulator presses it once after boot (see [the analog board model](docs/architecture.md#analog-board-model)). A normal
+launch resumes the project saved in the firmware's data image, so the mixer comes back as you left it. `./sp16 run
+--ephemeral` uses a disposable data image instead: nothing you do persists and there is no saved project, so the mixer
+starts at volume 0 (track 1 reads VOLUME 0). Use it for scripted runs and for a second app, since two apps cannot share
+one firmware's data image.
+
 `./sp16 firmware list` lists imports; `select`, `rename`, `remove`, `show` and `check --id <id>` manage them. In
 the app, Firmware > Library does the same.
 
@@ -198,7 +206,7 @@ the Python 3.12+ for the build tools.
 | Command | What it does |
 |---|---|
 | `doctor` | Check your Mac (Apple silicon, macOS, Command Line Tools, Python, Docker, disk space, git) and print the fixes |
-| `build` | Build the app into `build/<name>`: `--audio`, `--audio-device`, `--research`, `--trace` (strace, gdb, pcmtap, exec), `--uncalibrated`, `--pad-calibration-value`, `--bundle-suffix`, `--library`, `--reuse-qemu-from`, `--rebuild` |
+| `build` | Build the app into `build/<name>`: `--audio`, `--audio-device`, `--research`, `--trace` (strace, gdb, pcmtap, exec), `--app-arg` (research: start the app with an argument such as `testmode`), `--uncalibrated`, `--pad-calibration-value`, `--bundle-suffix`, `--library`, `--reuse-qemu-from`, `--no-reuse-qemu`, `--rebuild` |
 | `run` | Launch a build: `--firmware`, `--usb-image` (default `build/stick.img` when it exists), `--no-usb`, `--ephemeral`, `--dev-overlay`, `--no-ui-input` (bench mode: the window ignores input, for scripted runs), `--no-audio-files` (audio builds: count the audio, write no WAV) |
 | `bootstrap` | Everything in one go: `doctor`, build with audio, import and select firmware (`--update` or `--download-firmware`), fill the stick (`--samples`, `--projects`, folders or zips), launch; skips what is done, `--dry-run` lists the steps |
 | `usb create\|add\|ls\|mount\|unmount` | Prepare the virtual USB stick on the Mac without booting: load samples (`add --dest Projects` for project files), list, mount (see [Load your own samples](#5-load-your-own-samples-optional)) |
@@ -249,6 +257,33 @@ integrity checks are the same for every version (a changed library image is refu
 
 To turn an unverified version into a verified one, see [docs/architecture.md](docs/architecture.md#adding-a-firmware-version).
 
+## Current state
+
+**Works** (checked on firmware 1.60):
+
+- Boot to a settled home screen with live lamps; buttons, pads, encoders, the selector, the touch strip, the LCD and
+  touch; the power/standby key (`./sp16 ctl press power`); internal storage that persists across launches.
+- Audio: three playback streams, silent, recorded to WAV files or played through CoreAudio (`--audio`).
+- The virtual USB stick mounts and the firmware reads it (samples and projects: [step 5](#5-load-your-own-samples-optional)).
+- The analog board, as far as the firmware can see it: MAIN OUT and INPUT LEVEL act on the host side, the filter-select
+  and limiter lines are served, HP CUTOFF comes back out as the firmware's control-voltage code (read in the metrics),
+  and the filter loop passes a research test tone through the low-pass and high-pass.
+- The factory test mode (`--research --app-arg testmode`) with a DIN MIDI loopback cable. The DEVICE TEST page's
+  network query is answered with fixed values so the page no longer hangs; that fix is covered by contract tests and has
+  not been run end to end.
+- Research tools: the control socket (`./sp16 ctl`), `--trace` (strace, gdb, pcmtap, exec), the hardware suite, the
+  smoke test and the mod tooling.
+
+**Not there yet:**
+
+- LOW PASS CUTOFF, RESONANCE, HIGH PASS CUTOFF and ACTIVE do not change the sound of normal sampler playback: in the
+  sessions tried nothing the firmware plays reaches the filter loop, which so far only carries the research
+  `filter_tone`. The cutoff and resonance laws of the model are assumptions, not measurements. DRIVE has no emulator
+  model: the firmware reads the pot as an ADC word and applies it itself.
+- Not emulated: MIDI beyond the factory test's loopback, USB-B, sync and PRO DJ LINK, network, audio input and live
+  sampling (the research input tone stands in), and output routing beyond the main stereo pair.
+- A version is only `verified` by a full-tier hardware suite run ([docs/hardware-suite.md](docs/hardware-suite.md)).
+
 ## Load a modified firmware
 
 The repository ships the tooling to develop and run mods, not any mod. You write your own (or use a mod archive
@@ -285,7 +320,8 @@ make build-dev build-control      # build/sp16-dev and build/sp16-dev-uncal, sha
 ./sp16 hwsuite --smoke         # profile = the version of the selected firmware; --profile 1.60 to choose
 ```
 
-See [docs/hardware-suite.md](docs/hardware-suite.md) for the full steps.
+The smoke tier takes about 8 minutes. Without the control build, check HW-24 (uncalibrated pads) is `BLOCKED` and the
+run exits 2, which is not a failure. See [docs/hardware-suite.md](docs/hardware-suite.md) for the full steps.
 
 ## Troubleshooting
 
@@ -309,6 +345,8 @@ See [docs/hardware-suite.md](docs/hardware-suite.md) for the full steps.
 | `usb ...: already attached to this Mac` | Release it with `./sp16 usb unmount`, then repeat. `./sp16 run` also starts without the stick (and says why) while the Mac holds it. |
 | `usb ...: cannot attach` | The image has no FAT32 file system (for example a zero-filled file). Recreate it with `./sp16 usb create --force`, or `usb add` formats a blank image by itself. |
 | `usb ...: cannot mount ... privacy protection` (clone in Downloads, Desktop, Documents or iCloud Drive) | macOS privacy protection refuses some disk operations in those folders, even though the image itself is fine (`./sp16 doctor` warns about the location). Move the clone (for example to `~/src/sp16-emulator`) or give your terminal app Full Disk Access (System Settings > Privacy & Security), then repeat. |
+| The window opens but the emulator never boots, and `qemu-stderr.txt` says `Failed to get "consistent read" lock` | Another emulator already uses this firmware's data image, or the Mac has the image attached (for example after an `hdiutil attach`). Quit the other emulator, stopping only its process ids, or start the second one with `--ephemeral`. `hdiutil info \| grep -F emmc.img` shows an attachment; `diskutil eject <device>` releases it. |
+| The mixer shows volume 0 | You started with `--ephemeral` or on a brand-new data image, which has no saved project yet. A normal launch resumes the saved one. |
 | The window is black | Read `console.txt` in the newest folder under `build/sp16/sessions/`. |
 | The app quit or crashed | Start it again: it offers to collect diagnostics. Then see [Reporting a bug](#reporting-a-bug). The newest folder under `build/sp16/sessions/` holds `app.log` (the app's log) and `qemu-stderr.txt`. |
 

@@ -282,9 +282,10 @@ def render_report(result):
     lines += ["", "## N/A", ""] + ([f"- {item['id']}: {item['reason']}" for item in na] or ["- none (check level)"])
     lines += [f"- {hw} sub-result {s['name']}: {s.get('observed', '')}" for hw, s in na_subs]
     lines += ["", "## Not emulated (stub register; see docs/hardware-suite.md, Not in this suite)", "",
-              "MIDI IN/OUT/THRU and USB-B MIDI; sync sources and PRO DJ LINK; audio input, THROUGH and live sampling; "
-              "output routing, headphone and multichannel outputs; analog filter, resonance and DSP; network and USB host "
-              "hotplug beyond HW-36..39; physical pad force; the SHIFT lamp and strip LEDs 9-10.", ""]
+              "MIDI beyond the factory test's DIN loopback, and USB-B MIDI; sync sources and PRO DJ LINK; audio input, "
+              "THROUGH and live sampling (a research tone stands in for the input); output routing and multichannel "
+              "outputs beyond the main stereo pair; the analog filter acting on sampler playback, and DSP (the filter loop "
+              "only carries a research tone); network and USB host hotplug beyond HW-36..39; physical pad force.", ""]
     return "\n".join(lines)
 
 
