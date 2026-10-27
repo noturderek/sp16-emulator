@@ -1,3 +1,18 @@
+---
+title: "Lane l4-network: guest NIC and Pro DJ Link follower"
+description: "What changed for ./sp16 run --net, the fake tempo master, and why the Pro DJ Link follower is parked."
+type: report
+status: active
+created: 2026-10-27
+tags: [sp16, emulator, network, prodjlink]
+author:
+  harness: claude-code
+  agent: emu-l4-network
+  model: claude-sonnet-5-5
+  thinking: unknown
+  tokens: unknown
+---
+
 # Lane l4-network: a NIC for the guest, and the Pro DJ Link follower
 
 Tasks `pt-i44.38` (NIC) and `pt-i44.39` (follow a fake tempo master). Grades: O observed, S static, I inferred, U unknown.
