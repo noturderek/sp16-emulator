@@ -219,6 +219,7 @@ struct PanelRenderState {
     var stripTouch: Int?
     var lcdImage: CGImage?
     var debugOverlay = false
+    var bloom = true                    // additive glow around lit keys, buttons and LEDs
 
     func look(_ id: UInt8) -> LampLook {
         guard feedbackLive else { return .unknown }
@@ -832,10 +833,49 @@ final class PanelRenderer {
 
     func drawDynamic(_ ctx: CGContext, state: PanelRenderState, scale s: CGFloat, dirty: CGRect) {
         drawLCD(ctx, state: state, dirty: dirty)
-        for c in layout.controls where c.frame.insetBy(dx: -30, dy: -30).intersects(dirty) {
+        for c in layout.controls where c.frame.insetBy(dx: -PanelRenderer.dirtyReach, dy: -PanelRenderer.dirtyReach).intersects(dirty) {
             drawControlDynamic(ctx, c, state, s)
         }
+        if state.bloom && state.feedbackLive { drawBloom(ctx, state: state, dirty: dirty) }
         if state.debugOverlay { drawDebug(ctx) }
+    }
+
+    /// Canvas units around a control that its drawing (shadow glow, bloom) may reach; the dirty-rect margin.
+    static let dirtyReach: CGFloat = 40
+    static let bloomReach: CGFloat = 34
+
+    /// Soft additive halo over the frame around every lit key, button and LED, drawn after all controls so it also
+    /// lights its neighbours and the chassis. Static lamps cost one gradient each and only inside the dirty rect;
+    /// nothing animates, so an idle panel repaints nothing. The LCD glass is excluded from the halo.
+    private func drawBloom(_ ctx: CGContext, state: PanelRenderState, dirty: CGRect) {
+        let reach = PanelRenderer.bloomReach
+        var lit: [(PanelLayout.Control, LampColor)] = []
+        for c in layout.controls where c.kind != .knob && c.kind != .analog && c.kind != .selector && c.kind != .strip {
+            guard !(c.kind == .lamp && c.shape == "text"), case .lit(let col) = state.look(c.id),
+                  c.frame.insetBy(dx: -reach, dy: -reach).intersects(dirty) else { continue }
+            lit.append((c, col))
+        }
+        guard !lit.isEmpty else { return }
+        ctx.saveGState()
+        ctx.clip(to: dirty)
+        // Keep the halo off the LCD glass (even-odd: everything but the bezel).
+        ctx.addRect(dirty.insetBy(dx: -reach, dy: -reach)); ctx.addRect(layout.lcd.bezel.rect); ctx.clip(using: .evenOdd)
+        ctx.setBlendMode(.plusLighter)
+        for (c, col) in lit {
+            let f = c.frame
+            let big = max(f.width, f.height)
+            let strength: CGFloat = c.kind == .lamp ? 0.5 : (big > 60 ? 0.34 : 0.42)
+            let halfH = f.height / 2, outer = halfH + reach
+            let edge = halfH / outer
+            ctx.saveGState()
+            ctx.translateBy(x: f.midX, y: f.midY)
+            ctx.scaleBy(x: (f.width / 2 + reach) / outer, y: 1)
+            ctx.fillRadial([(0, col.lighter(0.25).cg(strength * 0.5)), (edge * 0.9, col.cg(strength * 0.55)),
+                            (edge + (1 - edge) * 0.35, col.cg(strength * 0.22)), (1, col.cg(0))],
+                           center: .zero, radius: outer)
+            ctx.restoreGState()
+        }
+        ctx.restoreGState()
     }
 
     func drawLCD(_ ctx: CGContext, state: PanelRenderState, dirty: CGRect, rect: CGRect? = nil) {
@@ -1449,7 +1489,7 @@ final class PanelView: NSView, NSViewToolTipOwner {
         guard !lcdOnly, let t = panelTransform else { return }
         for id in ids {
             guard let c = controlIndex[id] else { continue }
-            setNeedsDisplay(t.toView(c.frame.insetBy(dx: -30, dy: -30)))
+            setNeedsDisplay(t.toView(c.frame.insetBy(dx: -PanelRenderer.dirtyReach, dy: -PanelRenderer.dirtyReach)))
         }
     }
 
