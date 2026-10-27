@@ -244,6 +244,15 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             firmwareItem.submenu = firmwareMenu
             menu.addItem(helpMenuItem())
         }
+        let viewItem = NSMenuItem(); menu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let rear = NSMenuItem(title: "Rear I/O Panel", action: #selector(toggleRearPanel(_:)), keyEquivalent: "r")
+        rear.target = self
+        viewMenu.addItem(rear)
+        let glow = NSMenuItem(title: "Lamp Glow", action: #selector(toggleLampGlow(_:)), keyEquivalent: "")
+        glow.target = self
+        viewMenu.addItem(glow)
+        viewItem.submenu = viewMenu
         let inputItem = NSMenuItem(); menu.addItem(inputItem)
         let inputMenu = NSMenu(title: "Input")
         let release = NSMenuItem(title: "Release All Holds", action: #selector(releaseAllHolds), keyEquivalent: ".")
@@ -254,6 +263,18 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     @objc func releaseAllHolds() { panel.releaseAll() }
+
+    @objc func toggleRearPanel(_ sender: NSMenuItem) { panel.showRear.toggle() }
+    @objc func toggleLampGlow(_ sender: NSMenuItem) { panel.lampBloom.toggle() }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(toggleRearPanel(_:)): item.state = panel.showRear ? .on : .off
+        case #selector(toggleLampGlow(_:)): item.state = panel.lampBloom ? .on : .off
+        default: break
+        }
+        return true
+    }
 
     var libraryWindow: FirmwareLibraryWindow?
     @objc func showFirmwareLibrary() {
@@ -635,6 +656,12 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 }
             }
             return ok ? "{\"ok\":true}" : "{\"error\":\"panelshot failed\"}"
+        case "view":
+            // View toggles for screenshots: rear on|off, glow on|off.
+            guard let name = command["name"] as? String, ["rear", "glow"].contains(name),
+                  let on = command["on"] as? Bool else { return "{\"error\":\"view needs name rear|glow and on true|false\"}" }
+            DispatchQueue.main.sync { if name == "rear" { self.panel.showRear = on } else { self.panel.lampBloom = on } }
+            return "{\"ok\":true}"
         case "period":
             guard let ms = int("ms"), (1...50).contains(ms) else { return "{\"error\":\"period needs ms 1-50\"}" }
             sendBody([Kind.research, 5, UInt8(ms)]); return "{\"ok\":true}"
