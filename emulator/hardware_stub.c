@@ -1043,6 +1043,17 @@ static float bm_exp2(float x) { /* 2^x, relative error < 1e-4 for |x| < 60 */
     return r;
 }
 #define BM_DECADES3 9.965784f /* log2(1000): 20 Hz .. 20 kHz over the pot or DAC range */
+static float bm_log2(float x) { /* log2 for x > 0, error < 1e-4: exponent from the bits, mantissa by an atanh series */
+    uint32_t bits; memcpy(&bits,&x,4);
+    int e=(int)((bits>>23)&0xff)-127;
+    bits=(bits&0x7fffffu)|0x3f800000u; float m; memcpy(&m,&bits,4); /* [1,2) */
+    float t=(m-1)/(m+1), t2=t*t;
+    return (float)e+2.8853901f*t*(1+t2/3*(1+t2*3/5*(1+t2*5/7)));
+}
+/* Level scale (grade I, not measured on a unit): the converters' full scale is the rated maximum level of the jacks,
+ * +16 dBu (input and output). The dBu readouts in the metrics are dBFS + 16. */
+#define FS_DBU 16.0f
+static float to_dbu(float peak) { return peak>1e-6f?FS_DBU+6.0205999f*bm_log2(peak):-99.0f; }
 
 /* DAC7811 (high-pass control voltage): the app writes one little-endian 16-bit word per change, only when the
  * HPF pot word changes. The word is control nibble (bits 15..12) + 12-bit code. Logged on change, at most one line
@@ -1208,28 +1219,69 @@ static void loop_return(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frame
         loop_send_peak=loop_return_peak=0; loop_report_ns=now;
     }
 }
+/* Level meters for the metrics: peaks over the report window (linear, 1.0 = converter full scale). */
+static float meter_in_peak, meter_out_peak;
+static unsigned long meter_limited;
+static int meter_source, meter_limiter_logged=-1;  /* 0 off, 1 tone */
+static uint64_t meter_report_ns;
 /* MAIN OUT: an analog volume on the master jacks, applied to the copy the host hears (the app's own buffer, the PCM
  * tap and the firmware's ADC word are untouched). Which master channels feed OUT1-2 is not mapped yet, so it scales
  * every channel the transport sends from the master stream. */
 static void main_out_scale(struct ax_ring *r,uint8_t *data,uint32_t frames) {
     struct analog a=analog_now;
-    if (!a.main_set || a.main_gain==1) return;
     unsigned w=r->width, count=frames*r->sent_ch;
-    for (unsigned i=0;i<count;i++) bm_put(data+(size_t)i*w,(int)r->fmt,bm_get(data+(size_t)i*w,(int)r->fmt)*a.main_gain);
+    int scale=a.main_set && a.main_gain!=1;
+    for (unsigned i=0;i<count;i++) {
+        uint8_t *q=data+(size_t)i*w;
+        float v=bm_get(q,(int)r->fmt)*(scale?a.main_gain:1);
+        if (scale) bm_put(q,(int)r->fmt,v);
+        float m=v<0?-v:v; if (m>meter_out_peak) meter_out_peak=m;
+    }
 }
-/* Input jack: silence unless the host turned on the test tone; INPUT LEVEL scales it. The null plugin leaves a capture
+/* Input jack: silence unless the host turned on the test tone. Chain, as on the board: INPUT LEVEL gain, then the input
+ * limiter when the firmware has switched it on (GPIO5_IO06), then the converter. The null plugin leaves a capture
  * buffer untouched, so silence is written (all-zero bytes are 0 in every format the codec takes, and 0.0 in FLOAT_LE)
  * or the app's reused buffer would keep the last tone samples. */
+/* Input limiter (GPIO5_IO06, the AUDIO TEST LIMIT button). Level above the threshold is soft-saturated towards full
+ * scale. The threshold and curve are assumptions (grade U: the unit's limiter was not measured); high = on (grade I,
+ * from the line name LMT_xOFF/ON). Below the threshold the signal passes unchanged. */
+#define LIMITER_THRESHOLD 0.5f
+static int limiter_on(void) {
+    return __atomic_load_n(&gpio_written[4*32+6],__ATOMIC_ACQUIRE) && __atomic_load_n(&gpio_level[4*32+6],__ATOMIC_ACQUIRE)==1;
+}
+static float limit_soft(float x) {
+    float a=x<0?-x:x;
+    if (a<=LIMITER_THRESHOLD) return x;
+    float over=(a-LIMITER_THRESHOLD)/(1-LIMITER_THRESHOLD), y=LIMITER_THRESHOLD+(1-LIMITER_THRESHOLD)*over/(1+over);
+    return x<0?-y:y;
+}
+static void meter_report(uint64_t now,int force) {
+    int lim=limiter_on();
+    if (!force && lim==meter_limiter_logged && now-meter_report_ns<2000000000ULL) return;
+    if (!force && lim==meter_limiter_logged && meter_in_peak<=0 && meter_out_peak<=0) { meter_report_ns=now; return; }
+    struct analog a=analog_now;
+    static const char *const names[]={"off","tone"};
+    float in=meter_in_peak, out=meter_out_peak;
+    meter_report_ns=now; meter_limiter_logged=lim;
+    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu=%.1f out_peak=%.4f out_dbu=%.1f limited=%lu "
+            "main_out_gain=%.4f input_gain=%.4f source=%s\n",lim,(double)in,(double)to_dbu(in),(double)out,(double)to_dbu(out),
+            meter_limited,(double)a.main_gain,(double)a.input_gain,names[meter_source]);
+    meter_in_peak=meter_out_peak=0; meter_limited=0;
+}
 static void input_fill(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames) {
     struct analog a=analog_now;
     unsigned w=bm_width(s->format);
     if (!w || !s->channels || frames<=0 || !buffer) return;
+    int limiter=limiter_on();
+    meter_source=a.tone_amp>0?1:0;
     if (a.tone_amp<=0) { memset(buffer,0,(size_t)frames*w*s->channels); return; }
     float rate=(float)(s->rate?s->rate:44100), step=2*BM_PI*a.tone_hz/rate, amp=a.tone_amp*a.input_gain;
     uint8_t *p=buffer; unsigned bpf=w*s->channels;
     for (snd_pcm_sframes_t i=0;i<frames;i++,p+=bpf) {
         float y=amp*bm_sin(s->phase);
         s->phase+=step; if (s->phase>BM_PI) s->phase-=2*BM_PI;
+        float m=y<0?-y:y; if (m>meter_in_peak) meter_in_peak=m;
+        if (limiter) { float l=limit_soft(y); if (l!=y) meter_limited++; y=l; }
         for (unsigned c=0;c<s->channels;c++) bm_put(p+c*w,s->format,y);
     }
 }
@@ -1246,6 +1298,7 @@ static void pace(snd_pcm_t *handle,snd_pcm_sframes_t frames,unsigned method) {
     if (frames<=0) return;
     uint64_t step=(uint64_t)frames*1000000000ULL/s->rate, now=mono_ns();
     analog_refresh(now);
+    meter_report(now,0);
     dac_flush(now);
     if (!s->deadline_ns || now>s->deadline_ns+PCM_MAX_LAG_NS) s->deadline_ns=now;
     s->deadline_ns+=step;

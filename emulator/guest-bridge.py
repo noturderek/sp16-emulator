@@ -93,6 +93,8 @@ IOCTL_SEEN = re.compile(r"\[sp16-ui-stub\] ioctl accepted request=(0x[0-9a-f]{1,
 DAC_WORD = re.compile(r"\[sp16-ui-stub\] dac hpf word=0x([0-9a-f]{4}) ctrl=(\d+) code=(\d+) writes=(\d+)$")
 FILTER_LOOP = re.compile(r"\[sp16-ui-stub\] filter loop send_peak=([0-9.]+) return_peak=([0-9.]+) frames=(\d+) "
                          r"underruns=(\d+) drops=(\d+) lp_hz=(\d+) hp=(dac|off)$")
+ANALOG_LEVELS = re.compile(r"\[sp16-ui-stub\] analog levels limiter=([01]) in_peak=([0-9.]+) in_dbu=(-?[0-9.]+) out_peak=([0-9.]+) "
+                           r"out_dbu=(-?[0-9.]+) limited=(\d+) main_out_gain=([0-9.]+) input_gain=([0-9.]+) source=(off|tone)$")
 GPIO_LINE = re.compile(r"\[sp16-ui-stub\] gpio (GPIO\d_IO\d\d)=([01]) ([A-Za-z_/?]+)$")
 MIDI_LOOP = re.compile(r"\[sp16-ui-stub\] midi loopback (/dev/[a-z0-9_]+) first bytes=(\d+)$")
 
@@ -108,6 +110,14 @@ def board_line(line):
         return "filter_loop", {"send_peak": float(match.group(1)), "return_peak": float(match.group(2)),
                                "frames": int(match.group(3)), "underruns": int(match.group(4)),
                                "drops": int(match.group(5)), "lp_hz": int(match.group(6)), "hp": match.group(7)}
+    match = ANALOG_LEVELS.match(line)
+    if match:
+        # in/out: peak over the report window (1.0 = converter full scale); dBu = dBFS + 16 (grade I, not measured)
+        return "analog_levels", {"limiter_active": match.group(1) == "1", "in_peak": float(match.group(2)),
+                                 "in_dbu": float(match.group(3)), "out_peak": float(match.group(4)),
+                                 "out_dbu": float(match.group(5)), "limited_samples": int(match.group(6)),
+                                 "main_out_gain": float(match.group(7)), "input_gain": float(match.group(8)),
+                                 "source": match.group(9)}
     match = MIDI_LOOP.match(line)
     if match:
         return "midi_loopback", {"node": match.group(1), "first_bytes": int(match.group(2))}
