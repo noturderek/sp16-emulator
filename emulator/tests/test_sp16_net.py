@@ -74,5 +74,41 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(args[3], "stream,id=sp16net,server=off,addr.type=unix,addr.path=/x/socket_vmnet")
 
 
+
+class FakeMasterTests(unittest.TestCase):
+    """Packet layouts of net/fake_master.py (also checked by hand against python-prodj-link's parser)."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("fake_master", TOOLS / "net/fake_master.py")
+        self.master = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.master)
+
+    def test_keepalive_is_54_bytes_with_name_mac_and_ip(self):
+        packet = self.master.keepalive("CDJ-3000", 2, bytes.fromhex("020000000007"), bytes([169, 254, 1, 2]))
+        self.assertEqual((len(packet), packet[:10], packet[0x0a]), (54, b"Qspt1WmJOL", 0x06))
+        self.assertEqual(packet[0x0c:0x14], b"CDJ-3000")
+        self.assertEqual((packet[0x24], packet[0x26:0x2c], packet[0x2c:0x30]),
+                         (2, bytes.fromhex("020000000007"), bytes([169, 254, 1, 2])))
+
+    def test_beat_packet_carries_pitch_bpm_beat_and_distances(self):
+        import struct
+        packet = self.master.beat_packet("CDJ-3000", 1, 128.0, 0.02, 3, 100)
+        self.assertEqual((len(packet), packet[0x0a], packet[0x23]), (96, 0x28, 0x3c))
+        distances = struct.unpack(">6I", packet[0x24:0x3c])
+        self.assertEqual(distances[0], 100)
+        self.assertAlmostEqual(distances[2] - distances[0], 60000 / 130.56, delta=1)  # beat 3: one beat after the next, the bar
+        pitch, _, bpm, beat = struct.unpack(">IHHB", packet[0x54:0x5d])
+        self.assertEqual((pitch, bpm, beat), (round(1.02 * 0x100000), 12800, 3))
+
+    def test_status_packet_flags_master_sync_play(self):
+        import struct
+        packet = self.master.status_packet("CDJ-3000", 1, 128.0, 0.02, 2, 7)
+        self.assertEqual((len(packet), packet[0x0a], packet[0x21]), (212, 0x0a, 1))
+        self.assertEqual(packet[0x89] & 0x78, 0x78)
+        self.assertEqual(struct.unpack(">H", packet[0x92:0x94])[0], 12800)
+        self.assertEqual((struct.unpack(">I", packet[0xa0:0xa4])[0], packet[0xa6]), (7, 2))
+
+
 if __name__ == "__main__":
     unittest.main()
