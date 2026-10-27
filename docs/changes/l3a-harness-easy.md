@@ -1,3 +1,18 @@
+---
+title: Lane l3a-harness-easy
+description: "Panel protocol round-trip tests and a layout overlay tool: what each checks, results, offsets and open questions."
+type: report
+status: complete
+created: 2026-10-27
+tags: [sp16, emulator, tests, panel, layout]
+author:
+  harness: claude-code
+  agent: emu-l3a-harness-easy
+  model: claude-haiku-5-5
+  thinking: high
+  tokens: unknown
+---
+
 # Lane l3a-harness-easy
 
 Two test and tool additions for the panel layout. No existing file was changed.
