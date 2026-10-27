@@ -582,6 +582,7 @@ typedef unsigned long snd_pcm_uframes_t;
 typedef long snd_pcm_sframes_t;
 /* Diagnostic counters (logged every few seconds) so audio pacing can be measured, not guessed. */
 struct ax_ring;
+#define CODEC_RATE 44100u /* the only rate the codec clock offers, see codec_rate_fixed */
 struct pcm_state { snd_pcm_t *handle; unsigned int rate; int stream; char name[24];
                    uint64_t calls, frames, slept_ns, reported_ns, deadline_ns; int tid;
                    uint32_t logged; uint8_t io_logged; struct pcm_tap *tap; struct ax_ring *ax;
@@ -640,7 +641,7 @@ int snd_pcm_open(snd_pcm_t **handle, const char *name, int stream, int mode) {
     if (matched) {
         fprintf(stderr,"[sp16-ui-stub] PCM %s -> null stream=%d result=%d\n",name,stream,result);
         if (!result) for (unsigned i=0;i<16;i++) if (!pcms[i].handle) {
-            pcms[i]=(struct pcm_state){.handle=*handle,.rate=48000,.stream=stream};
+            pcms[i]=(struct pcm_state){.handle=*handle,.rate=CODEC_RATE,.stream=stream};
             snprintf(pcms[i].name,sizeof(pcms[i].name),"%s",name); break; }
     }
     return result;
@@ -670,6 +671,15 @@ static int codec_refuses(const struct pcm_state *s,int format) {
     if (!s || (any && !strcmp(any,"1")) || strncmp(s->name,"hw:ak4452audio,",15)) return 0;
     return format!=2 && format!=6 && format!=36;
 }
+/* The codec master clock is 1024 x 44.1 kHz and has no other setting (service manual clock tree), so every board PCM
+ * accepts 44100 Hz only. set_rate refuses anything else as a driver restricted to one rate would; set_rate_near
+ * answers 44100 whatever was asked, the way a near-search over a one-element rate set does. SP16_PCM_ANY_RATE=1
+ * (research) restores the null plugin's answer. */
+static int codec_rate_fixed(const struct pcm_state *s) {
+    const char *any=getenv("SP16_PCM_ANY_RATE");
+    return s && !(any && !strcmp(any,"1"));
+}
+static int codec_rate_refused(const struct pcm_state *s,unsigned int rate) { return codec_rate_fixed(s) && rate!=CODEC_RATE; }
 int snd_pcm_hw_params_set_format(snd_pcm_t *handle,snd_pcm_hw_params_t *params,int format) {
     int (*real)(snd_pcm_t *,snd_pcm_hw_params_t *,int)=alsa_symbol("snd_pcm_hw_params_set_format");
     if (!real) { errno=ENOSYS; return -ENOSYS; }
@@ -691,8 +701,9 @@ int snd_pcm_hw_params_set_channels(snd_pcm_t *handle,snd_pcm_hw_params_t *params
 int snd_pcm_hw_params_set_rate(snd_pcm_t *handle,snd_pcm_hw_params_t *params,unsigned int rate,int direction) {
     int (*real)(snd_pcm_t *,snd_pcm_hw_params_t *,unsigned int,int)=alsa_symbol("snd_pcm_hw_params_set_rate");
     if (!real) { errno=ENOSYS; return -ENOSYS; }
-    int result=real(handle,params,rate,direction);
     struct pcm_state *s=pcm(handle);
+    int result=codec_rate_refused(s,rate)?-EINVAL:real(handle,params,rate,direction);
+    if (!result && s) s->rate=rate;
     if (s && first_time(s,3)) fprintf(stderr,"[sp16-ui-stub] PCM %s set_rate requested=%u dir=%d result=%d\n",
                                       s->name,rate,direction,result);
     return result;
@@ -702,8 +713,10 @@ int snd_pcm_hw_params_set_rate_near(snd_pcm_t *handle,snd_pcm_hw_params_t *param
     if (!real) real=alsa_symbol("snd_pcm_hw_params_set_rate_near");
     if (!real) { errno=ENOSYS; return -ENOSYS; }
     unsigned int requested=rate?*rate:0; int requested_dir=direction?*direction:0;
+    struct pcm_state *s=pcm(handle);
+    if (codec_rate_fixed(s) && rate) { *rate=CODEC_RATE; if (direction) *direction=0; } /* the clock offers one rate only */
     int result=real(handle,params,rate,direction);
-    struct pcm_state *s=pcm(handle); if (!result && s && rate && *rate) s->rate=*rate;
+    if (!result && s && rate && *rate) s->rate=*rate;
     if (s && first_time(s,4)) fprintf(stderr,"[sp16-ui-stub] PCM %s set_rate_near requested=%u dir=%d returned=%u dir=%d result=%d\n",
                                       s->name,requested,requested_dir,rate?*rate:0,direction?*direction:0,result);
     return result;
