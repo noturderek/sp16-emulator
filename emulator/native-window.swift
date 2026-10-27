@@ -455,13 +455,16 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     func metrics() -> [String: Any] {
+        // Read before taking `lock`: the main thread takes it in renderLatest, so a main.sync under it could deadlock.
+        let redraw = Thread.isMainThread ? panel.redrawStats.json : DispatchQueue.main.sync { panel.redrawStats.json }
         lock.lock(); defer { lock.unlock() }
         return ["frames": frameCount, "uptime_seconds": ProcessInfo.processInfo.systemUptime - started,
                 "ack_ms": ackSamples.summary(), "visible_ms": visibleSamples.summary(),
                 "input_results": ["ok": resultCounts[0], "unsupported": resultCounts[1],
                                    "failed": resultCounts[2], "invalid": resultCounts[3]],
                 "pending_controls": controlTimes.count, "lamps_live": lampsLive,
-                "feedback_generation": feedbackGeneration, "guest": guestStats]
+                "feedback_generation": feedbackGeneration, "guest": guestStats,
+                "panel_redraw": redraw]
             .merging(audioSink.map { ["audio": $0.snapshot()] } ?? [:]) { first, _ in first }
     }
 
@@ -687,6 +690,12 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             guard let data = try? JSONSerialization.data(withJSONObject: reply, options: [.sortedKeys]),
                   let text = String(data: data, encoding: .utf8) else { return "{\"error\":\"firmware\"}" }
             return text
+        case "redraw-bench":
+            // Mean ms of a whole-view repaint (what every update would cost without dirty rects), for comparison
+            // with panel_redraw in `metrics`.
+            var ms = 0.0
+            DispatchQueue.main.sync { ms = self.panel.benchmarkFullRedraw(count: min(500, max(1, int("count") ?? 60))) }
+            return "{\"ok\":true,\"full_redraw_ms\":\(ms)}"
         case "metrics":
             guard let data = try? JSONSerialization.data(withJSONObject: metrics(), options: [.sortedKeys]),
                   let text = String(data: data, encoding: .utf8) else { return "{\"error\":\"metrics\"}" }

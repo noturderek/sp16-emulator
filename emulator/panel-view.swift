@@ -1276,7 +1276,9 @@ final class PanelView: NSView, NSViewToolTipOwner {
     private var loadError: String?
     private let toolbar = PanelToolbar(frame: .zero)
     private var state = PanelRenderState()
-    private var staticCache: (image: CGImage, key: StaticKey)?
+    /// The last two static layers: the window's scale and the offscreen scale of panelshot/cacheDisplay alternate, and
+    /// one slot would rebuild the whole chassis on every switch.
+    private var staticCache: [(image: CGImage, key: StaticKey)] = []
     private var axElements: [PanelAccessibilityElement]?
     private var input = InputState()
     private var observers: [NSObjectProtocol] = []
@@ -1431,6 +1433,7 @@ final class PanelView: NSView, NSViewToolTipOwner {
     }
 
     func setStatus(_ text: String) {
+        guard toolbar.status.stringValue != text else { return }
         toolbar.status.stringValue = text
         toolbar.status.toolTip = text
     }
@@ -1443,7 +1446,43 @@ final class PanelView: NSView, NSViewToolTipOwner {
 
     // MARK: Drawing
 
+    /// Host redraw cost, for metrics.json: passes through draw(_:), their wall time and how much of the view each
+    /// repainted (dirty-rect area as a fraction of the view).
+    struct RedrawStats {
+        var passes = 0, totalMs = 0.0, maxMs = 0.0, areaFraction = 0.0, full = 0
+        mutating func add(ms: Double, fraction: Double) {
+            passes += 1; totalMs += ms; maxMs = max(maxMs, ms); areaFraction += fraction
+            if fraction > 0.95 { full += 1 }
+        }
+        var json: [String: Any] {
+            ["passes": passes, "total_ms": totalMs, "ms_per_pass": passes > 0 ? totalMs / Double(passes) : 0, "max_ms": maxMs,
+             "mean_area_fraction": passes > 0 ? areaFraction / Double(passes) : 0, "full_passes": full]
+        }
+    }
+    private(set) var redrawStats = RedrawStats()
+
+    /// Forces `count` whole-view repaints and returns their mean wall time in ms: the cost without dirty rects.
+    func benchmarkFullRedraw(count: Int) -> Double {
+        let saved = redrawStats
+        // cacheDisplay always paints the whole view, even when the window is hidden or occluded (displayIfNeeded may not).
+        // One warm-up pass builds the static layer for the bitmap's scale, so the timed passes are the dynamic layer only.
+        var start = ProcessInfo.processInfo.systemUptime
+        if let rep = bitmapImageRepForCachingDisplay(in: bounds) {
+            cacheDisplay(in: bounds, to: rep)
+            start = ProcessInfo.processInfo.systemUptime
+            for _ in 0..<max(1, count) { cacheDisplay(in: bounds, to: rep) }
+        }
+        let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000 / Double(max(1, count))
+        redrawStats = saved
+        return ms
+    }
+
     override func draw(_ dirtyRect: NSRect) {
+        let began = ProcessInfo.processInfo.systemUptime
+        defer {
+            redrawStats.add(ms: (ProcessInfo.processInfo.systemUptime - began) * 1000,
+                            fraction: Double(dirtyRect.width * dirtyRect.height / max(1, bounds.width * bounds.height)))
+        }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         guard let renderer, let t = panelTransform else {
             drawFailure(ctx)
@@ -1451,12 +1490,15 @@ final class PanelView: NSView, NSViewToolTipOwner {
         }
         let scale = abs(ctx.convertToDeviceSpace(CGSize(width: 1, height: 0)).width)
         let key = StaticKey(size: bounds.size, scale: scale, lcdOnly: lcdOnly)
-        if staticCache?.key != key {
-            staticCache = renderer.makeStaticLayer(viewSize: bounds.size, scale: scale, transform: t, lcdOnly: lcdOnly).map { ($0, key) }
+        if let hit = staticCache.firstIndex(where: { $0.key == key }) {
+            if hit != 0 { staticCache.insert(staticCache.remove(at: hit), at: 0) }
+        } else if let image = renderer.makeStaticLayer(viewSize: bounds.size, scale: scale, transform: t, lcdOnly: lcdOnly) {
+            staticCache.insert((image, key), at: 0)
+            if staticCache.count > 2 { staticCache.removeLast() }
         }
         ctx.saveGState()
         ctx.clip(to: dirtyRect)
-        if let image = staticCache?.image {
+        if let image = staticCache.first?.image {
             ctx.translateBy(x: 0, y: bounds.height)
             ctx.scaleBy(x: 1, y: -1)
             ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
