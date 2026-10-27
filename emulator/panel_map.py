@@ -158,13 +158,15 @@ LAMP_IDS = {name: lamp for lamp, name in LAMP_NAMES.items()}
 # segments 15-22 bottom to top, step n = RGB n-1 and pad n = RGB 0x10+n-1.
 LAMP_ROLES = profiles.lamp_roles(PROFILE)
 
-# Mono lamps are single-colour; this is only the host presentation colour.
-MONO_COLORS = {"over_led": (255, 40, 40), "rec": (255, 40, 40), "active": (255, 60, 60), "usb_stop": (255, 60, 60),
-               "play": (60, 255, 90), "lamp_pitch": (150, 255, 90), "lamp_repeat": (150, 255, 90),
-               "lamp_user1": (150, 255, 90), "lamp_user2": (150, 255, 90),
-               **{f"bar_led{i}": (60, 255, 90) for i in range(1, 5)},
+# Mono lamps are single-colour; this is only the host presentation colour. OVER (amber), USB CONNECT (yellow-green),
+# the REC and PLAY light pipes, the bar and strip LEDs are sampled from the manufacturer's top-view product render
+# and match the service manual's LED matrix colour classes (p11).
+MONO_COLORS = {"over_led": (255, 218, 68), "usb_led": (159, 241, 61), "rec": (255, 51, 91), "active": (255, 60, 60),
+               "usb_stop": (255, 60, 60), "play": (85, 247, 90), "lamp_pitch": (150, 255, 90),
+               "lamp_repeat": (150, 255, 90), "lamp_user1": (150, 255, 90), "lamp_user2": (150, 255, 90),
+               **{f"bar_led{i}": (91, 241, 49) for i in range(1, 5)},
                **{f"bar{i}": (70, 140, 255) for i in range(1, 5)},
-               **{f"strip_led{i}": (70, 130, 255) for i in range(1, 9)}}
+               **{f"strip_led{i}": (7, 124, 255) for i in range(1, 9)}}
 DIM = 0.35
 # E12: TX byte 0x6e is the PAD/BUTTON BRIGHTNESS level (Utility: NORMAL = 4, DIMMED 1..3 = 3..1).
 # The firmware already scales the RGB lamp bytes with it (step lamp 0x4a/0x25/0x18/0x12 at levels
@@ -177,6 +179,29 @@ def brightness_scale(level):
     return level / BRIGHTNESS_MAX if 1 <= level <= BRIGHTNESS_MAX else 1.0
 # E8: the all-lamps-on test page and step/pad lamps reach 0x4a; scale RGB to the full range.
 RGB_FULL = 74
+
+
+def led_srgb(duty):
+    """LED PWM duty 0..1 is linear light; return the sRGB-encoded 0..1 value a display needs. Without this the
+    firmware's dim track colours (about 22/74 per channel in MUTE mode) draw as muddy near-black hues."""
+    duty = min(1.0, max(0.0, duty))
+    return 12.92 * duty if duty <= 0.0031308 else 1.055 * duty ** (1 / 2.4) - 0.055
+
+
+# A lit RGB LED under a diffuser reads as a vivid colour even at low duty, which a flat screen cannot show by
+# luminance alone; the peak channel of a lit RGB lamp is lifted to at least this fraction (hue kept), so dim states
+# (MUTE-mode track colours at about 22/74) stay as recognisable as on the unit. Full duty is unchanged.
+LIT_RGB_FLOOR = 0.5
+
+
+def rgb_lamp(raw):
+    """Firmware RGB lamp bytes (0..RGB_FULL each) -> display (r, g, b)."""
+    srgb = [led_srgb(v / RGB_FULL) for v in raw]
+    peak = max(srgb)
+    if peak <= 0:
+        return (0, 0, 0)
+    lift = (LIT_RGB_FLOOR + (1 - LIT_RGB_FLOOR) * peak) / peak
+    return tuple(round(255 * min(1.0, c * lift)) for c in srgb)
 
 # E3/E10: velocity -> (raw A, raw B).
 # 1.60 profile: A_MIN 172 (with the staged all-242 calibration A=169 registers, A=168 does not), A_MAX 874 (firmware
@@ -209,7 +234,7 @@ def decode_lamps(frame):
 
     Mono lamps: first bit lit; where a second flag exists, 0 = full brightness and 1 = dim
     (observed: the active pad-mode button has the flag clear). RGB lamps are normalised
-    against RGB_FULL.
+    against RGB_FULL. Both are PWM duty (linear light) and are sRGB-encoded for display (led_srgb).
     """
     raw = decode_tx(frame)
     if raw is None:
@@ -219,10 +244,10 @@ def decode_lamps(frame):
     level = brightness_scale(raw["level"])
     for role, (kind, channel) in LAMP_ROLES.items():
         if kind == "rgb":
-            lamps[ids[role]] = tuple(min(255, v * 255 // RGB_FULL) for v in raw["rgb"][channel])
+            lamps[ids[role]] = rgb_lamp(raw["rgb"][channel])
             continue
         lit, flag = raw["mono"][channel]
         base = MONO_COLORS.get(role, (255, 255, 255))
-        scale = 0.0 if not lit else (DIM if flag else 1.0) * level
+        scale = 0.0 if not lit else led_srgb((DIM if flag else 1.0) * level)
         lamps[ids[role]] = tuple(round(c * scale) for c in base)
     return lamps

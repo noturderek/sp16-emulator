@@ -80,6 +80,7 @@ struct PanelLayout: Decodable {
         let radius: CGFloat?, lineWidth: CGFloat?, from: CGFloat?, to: CGFloat?, tick: CGFloat?
         let count: Int?
         let gaps: [[CGFloat]]?, points: [[CGFloat]]?
+        let width0: CGFloat?, width1: CGFloat?    // "arc": stroke width at `from` and at `to` (tapered scale)
         var rect: CGRect { CGRect(x: x ?? 0, y: y ?? 0, width: w ?? 0, height: h ?? 0) }
     }
 
@@ -275,9 +276,10 @@ final class PanelRenderer {
 
         ctx.saveGState()
         ctx.addPath(body); ctx.clip()
-        ctx.fillLinear([(0, hexColor(0x2b2c2f)), (0.012, hexColor(0x1f2022)), (0.5, hexColor(0x161719)), (1, hexColor(0x101112))],
+        let face = CGRect(x: 0, y: 0, width: cv.width, height: cv.plinthTop)
+        if let metal = brushedMetal(face.size, base: 29, rowSigma: 5.5, streakSigma: 5, seed: 7) { ctx.draw(metal, in: face) }
+        ctx.fillLinear([(0, hexColor(0xffffff, 0.10)), (0.012, hexColor(0xffffff, 0)), (0.8, hexColor(0, 0)), (1, hexColor(0, 0.18))],
                        from: .zero, to: CGPoint(x: 0, y: cv.plinthTop))
-        brush(ctx, CGRect(x: 0, y: 0, width: cv.width, height: cv.plinthTop), strength: 0.055, seed: 7)
 
         // Side rails
         let rw = cv.railWidth
@@ -297,15 +299,51 @@ final class PanelRenderer {
         // Plinth
         let plinth = CGRect(x: 0, y: cv.plinthTop, width: cv.width, height: cv.height - cv.plinthTop)
         ctx.saveGState(); ctx.clip(to: plinth)
-        ctx.fillLinear([(0, hexColor(0x2c2d30)), (0.15, hexColor(0x202123)), (1, hexColor(0x161719))],
+        if let metal = brushedMetal(plinth.size, base: 47, rowSigma: 3.5, streakSigma: 8, seed: 29) { ctx.draw(metal, in: plinth) }
+        ctx.fillLinear([(0, hexColor(0xffffff, 0.08)), (0.15, hexColor(0, 0)), (1, hexColor(0, 0.22))],
                        from: CGPoint(x: 0, y: plinth.minY), to: CGPoint(x: 0, y: plinth.maxY))
-        brush(ctx, plinth, strength: 0.09, seed: 29)
         ctx.restoreGState()
         ctx.line(CGPoint(x: rw, y: cv.plinthTop), CGPoint(x: cv.width - rw, y: cv.plinthTop), hexColor(0, 0.8), 2)
         ctx.line(CGPoint(x: rw, y: cv.plinthTop + 2), CGPoint(x: cv.width - rw, y: cv.plinthTop + 2), hexColor(0xffffff, 0.1), 1)
         ctx.restoreGState()
 
         ctx.stroke(path: roundedPath(rect.insetBy(dx: 0.5, dy: 0.5), cv.cornerRadius), color: hexColor(0xffffff, 0.14), width: 1)
+    }
+
+    /// Hairline-brushed aluminium, measured on the product's top-view render: a flat grey base, crisp per-row offsets
+    /// (row-to-row sigma about 5.5) and long horizontal streaks (along-row sigma about 5). Generated once per size at
+    /// 2x canvas resolution and cached; the panel only rebuilds it when the canvas changes.
+    private var metalCache: [String: CGImage] = [:]
+
+    private func brushedMetal(_ size: CGSize, base: Double, rowSigma: Double, streakSigma: Double, seed: UInt64) -> CGImage? {
+        let key = "\(Int(size.width))x\(Int(size.height))/\(base)/\(seed)"
+        if let cached = metalCache[key] { return cached }
+        let w = max(1, Int(size.width * 2)), h = max(1, Int(size.height * 2))
+        var rng = SeededRandom(state: seed)
+        func gauss() -> Double { Double(rng.next() + rng.next() + rng.next() + rng.next() - 2) * 1.732 }
+        var pixels = [UInt8](repeating: 255, count: w * h * 4)
+        var row = [Double](repeating: 0, count: w)
+        for y in 0..<h {
+            let offset = gauss() * rowSigma
+            for x in 0..<w { row[x] = offset + gauss() * 1.2 }
+            for _ in 0..<max(2, w / 110) {
+                let x0 = Int(rng.next() * CGFloat(w)), len = Int(40 + rng.next() * 1600), amp = gauss() * streakSigma
+                let end = min(w, x0 + len)
+                guard end > x0 else { continue }
+                for x in x0..<end { row[x] += amp * sin(Double(x - x0) / Double(len) * .pi) }
+            }
+            for x in 0..<w {
+                let v = max(0, min(253, base + row[x])), o = (y * w + x) * 4
+                pixels[o] = UInt8(v); pixels[o + 1] = UInt8(v); pixels[o + 2] = UInt8(v + 2)
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+              let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: sRGB,
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue), provider: provider,
+                                  decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        metalCache[key] = image
+        return image
     }
 
     private func brush(_ ctx: CGContext, _ r: CGRect, strength: CGFloat, seed: UInt64) {
@@ -352,6 +390,9 @@ final class PanelRenderer {
         default: return .semibold
         }
     }
+
+    /// Button styles lit through a rim light pipe rather than a translucent cap.
+    static let rimLitStyles: Set<String> = ["white", "mode", "rec", "stop", "play"]
 
     static func color(_ name: String?) -> CGColor {
         switch name {
@@ -427,6 +468,35 @@ final class PanelRenderer {
                     ctx.fillCircle(CGPoint(x: c.x + dir.x * r, y: c.y + dir.y * r), (d.size ?? 3) / 2, ink)
                 }
             }
+        case "arc":
+            // Printed tapered scale around a CUTOFF knob: width runs from width0 at `from` to width1 at `to` (degrees,
+            // clockwise from 12 o'clock); `gaps` are [start, end] angle pairs left unprinted.
+            let c = CGPoint(x: d.cx ?? 0, y: d.cy ?? 0), r = d.r ?? 0
+            let a0 = d.from ?? -140, a1 = d.to ?? 140, w0 = d.width0 ?? 2, w1 = d.width1 ?? 2
+            let steps = 120
+            let gaps = (d.gaps ?? []).filter { $0.count == 2 }
+            var run: [(CGFloat, CGFloat)] = []    // (angle, width) of the current unbroken stretch
+            func flush() {
+                guard run.count > 1 else { run.removeAll(); return }
+                let path = CGMutablePath()
+                for (i, (a, w)) in run.enumerated() {
+                    let rad = a * .pi / 180, p = CGPoint(x: c.x + sin(rad) * (r + w / 2), y: c.y - cos(rad) * (r + w / 2))
+                    i == 0 ? path.move(to: p) : path.addLine(to: p)
+                }
+                for (a, w) in run.reversed() {
+                    let rad = a * .pi / 180
+                    path.addLine(to: CGPoint(x: c.x + sin(rad) * (r - w / 2), y: c.y - cos(rad) * (r - w / 2)))
+                }
+                path.closeSubpath()
+                ctx.fill(path: path, color: ink)
+                run.removeAll()
+            }
+            for i in 0...steps {
+                let t = CGFloat(i) / CGFloat(steps), a = a0 + (a1 - a0) * t
+                if gaps.contains(where: { a >= $0[0] && a <= $0[1] }) { flush(); continue }
+                run.append((a, w0 + (w1 - w0) * t))
+            }
+            flush()
         case "insert":
             let r = d.rect
             ctx.fill(path: roundedPath(r.insetBy(dx: -2, dy: -2), (d.radius ?? 0) + 2), color: hexColor(0xffffff, 0.06))
@@ -550,18 +620,24 @@ final class PanelRenderer {
             ctx.fill(path: roundedPath(groove, 3.5), color: hexColor(0x0a0a0b))
             ctx.stroke(path: roundedPath(groove, 3.5), color: hexColor(0xffffff, 0.14), width: 1)
         case "gray":
+            // SHIFT has no LED: a dark rubber key carrying a light printed label plate.
             ctx.fill(path: roundedPath(f.insetBy(dx: -3, dy: -3), c.cornerRadius + 3), color: hexColor(0x050506))
             ctx.saveGState()
             ctx.addPath(roundedPath(f, c.cornerRadius)); ctx.clip()
-            ctx.fillLinear([(0, hexColor(0x3a3c40)), (1, hexColor(0x1f2023))], from: CGPoint(x: 0, y: f.minY), to: CGPoint(x: 0, y: f.maxY))
+            ctx.fillLinear([(0, hexColor(0x2a2b2e)), (1, hexColor(0x141517))], from: CGPoint(x: 0, y: f.minY), to: CGPoint(x: 0, y: f.maxY))
             ctx.restoreGState()
-            ctx.stroke(path: roundedPath(f.insetBy(dx: 0.7, dy: 0.7), c.cornerRadius), color: hexColor(0x7e8084), width: 1.4)
+            let plate = f.insetBy(dx: 7, dy: 8)
+            ctx.saveGState()
+            ctx.addPath(roundedPath(plate, 2)); ctx.clip()
+            ctx.fillLinear([(0, hexColor(0xe4e5e8)), (1, hexColor(0xc4c5c9))], from: CGPoint(x: 0, y: plate.minY), to: CGPoint(x: 0, y: plate.maxY))
+            ctx.restoreGState()
         default:
+            // Unlit light-pipe rim; drawButtonLamp lights it in the lamp colour.
             let outline: CGColor
             switch style {
-            case "rec": outline = hexColor(0xff3030)
-            case "play": outline = hexColor(0x35ee48)
-            default: outline = hexColor(0xf4f5f6)
+            case "rec": outline = hexColor(0x4a1a24)
+            case "play": outline = hexColor(0x1d4322)
+            default: outline = hexColor(0x55575b)
             }
             ctx.fill(path: roundedPath(f.insetBy(dx: -3.5, dy: -3.5), c.cornerRadius + 3.5), color: hexColor(0x050506))
             if style == "mode" {
@@ -573,7 +649,7 @@ final class PanelRenderer {
                 ctx.stroke(path: roundedPath(f.insetBy(dx: -2, dy: -2), c.cornerRadius + 2), color: hexColor(0x8e9094), width: 1.3)
             }
             ctx.fill(path: roundedPath(f, c.cornerRadius), color: hexColor(0x070708))
-            ctx.stroke(path: roundedPath(f.insetBy(dx: 1.5, dy: 1.5), max(0, c.cornerRadius - 1)), color: outline, width: 3)
+            ctx.stroke(path: roundedPath(f.insetBy(dx: 2, dy: 2), max(0, c.cornerRadius - 1)), color: outline, width: 4)
         }
         drawButtonGlyph(ctx, c)
     }
@@ -600,7 +676,7 @@ final class PanelRenderer {
         if let label = c.label, !label.isEmpty {
             let gray = style == "gray"
             drawText(label, at: ctr, size: gray ? 14.5 : 15.5, weight: gray ? .medium : .bold,
-                     color: labelColor ?? (gray ? hexColor(0xd2d3d6) : PanelRenderer.color(nil)))
+                     color: labelColor ?? (gray ? hexColor(0x1b1c1f) : PanelRenderer.color(nil)))
         }
     }
 
@@ -632,39 +708,81 @@ final class PanelRenderer {
         ctx.strokeCircle(ctr, r * 0.66, hexColor(0x8a8c90, 0.55), 1.2)
     }
 
-    private func drawAnalogBody(_ ctx: CGContext, _ c: PanelLayout.Control) {
-        let ctr = c.center, r = c.r ?? 30
-        ctx.fillCircle(ctr, r + 3, hexColor(0x050506))
-        ctx.fillRadial([(0, hexColor(0x26272a)), (1, hexColor(0x070708))], center: ctr, radius: r)
-        for i in 0..<30 {
-            let a = CGFloat(i) / 30 * 2 * .pi
-            ctx.line(CGPoint(x: ctr.x + sin(a) * r * 0.82, y: ctr.y - cos(a) * r * 0.82),
-                     CGPoint(x: ctr.x + sin(a) * r * 0.97, y: ctr.y - cos(a) * r * 0.97), hexColor(0x5c5e63, 0.8), 1.8)
+    /// Knob silhouette with `lobes` rounded flutes; `depth` is how far the cusps between flutes sit inside `r`.
+    private func flutedPath(_ ctr: CGPoint, r: CGFloat, lobes: Int, depth: CGFloat) -> CGPath {
+        let path = CGMutablePath(), n = lobes * 16
+        for i in 0...n {
+            let a = CGFloat(i) / CGFloat(n) * 2 * .pi
+            let rr = r - depth * (1 - abs(sin(CGFloat(lobes) * a / 2)))
+            let p = CGPoint(x: ctr.x + sin(a) * rr, y: ctr.y - cos(a) * rr)
+            i == 0 ? path.move(to: p) : path.addLine(to: p)
         }
-        let cap = r * 0.8
-        if c.style == "matte" {
-            ctx.fillRadial([(0, hexColor(0x34363a)), (1, hexColor(0x0d0d0f))], center: ctr, radius: cap,
-                           focus: CGPoint(x: ctr.x - cap * 0.25, y: ctr.y - cap * 0.3))
-        } else {
-            ctx.saveGState()
-            ctx.addEllipse(in: CGRect(x: ctr.x - cap, y: ctr.y - cap, width: 2 * cap, height: 2 * cap)); ctx.clip()
-            let tones: [(UInt32, UInt32)] = [(0xe2e3e6, 0xa9abaf), (0x9a9ca1, 0x6a6c70), (0x55575b, 0x2e2f32), (0xb4b6ba, 0x7b7d81)]  // TL, TR, BR, BL
-            for (i, tone) in tones.enumerated() {
-                let q = CGRect(x: i == 0 || i == 3 ? ctr.x - cap : ctr.x, y: i < 2 ? ctr.y - cap : ctr.y, width: cap, height: cap)
-                ctx.saveGState(); ctx.clip(to: q)
-                ctx.fillLinear([(0, hexColor(tone.0)), (1, hexColor(tone.1))], from: CGPoint(x: q.minX, y: q.minY), to: CGPoint(x: q.maxX, y: q.maxY))
-                ctx.restoreGState()
-            }
-            ctx.restoreGState()
-            ctx.strokeCircle(ctr, cap, hexColor(0x1a1b1d), 1.4)
-        }
+        path.closeSubpath()
+        return path
     }
 
+    /// Analog pots as on the product render: a fluted skirt (gunmetal for the filter, black for MAIN OUT) under a
+    /// smooth spun-metal cap whose sheen is light top-right and bottom-left. The white pointer is dynamic.
+    private func drawAnalogBody(_ ctx: CGContext, _ c: PanelLayout.Control) {
+        let ctr = c.center, r = c.r ?? 30, matte = c.style == "matte"
+        let skirt = flutedPath(ctr, r: r, lobes: 14, depth: r * 0.08)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 3), blur: 7, color: hexColor(0, 0.75))
+        ctx.fill(path: skirt, color: hexColor(matte ? 0x0f1012 : 0x1c1b21))
+        ctx.restoreGState()
+        ctx.saveGState(); ctx.addPath(skirt); ctx.clip()
+        let rim: [(CGFloat, CGColor)] = matte
+            ? [(0, hexColor(0x55565b)), (0.42, hexColor(0x1a1b1e)), (0.7, hexColor(0x0c0c0e)), (1, hexColor(0x3a3b40))]
+            : [(0, hexColor(0xb9b6c4)), (0.4, hexColor(0x3b3a43)), (0.68, hexColor(0x1b1a20)), (1, hexColor(0x8a7f99))]
+        ctx.fillLinear(rim, from: CGPoint(x: ctr.x - r * 0.7, y: ctr.y - r), to: CGPoint(x: ctr.x + r * 0.7, y: ctr.y + r))
+        ctx.restoreGState()
+        ctx.stroke(path: skirt, color: hexColor(0, 0.65), width: 1)
+
+        spunMetal(ctx, ctr, radius: r * 0.72, low: matte ? 0.09 : 0.20, high: matte ? 0.19 : 0.56)
+    }
+
+    /// Spun-metal disc: a two-lobed sheen (light top-right and bottom-left, as lit on the product render) between grey
+    /// levels `low` and `high`, with optional fine concentric spin rings and a dark rim.
+    private func spunMetal(_ ctx: CGContext, _ ctr: CGPoint, radius cap: CGFloat, low: CGFloat, high: CGFloat, rings: Bool = false) {
+        ctx.saveGState()
+        ctx.addEllipse(in: CGRect(x: ctr.x - cap, y: ctr.y - cap, width: 2 * cap, height: 2 * cap)); ctx.clip()
+        let wedges = 96
+        for i in 0..<wedges {
+            let a0 = CGFloat(i) / CGFloat(wedges) * 2 * .pi, a1 = CGFloat(i + 1) / CGFloat(wedges) * 2 * .pi + 0.01
+            let sheen = 0.5 + 0.5 * cos(2 * ((a0 + a1) / 2 - .pi / 4))      // peaks top-right and bottom-left
+            let v = low + (high - low) * sheen
+            let wedge = CGMutablePath()
+            wedge.move(to: ctr)
+            wedge.addLine(to: CGPoint(x: ctr.x + sin(a0) * cap * 1.1, y: ctr.y - cos(a0) * cap * 1.1))
+            wedge.addLine(to: CGPoint(x: ctr.x + sin(a1) * cap * 1.1, y: ctr.y - cos(a1) * cap * 1.1))
+            wedge.closeSubpath()
+            ctx.fill(path: wedge, color: CGColor(colorSpace: sRGB, components: [v, v * 0.98, v * 1.04, 1])!)
+        }
+        if rings {
+            var k = cap * 0.08
+            while k < cap { ctx.strokeCircle(ctr, k, hexColor(0xffffff, 0.035), 0.6); k += 2.2 }
+        }
+        ctx.fillRadial([(0, hexColor(0xffffff, 0.05)), (0.8, hexColor(0, 0)), (1, hexColor(0, 0.45))], center: ctr, radius: cap)
+        ctx.restoreGState()
+        ctx.strokeCircle(ctr, cap, hexColor(0, 0.6), 1.2)
+    }
+
+    /// The selector's fixed parts, as on the product render: the printed white ring, a black well and a soft rubber
+    /// collar around the knob (no tick marks).
     private func drawSelectorWell(_ ctx: CGContext, _ c: PanelLayout.Control) {
         let ctr = c.center, r = c.r ?? 60
         ctx.fillCircle(ctr, r + 2, hexColor(0x040405))
         ctx.strokeCircle(ctr, r, hexColor(0xf0f1f2), 2.4)
-        ctx.fillRadial([(0, hexColor(0x15161a)), (1, hexColor(0x050506))], center: ctr, radius: r - 2)
+        ctx.fillCircle(ctr, r - 2, hexColor(0x060607))
+        let collar = r * 0.9
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 6, color: hexColor(0, 0.8))
+        ctx.fillCircle(ctr, collar, hexColor(0x141518))
+        ctx.restoreGState()
+        ctx.fillRadial([(0.6, hexColor(0x0c0d0f)), (0.82, hexColor(0x202125)), (0.94, hexColor(0x16171a)), (1, hexColor(0x0a0a0c))],
+                       center: ctr, radius: collar, focus: CGPoint(x: ctr.x - collar * 0.12, y: ctr.y - collar * 0.16))
+        ctx.strokeCircle(ctr, collar - 0.5, hexColor(0xffffff, 0.07), 1)
+        ctx.strokeCircle(ctr, collar * 0.74, hexColor(0, 0.7), 1.5)
     }
 
     private func drawStripFrame(_ ctx: CGContext, _ f: CGRect) {
@@ -803,7 +921,16 @@ final class PanelRenderer {
     private func drawButtonLamp(_ ctx: CGContext, _ c: PanelLayout.Control, _ look: LampLook, _ held: Bool, _ s: CGFloat) {
         let f = c.frame
         let path: CGPath = c.isCircle ? CGPath(ellipseIn: f, transform: nil) : roundedPath(f, c.cornerRadius)
-        if case .lit(let col) = look {
+        if case .lit(let col) = look, !c.isCircle, PanelRenderer.rimLitStyles.contains(c.style ?? "white") {
+            // As on the unit: the light pipe around the key glows; the face stays black with its printed label.
+            let rim = roundedPath(f.insetBy(dx: 2, dy: 2), max(0, c.cornerRadius - 1))
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 12 * s, color: col.cg(0.85))
+            ctx.stroke(path: rim, color: col.cg(), width: 4)
+            ctx.restoreGState()
+            ctx.stroke(path: rim, color: col.lighter(0.55).cg(), width: 1.6)
+            drawButtonGlyph(ctx, c)
+        } else if case .lit(let col) = look {
             ctx.saveGState()
             ctx.setShadow(offset: .zero, blur: 14 * s, color: col.cg(0.9))
             ctx.fill(path: path, color: col.cg(0.85))
@@ -855,8 +982,9 @@ final class PanelRenderer {
         ctx.translateBy(x: c.cx, y: c.cy)
         ctx.rotate(by: angle * .pi / 180)
         if long {
-            ctx.line(CGPoint(x: 0, y: -r * 0.08), CGPoint(x: 0, y: -r * 0.9), hexColor(0x050506, 0.6), 6, cap: .round)
-            ctx.line(CGPoint(x: 0, y: -r * 0.08), CGPoint(x: 0, y: -r * 0.9), hexColor(0xf4f5f6), 4, cap: .round)
+            // A white bar from inside the cap out over the skirt's edge, as on the product.
+            ctx.line(CGPoint(x: 0, y: -r * 0.12), CGPoint(x: 0, y: -r * 0.96), hexColor(0x050506, 0.6), r * 0.17 + 2, cap: .round)
+            ctx.line(CGPoint(x: 0, y: -r * 0.12), CGPoint(x: 0, y: -r * 0.96), hexColor(0xf4f5f6), r * 0.17, cap: .round)
         } else {
             ctx.line(CGPoint(x: 0, y: -r * 0.32), CGPoint(x: 0, y: -r * 0.6), hexColor(0xe4e5e8), 3, cap: .round)
         }
@@ -864,23 +992,28 @@ final class PanelRenderer {
     }
 
     private func drawSelector(_ ctx: CGContext, _ c: PanelLayout.Control, angle: CGFloat, held: Bool) {
-        let ctr = c.center, r = c.r ?? 60, cap = c.capR ?? 40
-        // Rotating ring: knurl notches.
+        let ctr = c.center, ring = c.capR ?? 40, cap = ring * 0.78
+        // Chrome band with dimples notched into its outer edge: the dimples turn with the selector; the light stays fixed.
+        let band = CGRect(x: ctr.x - ring, y: ctr.y - ring, width: 2 * ring, height: 2 * ring)
         ctx.saveGState()
-        ctx.translateBy(x: ctr.x, y: ctr.y)
-        ctx.rotate(by: angle * .pi / 180)
-        for i in 0..<30 {
-            let a = CGFloat(i) / 30 * 2 * .pi
-            let p0 = CGPoint(x: sin(a) * (cap + 4), y: -cos(a) * (cap + 4)), p1 = CGPoint(x: sin(a) * (r - 4), y: -cos(a) * (r - 4))
-            ctx.line(p0, p1, i % 5 == 0 ? hexColor(0x8d8f94, 0.85) : hexColor(0x3a3b3f, 0.9), i % 5 == 0 ? 2.4 : 1.8, cap: .round)
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 5, color: hexColor(0, 0.85))
+        ctx.fillCircle(ctr, ring, hexColor(0x6d6f74))
+        ctx.restoreGState()
+        ctx.saveGState(); ctx.addEllipse(in: band); ctx.clip()
+        ctx.fillLinear([(0, hexColor(0xf4f5f8)), (0.3, hexColor(0xa4a6ac)), (0.52, hexColor(0x45464b)), (0.74, hexColor(0xcfd1d6)),
+                        (1, hexColor(0x707277))],
+                       from: CGPoint(x: ctr.x - ring, y: ctr.y - ring), to: CGPoint(x: ctr.x + ring, y: ctr.y + ring))
+        let dimples = 12, spin = angle * .pi / 180
+        for i in 0..<dimples {
+            let a = spin + CGFloat(i) / CGFloat(dimples) * 2 * .pi
+            let p = CGPoint(x: ctr.x + sin(a) * ring * 1.0, y: ctr.y - cos(a) * ring * 1.0)
+            ctx.fillRadial([(0, hexColor(0x050506)), (0.7, hexColor(0x111214)), (1, hexColor(0x2a2b2f, 0))], center: p, radius: ring * 0.17)
         }
         ctx.restoreGState()
-        // Cap
-        ctx.fillCircle(ctr, cap + 2.5, hexColor(0x040405))
-        ctx.fillRadial([(0, hexColor(0x3b3d41)), (0.6, hexColor(0x18191b)), (1, hexColor(0x0b0b0c))], center: ctr, radius: cap,
-                       focus: CGPoint(x: ctr.x - cap * 0.25, y: ctr.y - cap * 0.3))
-        ctx.strokeCircle(ctr, cap - 0.8, hexColor(0xc8cacd, 0.8), 1.8)
-        for k in 1...4 { ctx.strokeCircle(ctr, cap * CGFloat(k) / 5, hexColor(0xffffff, 0.05), 1) }
+        ctx.strokeCircle(ctr, ring - 0.5, hexColor(0, 0.5), 1)
+        // Spun-metal top cap.
+        ctx.fillCircle(ctr, cap + 1.5, hexColor(0x0a0a0c))
+        spunMetal(ctx, ctr, radius: cap, low: 0.05, high: 0.30, rings: true)
         if held {
             ctx.saveGState()
             ctx.addEllipse(in: CGRect(x: ctr.x - cap, y: ctr.y - cap, width: 2 * cap, height: 2 * cap)); ctx.clip()

@@ -644,7 +644,7 @@ class MapTests(unittest.TestCase):
         self.assertEqual(panel_map.LAMP_ROLES["usb_led"], ("mono", 25))
         self.assertEqual(panel_map.decode_lamps(bytes(frame))[usb], (0, 0, 0))
         frame[0x65] = 0x01
-        self.assertEqual(panel_map.decode_lamps(bytes(frame))[usb], (255, 255, 255))
+        self.assertEqual(panel_map.decode_lamps(bytes(frame))[usb], panel_map.MONO_COLORS["usb_led"])
         frame[0x65] = 0x02  # mono 34 must not drive it
         self.assertEqual(panel_map.decode_lamps(bytes(frame))[usb], (0, 0, 0))
 
@@ -668,9 +668,9 @@ class MapTests(unittest.TestCase):
         lamps = panel_map.decode_lamps(bytes(frame))
         ids = panel_map.CONTROL_IDS
         self.assertEqual(lamps[ids["track"]], (255, 255, 255))
-        self.assertEqual(lamps[ids["mute"]], (89, 89, 89))
+        self.assertEqual(lamps[ids["mute"]], (160, 160, 160))  # duty 0.35, sRGB-encoded
         self.assertEqual(lamps[ids["slice"]], (0, 0, 0))
-        self.assertEqual(lamps[ids["step1"]], (255, 127, 0))
+        self.assertEqual(lamps[ids["step1"]], (255, 188, 0))  # 37/74 duty, sRGB-encoded
 
     def test_mono_lamps_scale_with_the_pad_button_brightness_level(self):
         def decode(level):
@@ -681,8 +681,8 @@ class MapTests(unittest.TestCase):
             return panel_map.decode_lamps(bytes(frame))
         shift, step1 = panel_map.CONTROL_IDS["shift"], panel_map.CONTROL_IDS["step1"]
         self.assertEqual(decode(4)[shift], (255, 255, 255))
-        self.assertEqual(decode(2)[shift], (128, 128, 128))
-        self.assertEqual(decode(1)[shift], (64, 64, 64))
+        self.assertEqual(decode(2)[shift], (188, 188, 188))
+        self.assertEqual(decode(1)[shift], (137, 137, 137))
         self.assertEqual(decode(0)[shift], (255, 255, 255))  # no level: full
         self.assertEqual(decode(4)[step1], decode(1)[step1])  # RGB is not rescaled again
 
@@ -696,10 +696,18 @@ class MapTests(unittest.TestCase):
         lamps = panel_map.decode_lamps(bytes(frame))
         ids = panel_map.CONTROL_IDS
         self.assertEqual(lamps[ids["track"]], (255, 255, 255))
-        self.assertEqual(lamps[ids["play"]], (60, 255, 90))
+        self.assertEqual(lamps[ids["play"]], panel_map.MONO_COLORS["play"])
         self.assertEqual(lamps[ids["mute"]], (0, 0, 0))
         self.assertEqual(lamps[ids["bar3"]], (70, 140, 255))
-        self.assertEqual(lamps[ids["step5"]], (0x20 * 255 // 74, 0x30 * 255 // 74, min(255, 0x40 * 255 // 74)))
+        self.assertEqual(lamps[ids["step5"]], panel_map.rgb_lamp((0x20, 0x30, 0x40)))
+
+    def test_dim_rgb_lamps_keep_their_hue_and_stay_visible(self):
+        dim_red = panel_map.rgb_lamp((22, 1, 0))      # MUTE-mode track colour
+        self.assertGreaterEqual(max(dim_red), round(255 * panel_map.LIT_RGB_FLOOR))
+        self.assertGreater(dim_red[0], 4 * dim_red[1])
+        self.assertEqual(dim_red[2], 0)
+        self.assertEqual(panel_map.rgb_lamp((74, 74, 74)), (255, 255, 255))
+        self.assertEqual(panel_map.rgb_lamp((0, 0, 0)), (0, 0, 0))
         self.assertIsNone(panel_map.decode_lamps(bytes(128)))
 
 
