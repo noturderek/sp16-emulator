@@ -5,23 +5,28 @@ scaled so that its pixel width covers the same canvas width, so one layout unit 
 same number of pixels. Offsets are measured from the chassis top-left corner (the canvas origin), and the vertical
 scale is the horizontal one, so the layout is never stretched.
 
-The render is private (firmware/TORAIZ-SP-16/references). It is read in place and never copied into the repo; the
-overlay goes to build/, which git ignores.
+The render is private (the owner's firmware references). It is read in place and never copied into the repo: give its
+path with --image or in the SP16_TOP_VIEW environment variable. The overlay goes to build/, which git ignores.
 
-  python3 emulator/layout_overlay.py [--image PATH] [--out PATH]
+  SP16_TOP_VIEW=/path/to/render.png python3 emulator/layout_overlay.py [--image PATH] [--out PATH]
+
+Needs Pillow in the Python that runs the build tools: python3 -m pip install pillow
 """
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # reported by main() with the install command, so importing this module stays cheap
+    Image = ImageDraw = ImageFont = None
 
 TOOLS = Path(__file__).resolve().parent
 REPO = TOOLS.parent
 LAYOUT_PATH = TOOLS / "panel-layout.json"
-DEFAULT_IMAGE = Path("/Users/shwanton/Projects/pioneer/internal/firmware/TORAIZ-SP-16/references/originals/pioneerdj"
-                     "/SP16-005_toraiz-sp-16_5.png")
+TOP_VIEW_ENV = "SP16_TOP_VIEW"
 DEFAULT_OUT = REPO / "build" / "layout-overlay.png"
 CHASSIS_WIDTH_MM = 436.5
 KIND_COLOURS = {"pad": (0, 255, 255), "button": (255, 200, 0), "step": (255, 120, 255), "bar": (120, 255, 120),
@@ -72,9 +77,14 @@ def render_on_white(path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--image", type=Path, default=DEFAULT_IMAGE, help="top-view render (read in place)")
+    parser.add_argument("--image", type=Path, default=os.environ.get(TOP_VIEW_ENV) or None,
+                        help=f"top-view render (read in place); default: ${TOP_VIEW_ENV}")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="overlay PNG to write")
     args = parser.parse_args(argv)
+    if args.image is None:
+        parser.error(f"give the top-view render with --image or set {TOP_VIEW_ENV}")
+    if Image is None:
+        parser.error("Pillow is not installed: python3 -m pip install pillow")
 
     layout = json.loads(LAYOUT_PATH.read_text())
     image = render_on_white(args.image)
