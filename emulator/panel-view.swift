@@ -1728,7 +1728,7 @@ final class PanelView: NSView, NSViewToolTipOwner {
 
     // MARK: Hold bookkeeping
 
-    private enum HoldSource: Hashable { case mouse, key(UInt16), shift, latch, accessibility }
+    private enum HoldSource: Hashable { case mouse, key(UInt16), shift, latch, accessibility, boot }
 
     private enum Drag { case hold(UInt8), knob(UInt8), analog(UInt8), ring, strip, lcd }
 
@@ -1768,6 +1768,18 @@ final class PanelView: NSView, NSViewToolTipOwner {
         state.held.remove(id)
         emit(id, 0, 0)
         invalidate([id])
+    }
+
+    /// Holds the named controls as the host's own "keys held at power-on" (Power On With Keys Held); the release
+    /// comes from `releaseBootHolds`, or from releaseAll when the window loses focus.
+    func holdForBoot(_ names: [String]) {
+        for name in names {
+            if let id = panelLayout?.controls.first(where: { $0.name == name })?.id { addSource(id, .boot) }
+        }
+    }
+
+    func releaseBootHolds() {
+        for id in input.holds.keys.sorted() { removeSource(id, .boot) }
     }
 
     /// Emits a release for every held or latched control and ends any LCD touch. Safe to call repeatedly.
