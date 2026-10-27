@@ -119,6 +119,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         installMenus()
+        loadSkinOverlay()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
@@ -249,6 +250,9 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         let rear = NSMenuItem(title: "Rear I/O Panel", action: #selector(toggleRearPanel(_:)), keyEquivalent: "r")
         rear.target = self
         viewMenu.addItem(rear)
+        let skin = NSMenuItem(title: "Private Skin Overlay", action: #selector(toggleSkin(_:)), keyEquivalent: "")
+        skin.target = self
+        viewMenu.addItem(skin)
         let glow = NSMenuItem(title: "Lamp Glow", action: #selector(toggleLampGlow(_:)), keyEquivalent: "")
         glow.target = self
         viewMenu.addItem(glow)
@@ -265,12 +269,48 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     @objc func releaseAllHolds() { panel.releaseAll() }
 
     @objc func toggleRearPanel(_ sender: NSMenuItem) { panel.showRear.toggle() }
+    /// The user's own artwork, never shipped: private/skin/overlay.png of the checkout this app was built in (the app
+    /// sits in <checkout>/build/<name>/), or the file named by SP16_SKIN_OVERLAY. Off until View > Private Skin
+    /// Overlay turns it on; the choice is remembered. A missing file leaves the panel unchanged.
+    static let skinDefaultsKey = "SP16PrivateSkinOverlay"
+    func skinOverlayURL() -> URL? {
+        let fm = FileManager.default
+        if let path = ProcessInfo.processInfo.environment["SP16_SKIN_OVERLAY"], fm.fileExists(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        var folder = Bundle.main.bundleURL.deletingLastPathComponent()
+        for _ in 0..<4 {
+            let candidate = folder.appendingPathComponent("private/skin/overlay.png")
+            if fm.fileExists(atPath: candidate.path) { return candidate }
+            folder = folder.deletingLastPathComponent()
+        }
+        return nil
+    }
+
+    func loadSkinOverlay() {
+        guard let url = skinOverlayURL() else { return }
+        if panel.loadSkin(from: url) {
+            AppLog.log("skin overlay available (View > Private Skin Overlay)")
+            panel.showSkin = UserDefaults.standard.bool(forKey: Self.skinDefaultsKey)
+        } else {
+            AppLog.log("skin overlay: cannot read the image, ignored")
+        }
+    }
+
+    @objc func toggleSkin(_ sender: NSMenuItem) {
+        panel.showSkin.toggle()
+        UserDefaults.standard.set(panel.showSkin, forKey: Self.skinDefaultsKey)
+    }
+
     @objc func toggleLampGlow(_ sender: NSMenuItem) { panel.lampBloom.toggle() }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
         case #selector(toggleRearPanel(_:)): item.state = panel.showRear ? .on : .off
         case #selector(toggleLampGlow(_:)): item.state = panel.lampBloom ? .on : .off
+        case #selector(toggleSkin(_:)):
+            item.state = panel.showSkin ? .on : .off
+            return panel.hasSkin     // greyed out when private/skin/overlay.png is absent
         default: break
         }
         return true
@@ -658,9 +698,14 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             return ok ? "{\"ok\":true}" : "{\"error\":\"panelshot failed\"}"
         case "view":
             // View toggles for screenshots: rear on|off, glow on|off.
-            guard let name = command["name"] as? String, ["rear", "glow"].contains(name),
-                  let on = command["on"] as? Bool else { return "{\"error\":\"view needs name rear|glow and on true|false\"}" }
-            DispatchQueue.main.sync { if name == "rear" { self.panel.showRear = on } else { self.panel.lampBloom = on } }
+            guard let name = command["name"] as? String, ["rear", "glow", "skin"].contains(name),
+                  let on = command["on"] as? Bool else { return "{\"error\":\"view needs name rear|glow|skin and on true|false\"}" }
+            DispatchQueue.main.sync { switch name {
+                case "rear": self.panel.showRear = on
+                case "skin": self.panel.showSkin = on && self.panel.hasSkin
+                default: self.panel.lampBloom = on
+                }
+            }
             return "{\"ok\":true}"
         case "period":
             guard let ms = int("ms"), (1...50).contains(ms) else { return "{\"error\":\"period needs ms 1-50\"}" }

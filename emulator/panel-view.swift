@@ -260,7 +260,7 @@ final class PanelRenderer {
     // MARK: Static layer
 
     /// Renders backdrop + chassis + printed art + empty control shapes into a top-down bitmap.
-    func makeStaticLayer(viewSize: CGSize, scale: CGFloat, transform: PanelTransform, lcdOnly: Bool, rear: Bool = false) -> CGImage? {
+    func makeStaticLayer(viewSize: CGSize, scale: CGFloat, transform: PanelTransform, lcdOnly: Bool, rear: Bool = false, skin: CGImage? = nil) -> CGImage? {
         guard let ctx = CGContext(data: nil, width: Int(ceil(viewSize.width * scale)), height: Int(ceil(viewSize.height * scale)),
                                   bitsPerComponent: 8, bytesPerRow: 0, space: sRGB,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
@@ -290,6 +290,14 @@ final class PanelRenderer {
         for d in layout.decor { drawDecor(ctx, d) }
         for c in layout.controls { drawControlStatic(ctx, c, s) }
         drawLCDBezel(ctx)
+        if let skin {
+            // The user's own overlay (logos, printing), stretched over the whole canvas; lamps still draw on top.
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: layout.canvas.height); ctx.scaleBy(x: 1, y: -1)
+            ctx.interpolationQuality = .high
+            ctx.draw(skin, in: CGRect(origin: .zero, size: layout.canvas.size))
+            ctx.restoreGState()
+        }
         return ctx.makeImage()
     }
 
@@ -1404,6 +1412,26 @@ final class PanelView: NSView, NSViewToolTipOwner {
             NSAccessibility.post(element: self, notification: .layoutChanged)
         }
     }
+    /// Optional private artwork: a transparent PNG with the panel's canvas proportions (1773 x 1011 or any multiple),
+    /// loaded by the app from the git-ignored private/ folder. The repository ships none; the overlay is off until
+    /// the user turns it on (View > Private Skin Overlay).
+    private var skinImage: CGImage?
+    var hasSkin: Bool { skinImage != nil }
+    var showSkin = false { didSet { if showSkin != oldValue { staticCache.removeAll(); needsDisplay = true } } }
+    private var skinActive: Bool { showSkin && skinImage != nil && !showRear }
+
+    /// Loads the overlay image; nil clears it. Returns false when the file is not a readable image.
+    @discardableResult
+    func loadSkin(from url: URL?) -> Bool {
+        defer { staticCache.removeAll(); needsDisplay = true }
+        guard let url else { skinImage = nil; return true }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            skinImage = nil
+            return false
+        }
+        skinImage = image
+        return true
+    }
     /// Lit keys, buttons and LEDs throw an additive halo (View > Lamp Glow).
     var lampBloom: Bool {
         get { state.bloom }
@@ -1438,7 +1466,7 @@ final class PanelView: NSView, NSViewToolTipOwner {
     private var input = InputState()
     private var observers: [NSObjectProtocol] = []
 
-    private struct StaticKey: Equatable { var size: CGSize, scale: CGFloat, lcdOnly: Bool, rear: Bool }
+    private struct StaticKey: Equatable { var size: CGSize, scale: CGFloat, lcdOnly: Bool, rear: Bool, skin: Bool }
 
     // MARK: Setup
 
@@ -1650,10 +1678,10 @@ final class PanelView: NSView, NSViewToolTipOwner {
             return
         }
         let scale = abs(ctx.convertToDeviceSpace(CGSize(width: 1, height: 0)).width)
-        let key = StaticKey(size: bounds.size, scale: scale, lcdOnly: lcdOnly, rear: showRear)
+        let key = StaticKey(size: bounds.size, scale: scale, lcdOnly: lcdOnly, rear: showRear, skin: skinActive)
         if let hit = staticCache.firstIndex(where: { $0.key == key }) {
             if hit != 0 { staticCache.insert(staticCache.remove(at: hit), at: 0) }
-        } else if let image = renderer.makeStaticLayer(viewSize: bounds.size, scale: scale, transform: t, lcdOnly: lcdOnly, rear: showRear) {
+        } else if let image = renderer.makeStaticLayer(viewSize: bounds.size, scale: scale, transform: t, lcdOnly: lcdOnly, rear: showRear, skin: skinActive ? skinImage : nil) {
             staticCache.insert((image, key), at: 0)
             if staticCache.count > 2 { staticCache.removeLast() }
         }
