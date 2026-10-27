@@ -106,7 +106,7 @@ int main(int argc,char **argv) {
     struct timespec nap={ .tv_nsec=150000000 }; nanosleep(&nap,NULL);
     int fd=open(getenv("SP16_PCM_PORT"),O_RDONLY); assert(fd>=0);
     static uint8_t data[2*1024*1024]; ssize_t size=read(fd,data,sizeof data); assert(size>0);
-    int first=-1, last=-1; size_t at=0;
+    int first=-1, last=-1, pad=-1, right=-1; size_t at=0;
     while (at+48<=(size_t)size) {
         uint32_t payload=rd32(data+at+44);
         if (!memcmp(data+at,"SPCM",4) && data[at+4]==2 && at+48+payload<=(size_t)size && payload>=8) {
@@ -114,11 +114,15 @@ int main(int argc,char **argv) {
             if (first<0) first=v;
             memcpy(&v,data+at+48+payload-8,2); /* the newest frame: a packet may coalesce older periods */
             last=v;
+            memcpy(&v,data+at+48+payload-6,2); pad=v;   /* channel 13: padding, not behind the knob */
+            memcpy(&v,data+at+48+payload-4,2); right=v; /* channel 14: the other channel of OUT1-2 */
         }
         at+=48+rd32(data+at+44);
     }
     assert(first==16384);                                   /* untouched control: unity */
     assert(last>=(int)(16384*main_gain)-2 && last<=(int)(16384*main_gain)+2);
+    assert(right>=(int)(16384*main_gain)-2 && right<=(int)(16384*main_gain)+2);
+    assert(pad==16384);                                     /* only OUT1-2 (channels 12 and 14) follows MAIN OUT */
     assert(snd_pcm_close(m)==0);
     /* 2. The loop low-pass: a 1 kHz tone at CUTOFF 500 comes back at the law's gain, and RESONANCE 500 lifts it. */
     snd_pcm_t *send=pcm("hw:ak4452audio,1",0,6,2), *ret=pcm("hw:ak4452audio,1",1,6,2);

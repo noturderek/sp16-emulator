@@ -1,6 +1,6 @@
-/* Input chain contract: INPUT LEVEL gain, the input limiter (GPIO5_IO06) and the level metrics line.
+/* Input chain contract: INPUT LEVEL gain, the input limiter (GPIO5_IO06), WAV injection and the level metrics line.
  * Build twice, as sp16_board_contract.c does (-DSP16_FAKE_ALSA -shared -fPIC -> libsp16-fake-alsa.so; normal -> test)
- * and run with the ARM UI preload and SP16_ANALOG=<file>.
+ * and run with the ARM UI preload, SP16_ANALOG=<file> and SP16_INPUT_WAV=<file>.
  */
 #define _GNU_SOURCE
 #include <assert.h>
@@ -84,9 +84,18 @@ static void gpio_limiter(int level) {
     uint8_t v=(uint8_t)level;
     assert(lseek(g,4*32+6,SEEK_SET)==4*32+6 && write(g,&v,1)==1); close(g);
 }
+static void wav(const char *path,unsigned channels,unsigned rate,const int16_t *frame,unsigned frames) {
+    uint32_t data=frames*channels*2, riff=36+data, fmt=16, br=rate*channels*2; uint16_t tag=1, ch=(uint16_t)channels, ba=(uint16_t)(channels*2), bits=16;
+    FILE *f=fopen(path,"wb"); assert(f);
+    fwrite("RIFF",1,4,f); fwrite(&riff,4,1,f); fwrite("WAVEfmt ",1,8,f); fwrite(&fmt,4,1,f); fwrite(&tag,2,1,f); fwrite(&ch,2,1,f);
+    fwrite(&rate,4,1,f); fwrite(&br,4,1,f); fwrite(&ba,2,1,f); fwrite(&bits,2,1,f); fwrite("data",1,4,f); fwrite(&data,4,1,f);
+    for (unsigned i=0;i<frames;i++) fwrite(frame,2,channels,f);
+    fclose(f);
+}
 int main(void) {
-    const char *state=getenv("SP16_ANALOG");
-    assert(state);
+    const char *state=getenv("SP16_ANALOG"), *wavpath=getenv("SP16_INPUT_WAV");
+    assert(state && wavpath);
+    unlink(wavpath);
     snd_pcm_t *in=capture();
     /* 1. INPUT LEVEL law: gain = 4 * pot^2 (unity at pot 0.5). A 0 dBFS tone at pot 0.5 peaks near full scale, at
      * pot 0.25 near a quarter, and a tone at -30 dBFS at pot 0.5 near 0.0316 full scale. */
@@ -108,6 +117,32 @@ int main(void) {
     analog(state,500,1000);
     gpio_limiter(0);
     top=peak16(in,NULL,NULL); assert(top>32000);
+    /* 3. WAV injection: a stereo file replaces the tone, INPUT LEVEL scales it, the limiter acts on it. */
+    analog(state,500,0);
+    top=peak16(in,NULL,NULL); assert(top==0);                    /* no tone, no file: silence */
+    int16_t lr[2]={ 16384, -8192 };
+    wav(wavpath,2,44100,lr,2000);
+    int l=0, r=0;
+    sleep(1); settle();
+    top=peak16(in,&l,&r); assert(l>16380 && l<16388 && r<-8188 && r>-8196);
+    analog(state,250,0);
+    top=peak16(in,&l,&r); assert(l>4090 && l<4098 && r<-2045 && r>-2051);
+    analog(state,500,0);
+    int16_t hot[2]={ 32000, 32000 };
+    wav(wavpath,2,44100,hot,2001);                               /* a different size: the shim reloads it */
+    sleep(2);
+    gpio_limiter(1);
+    top=peak16(in,&l,&r); assert(l>22000 && l<25000 && l==r);    /* 0.977 -> 0.5 + 0.5 * 0.954/1.954 = 0.744 */
+    gpio_limiter(0);
+    /* A mono file feeds both channels; a 22.05 kHz file plays at the codec rate (constant here, so unchanged). */
+    int16_t mono[1]={ 8192 };
+    wav(wavpath,1,22050,mono,3000);
+    sleep(2);
+    top=peak16(in,&l,&r); assert(l>8188 && l<8196 && l==r);
+    /* Removing the file returns to the tone source (silence with the tone off). */
+    unlink(wavpath);
+    sleep(2);
+    top=peak16(in,&l,&r); assert(top==0);
     assert(snd_pcm_close(in)==0);
     return 0;
 }

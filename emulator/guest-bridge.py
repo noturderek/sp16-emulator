@@ -94,7 +94,7 @@ DAC_WORD = re.compile(r"\[sp16-ui-stub\] dac hpf word=0x([0-9a-f]{4}) ctrl=(\d+)
 FILTER_LOOP = re.compile(r"\[sp16-ui-stub\] filter loop send_peak=([0-9.]+) return_peak=([0-9.]+) frames=(\d+) "
                          r"underruns=(\d+) drops=(\d+) lp_hz=(\d+) hp=(dac|off)$")
 ANALOG_LEVELS = re.compile(r"\[sp16-ui-stub\] analog levels limiter=([01]) in_peak=([0-9.]+) in_dbu=(-?[0-9.]+) out_peak=([0-9.]+) "
-                           r"out_dbu=(-?[0-9.]+) limited=(\d+) main_out_gain=([0-9.]+) input_gain=([0-9.]+) source=(off|tone)$")
+                           r"out_dbu=(-?[0-9.]+) limited=(\d+) main_out_gain=([0-9.]+) input_gain=([0-9.]+) source=(off|tone|wav)$")
 GPIO_LINE = re.compile(r"\[sp16-ui-stub\] gpio (GPIO\d_IO\d\d)=([01]) ([A-Za-z_/?]+)$")
 MIDI_LOOP = re.compile(r"\[sp16-ui-stub\] midi loopback (/dev/[a-z0-9_]+) first bytes=(\d+)$")
 

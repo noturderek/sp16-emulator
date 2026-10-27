@@ -1,4 +1,4 @@
-"""Contract: INPUT LEVEL gain, the input limiter and the analog level metrics.
+"""Contract: INPUT LEVEL gain, the input limiter, WAV injection and the analog level metrics.
 
 Runs tests/sp16_input_chain_contract.c against hardware_stub.c under qemu-user in Docker (skipped without Docker), plus
 host-side checks of the bridge's parsing of the shim's level line.
@@ -53,14 +53,15 @@ class InputChainTests(unittest.TestCase):
         with arm_contract.ArmContract() as arm:
             try:
                 out = arm.run("sp16_input_chain_contract", [
-                    "rm -f /tmp/run/analog",
-                    "$PRE -E SP16_ANALOG=/tmp/run/analog /tmp/run/t && echo PASS-input-chain"])
+                    "rm -f /tmp/run/analog /tmp/run/in.wav",
+                    "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/in.wav /tmp/run/t && echo PASS-input-chain"])
             except subprocess.CalledProcessError as exc:
                 self.fail((exc.stdout or "")[-2500:] + (exc.stderr or "")[-1500:])
             self.assertIn("PASS-input-chain", out)
             self.assertIn("analog levels limiter=1", out)
             self.assertIn("analog levels limiter=0", out)
-            self.assertIn("source=tone", out)
+            self.assertIn("source=wav", out)
+            self.assertIn("input injection: /tmp/run/in.wav channels=2 bits=16", out)
 
 
 if __name__ == "__main__":
