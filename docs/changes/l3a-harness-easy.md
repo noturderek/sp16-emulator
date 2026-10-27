@@ -55,7 +55,8 @@ How it works:
   check, not a fix.
 - Offsets are from the chassis top-left corner, in mm, for each control centre.
 
-Run: `python3 emulator/layout_overlay.py`
+Run: `SP16_TOP_VIEW=/path/to/render.png python3 emulator/layout_overlay.py` (or `--image PATH`). Needs Pillow:
+`python3 -m pip install pillow`. The render path is never stored in the repo.
 
 Overlay PNG: `build/layout-overlay.png` (inside the worktree, git-ignored). Visual check: pads, step keys, knobs, transport
 and bar LEDs sit on their render features.
@@ -92,14 +93,18 @@ None.
 
 ## Cross-lane requests
 
-None.
+1. Owner decision: Pillow must be installed in the emulator repo's Python. `README.md` already lists it for the
+   hardware suite (line 26); the owner wants it stated as a requirement for the overlay tool too. Exact change for the
+   file's owner, in `README.md` under the Python tools paragraph:
+   "`pillow` is needed by `emulator/layout_overlay.py` (the panel overlay) as well as the hardware suite:
+   `python3 -m pip install pillow`."
+   This lane does not edit `README.md` (held). The script itself already reports the install command when Pillow is
+   missing.
 
-## Open questions for the owner
+## Owner decisions (applied)
 
-1. `emulator/layout_overlay.py` defaults to a path inside the owner's private internal folder. The public repo now
-   carries that absolute path. Should the default come from an environment variable instead (for example
-   `SP16_TOP_VIEW`), so the path stays out of the repo?
-2. The script imports Pillow, which is not declared anywhere in the repo. Add it to the developer requirements, or
-   keep the import optional?
-3. "Centre offset" is taken as the offset from the chassis top-left corner. If the intent was the offset from the
-   chassis centre, or the registration error against the render's real control positions, tell me and I will change it.
+- The overlay's render path is no longer a default in the repo. It comes from `--image` or `SP16_TOP_VIEW` (commit
+  `437c10b`), so no private path is stored in the repo.
+- Pillow: the owner wants it installed in the emulator repo. The script stops with the install command when it is
+  missing. The README line is the cross-lane request above.
+- Centre offset: from the chassis top-left corner, as the script does now. No change.
