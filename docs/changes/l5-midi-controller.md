@@ -1,3 +1,18 @@
+---
+title: "L5: MIDI controller bridge"
+description: "What the MIDI bridge adds (pt-i44.36), how to use it, what it assumes, its checks and the hand-back."
+type: report
+status: active
+created: 2026-10-27
+tags: [sp16, emulator, midi, lane-l5]
+author:
+  harness: claude-code
+  agent: l5-midi-controller
+  model: claude-sonnet-5-5
+  thinking: unknown
+  tokens: unknown
+---
+
 # L5: MIDI controller bridge (pt-i44.36)
 
 New package `emulator/midi_bridge/`; no existing file was edited. Entry point: `python3 -m emulator.midi_bridge`
