@@ -37,6 +37,34 @@ for sp16_port in /sys/class/virtio-ports/*; do
    sp16.gdb) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-gdb ;;
   esac
 done
+# Network (./sp16 run --net): QEMU adds a virtio-net device only then. The app's Pro DJ Link sockets live on eth0, so bring
+# it up when the device exists (virtio device id 1); without one the guest has lo only, as before.
+sp16_have_nic=
+for sp16_dev in /sys/bus/virtio/devices/*/device; do
+  [ -e "$sp16_dev" ] && [ "$(cat "$sp16_dev")" = 0x0001 ] && sp16_have_nic=1
+done
+if [ -n "$sp16_have_nic" ]; then
+  modprobe virtio_net || :
+  sp16_wait=0
+  until [ -e /sys/class/net/eth0 ]; do
+    sp16_wait=$((sp16_wait + 1)); [ "$sp16_wait" -lt 30 ] || break; sleep .1
+  done
+  if [ -e /sys/class/net/eth0 ]; then
+    ip link set eth0 up
+    # The unit's rc.local gives eth0 an address before the app starts (ifconfig from fw_printenv ipaddr); the app crashes
+    # (SIGSEGV) on an eth0 that has none. So: a link-local address from the MAC, 169.254.A.B with A and B from its last
+    # two bytes and kept off .0 and .255. The MAC is random per start (net/qemu-net.sh), so instances differ.
+    sp16_mac=$(cat /sys/class/net/eth0/address)
+    sp16_b5=$(echo "$sp16_mac" | cut -d: -f5); sp16_b6=$(echo "$sp16_mac" | cut -d: -f6)
+    sp16_ip="169.254.$((0x$sp16_b5 % 254 + 1)).$((0x$sp16_b6 % 254 + 1))"
+    ip addr add "$sp16_ip/16" broadcast 169.254.255.255 dev eth0
+    echo "SP16_NET eth0 $sp16_mac $sp16_ip"
+  else
+    sp16_have_nic=
+    echo "SP16_NET no eth0 (virtio_net module missing from this guest image? rebuild with the current Dockerfile)"
+  fi
+fi
+
 # Firmware import boot (decoupled base image only, docs/architecture.md M2): the user's update and an output disk
 # are attached; guest-firmware.py decrypts, assembles and writes the read-only firmware image, then the VM powers off.
 case " $(cat /proc/cmdline) " in
@@ -196,7 +224,11 @@ done
 # looping the app's own MIDI back into it would feed it its own clock. The same page reads eth0's MAC and IP, which the
 # guest does not have (only lo): SP16_FAKE_ETH0 makes the shim answer those ioctls with fake values.
 sp16_midi_env=
-if [ -n "$sp16_app_arg" ]; then sp16_midi_env="-E SP16_MIDI_LOOPBACK=1 -E SP16_FAKE_ETH0=1"; fi
+if [ -n "$sp16_app_arg" ]; then
+  sp16_midi_env="-E SP16_MIDI_LOOPBACK=1"
+  # A real eth0 (--net) is answered by the kernel; the fake one is only for runs without a NIC.
+  [ -n "$sp16_have_nic" ] || sp16_midi_env="$sp16_midi_env -E SP16_FAKE_ETH0=1"
+fi
 # Research builds only (native.py --research --trace): opt-in QEMU user-mode tracing, default off.
 sp16_trace_args=
 case " $(cat /proc/cmdline) " in
