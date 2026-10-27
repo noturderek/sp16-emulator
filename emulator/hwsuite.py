@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-46 checks (HW-01..HW-46) of the emulated hardware boundary, driven only through a research session's control socket,
+47 checks (HW-01..HW-47; HW-47 is an extra outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
@@ -40,7 +40,9 @@ TIMING_CHECKS = ("HW-19", "HW-32", "HW-33", "HW-44")
 MAX_VMS = 3
 EXIT_OK, EXIT_FAIL, EXIT_BLOCKED, EXIT_ENV, EXIT_LOST = range(5)
 STATUSES = ("PASS", "FAIL", "N/A", "BLOCKED", "SKIP")
-TIERS = {"smoke": ("S",), "core": ("S", "C"), "full": ("S", "C", "L")}
+# "X" checks are extras outside verification: a full run never includes them (so a profile can still be marked verified
+# without a testmode build or a disposable session); `--tier extra`, or `--only` naming them, runs them.
+TIERS = {"smoke": ("S",), "core": ("S", "C"), "full": ("S", "C", "L"), "extra": ("X",)}
 
 
 # ------------------------------------------------------------------------------------------------------ check table
@@ -130,10 +132,12 @@ CHECKS = [
           ["device_nodes", "ioctl_set", "identity.panel_protocol_revision"], ["HW-01"]),
     Check("HW-46", "Analog", "ACTIVE drives the filter select line; the shim's filter loop runs", "C",
           ["panel.lamp_roles"], ["HW-01"]),
+    Check("HW-47", "Power", "Standby: the power key enters it (stick unmounted, saves blocked, UI alive); a restart leaves it",
+          "X", ["button_effects.power", "recipes.save_project", "usb.sample_dir", "panel.lamp_roles"], ["HW-01"]),
 ]
 CHECK_BY_ID = {check.id: check for check in CHECKS}
 SMOKE_IDS = tuple(c.id for c in CHECKS if c.tier == "S")
-assert len(CHECKS) == 46 and len(SMOKE_IDS) == 16
+assert len(CHECKS) == 47 and len(SMOKE_IDS) == 16
 
 
 def checks_hash():
@@ -159,7 +163,8 @@ def select_checks(tier="full", only=None):
         unknown = [hw for hw in only if hw not in CHECK_BY_ID]
         if unknown:
             raise ValueError("unknown check ids: " + ", ".join(unknown))
-    return [c.id for c in CHECKS if c.tier in TIERS[tier] and (not only or c.id in only)]
+    return [c.id for c in CHECKS if (c.tier in TIERS[tier] or (only and c.tier == "X" and c.id in only))
+            and (not only or c.id in only)]
 
 
 # ------------------------------------------------------------------------------------------------- profile fields
@@ -3388,6 +3393,79 @@ class Runner:
                         f"changed {bad}, dirty flag {dirty_flag}"))
         return from_subresults("HW-39", subs)
 
+    # ------------------------------------------------------------------ HW-47 standby
+    def standby_save_completes(self):
+        """Does the profile's save recipe finish? (In standby the firmware's save hangs at SAVING 0%.)"""
+        try:
+            self.recipe("save_project")
+            return True
+        except RecipeError:
+            return False
+
+    def hw47(self):
+        """The power key (RX 5.4) puts the app in standby: the TX standby flag (0x67 bit 0) latches, the USB stick is
+        unmounted and its LED goes dark, project saves stop, and the UI stays alive (the socket answers, TX frames
+        keep coming). The emulator has no M1 to wake the app, so leaving standby is a restart: the stick mounts again,
+        the flag is clear and saves work. Runs in its own throwaway session after the main one is stopped."""
+        if self.given_runtime:
+            return verdict("HW-47", "BLOCKED", "needs its own session: omit --runtime")
+        stick = self.out / "hw-stick-standby.img"
+        payload, total = stick_image(fixture_wavs(), self.p["usb"]["sample_dir"])
+        write_sparse(stick, payload, total)
+        hold = (self.p["button_effects"]["power"]).get("hold_s", .3)
+        subs, first = [], None
+        try:
+            self.relaunch(stick, ephemeral=True)
+            s = self.session
+            idle = self.now()
+            console = s.console()
+            subs += [sub("before: standby flag clear", not idle["standby"], f"flag {idle['standby']}"),
+                     sub("before: stick mounted, USB LED lit", any("mounted=yes" in l for l in console_lines(console, "SP16_USB"))
+                         and bool(self.lamp(idle, "usb_led")[0]), " | ".join(console_lines(console, "SP16_USB"))[:160])]
+            offset = s.tx_offset()
+            s.press("power", hold)
+            time.sleep(3.0)
+            records = s.lamps_since(offset)
+            tail_offset = s.tx_offset()
+            time.sleep(1.0)
+            tail = s.lamps_since(tail_offset)
+            console = s.console()
+            first = next((t for t, d in records if d["standby"]), None)
+            subs += [sub("the TX standby flag latches", first is not None and all(d["standby"] for _, d in tail) and bool(tail),
+                         f"{sum(d['standby'] for _, d in records)} of {len(records)} frames, tail {len(tail)} frames"),
+                     sub("UI alive: TX frames keep coming and the socket answers", len(tail) >= 20 and
+                         s.metrics().get("pending_controls") == 0, f"{len(tail)} frames in 1 s"),
+                     sub("stick unmounted by the app", "unmounted_by_app=yes" in console, ""),
+                     sub("USB LED dark", tail != [] and not tail[-1][1]["mono"][self.roles["usb_led"][1]][0],
+                         str(tail[-1][1]["mono"][self.roles["usb_led"][1]] if tail else None))]
+            try:
+                s.snapshot("standby")
+                subs.append(sub("the LCD can still be read", True, "snapshot written"))
+            except (RuntimeError, OSError) as error:
+                subs.append(sub("the LCD can still be read", False, str(error)))
+            subs.append(sub("a project save does not complete", not self.standby_save_completes(), ""))
+            # Leaving standby: no M1 here, so restart the app (clean stop first) and look at the same things again.
+            s.close()
+            seconds = stop(self.build, self.pid, signal.SIGTERM, timeout=20)
+            subs.append(sub("the app stops cleanly from standby (<= 9 s)", seconds is not None and seconds <= 9,
+                            f"{seconds and round(seconds, 2)} s"))
+            self.relaunch(stick, ephemeral=True)
+            s = self.session
+            woke = self.now()
+            console = s.console()
+            subs += [sub("after the restart: standby flag clear", not woke["standby"], f"flag {woke['standby']}"),
+                     sub("after the restart: stick mounted, USB LED lit",
+                         any("mounted=yes" in l for l in console_lines(console, "SP16_USB")) and bool(self.lamp(woke, "usb_led")[0]),
+                         ""),
+                     sub("after the restart: a project save completes", self.standby_save_completes(), "")]
+        except (SessionLost, RecipeError, RuntimeError, OSError) as error:
+            subs.append(sub("the check ran to the end", False, f"{type(error).__name__}: {error}", blocked=True))
+        finally:
+            if self.session:
+                self.session.close()
+                stop(self.build, self.pid)
+        return from_subresults("HW-47", subs, {"flag_seen": first is not None})
+
     # ------------------------------------------------------------------ HW-42, HW-44, HW-45, HW-24
     def library_files(self):
         """Other firmware entries' data images and other builds' app and QEMU (must not change during the run)."""
@@ -3700,6 +3778,8 @@ class Runner:
                 stop(self.build, self.pid)
         if not self.lost and self.need("HW-39"):
             self.record("HW-39", self.hw39)
+        if not self.lost and self.need("HW-47"):
+            self.record("HW-47", self.hw47)
         if "HW-24" in self.partial or self.need("HW-24"):
             subs = self.partial.pop("HW-24", []) or []
             try:

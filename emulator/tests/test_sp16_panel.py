@@ -590,6 +590,13 @@ class MapTests(unittest.TestCase):
         self.assertEqual(decoded["rgb"][0], (1, 2, 3))
         self.assertEqual(decoded["mono"][0], (1, 1))
         self.assertEqual(decoded["mono"][34], (1, None))
+        self.assertFalse(decoded["standby"])
+        frame[0x67] = 0xfe
+        self.assertFalse(panel_map.decode_tx(bytes(frame))["standby"])
+        frame[0x67] = 0x01
+        decoded = panel_map.decode_tx(bytes(frame))
+        self.assertTrue(decoded["standby"])
+        self.assertEqual(decoded["extra"][1], 1)
         frame[0] = 1
         self.assertIsNone(panel_map.decode_tx(bytes(frame)))
         frame[0], frame[0x77] = 2, 0

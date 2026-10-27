@@ -19,14 +19,15 @@ SPEC_SMOKE = ["HW-01", "HW-05", "HW-06", "HW-07", "HW-08", "HW-16", "HW-18", "HW
 
 
 def all_pass(ids=None):
-    return [hwsuite.verdict(hw, "PASS") for hw in (ids or [c.id for c in hwsuite.CHECKS])]
+    return [hwsuite.verdict(hw, "PASS") for hw in (ids or hwsuite.select_checks("full"))]
 
 
 class CheckTableTests(unittest.TestCase):
     def test_table_matches_the_spec(self):
-        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 47)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 48)])
         self.assertEqual(list(hwsuite.SMOKE_IDS), SPEC_SMOKE)
         self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "L"], ["HW-44"])
+        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], ["HW-47"])
 
     def test_tiers_and_only(self):
         self.assertEqual(hwsuite.select_checks("smoke"), SPEC_SMOKE)
@@ -34,6 +35,10 @@ class CheckTableTests(unittest.TestCase):
         self.assertEqual(len(hwsuite.select_checks("full")), 46)
         self.assertEqual(hwsuite.select_checks("full", ["HW-18", "HW-05"]), ["HW-05", "HW-18"])
         self.assertEqual(hwsuite.select_checks("smoke", ["HW-02", "HW-05"]), ["HW-05"])
+        # Extras stay out of full and core, and run by tier or by name.
+        self.assertNotIn("HW-47", hwsuite.select_checks("full"))
+        self.assertEqual(hwsuite.select_checks("extra"), ["HW-47"])
+        self.assertEqual(hwsuite.select_checks("full", ["HW-47", "HW-05"]), ["HW-05", "HW-47"])
         with self.assertRaises(ValueError):
             hwsuite.select_checks("full", ["HW-99"])
         with self.assertRaises(ValueError):
@@ -128,7 +133,7 @@ class VerdictTests(unittest.TestCase):
         text = hwsuite.render_report(result)
         self.assertIn("## HW-18 FAIL", text)
         self.assertIn("- HW-30: analog-only", text)
-        self.assertEqual(text.count("| HW-"), 46)
+        self.assertEqual(text.count("| HW-"), len(verdicts))
 
 
 class FrameTests(unittest.TestCase):

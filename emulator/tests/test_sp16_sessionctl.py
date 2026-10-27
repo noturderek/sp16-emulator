@@ -36,6 +36,7 @@ class FakeApp:
         self.server.listen(1)
         self.behaviour = behaviour
         self.done = threading.Event()
+        self.received = []
         self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
@@ -46,7 +47,8 @@ class FakeApp:
             return
         with client:
             reader = client.makefile("r")
-            while reader.readline():
+            for line in iter(reader.readline, ""):
+                self.received.append(json.loads(line))
                 if self.behaviour in REPLIES:
                     client.sendall(REPLIES[self.behaviour])
                 elif self.behaviour == "trickle":
@@ -194,6 +196,37 @@ class SessionctlTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
         self.assertTrue(result.stderr.startswith("sessionctl: no reply to snapshot within 0.3 s"), result.stderr)
+
+    def tx_line(self, standby):
+        frame = bytearray(128)
+        frame[0], frame[0x77], frame[0x67] = 2, 0xaa, 1 if standby else 0
+        return json.dumps({"t": 1.0, "hex": "000001" + frame.hex()}) + "\n"
+
+    def test_power_presses_and_releases_the_host_control(self):
+        app = self.app("answer")
+        self.session(self.runtime(app)).power(0.01)
+        power = sessionctl.CONTROL_IDS["power"]
+        self.assertEqual([(c["id"], c["action"]) for c in app.received], [(power, 1), (power, 0)])
+
+    def test_the_tx_standby_flag_is_read_from_the_newest_frame_logged_afterwards(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        log = self.tmp / sessionctl.TX_LOG
+        log.write_text(self.tx_line(True))              # before the window: ignored
+        self.assertIsNone(session.tx_standby(0.05))
+        def append():
+            with open(log, "a") as handle:
+                handle.write(self.tx_line(False) + self.tx_line(True))
+        threading.Timer(0.05, append).start()
+        self.assertTrue(session.tx_standby(0.3))
+        self.assertEqual(app.received[0], {"op": "txlog", "on": 1})
+
+    def test_standby_on_the_command_line_needs_yes(self):
+        runtime = self.runtime(self.app("answer"))
+        result = subprocess.run([sys.executable, str(TOOLS / "sessionctl.py"), "--runtime", str(runtime), "standby"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("standby needs the argument yes", result.stderr)
 
 
 if __name__ == "__main__":

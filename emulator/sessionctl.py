@@ -13,12 +13,17 @@ import socket
 import sys
 import time
 
-from panel_map import CONTROL_IDS
+from panel_map import CONTROL_IDS, decode_tx
 
 ACTIONS = {"release": 0, "press": 1, "delta": 2, "value": 3}
 # How long a call waits for the app's reply. A host under heavy load can take well over 10 s to answer (the app serves
 # the socket on a background queue); SP16_CONTROL_TIMEOUT or --timeout overrides it.
 DEFAULT_TIMEOUT = 60.0
+TX_LOG = "tx-frames.jsonl"
+# The power key puts the app in standby, which a real unit's M1 follows by cutting the power; the emulator has no M1,
+# so the app stays in standby, the USB stick is unmounted and saves stop until the app is restarted.
+STANDBY_WARNING = ("the app enters standby: the USB stick is unmounted and saves stop until the app is restarted "
+                   "(the emulator has no M1 to wake it)")
 
 
 class ControlError(RuntimeError):
@@ -171,6 +176,43 @@ class Session:
         and leaves the stick mounted if something still holds it) or "attach" (remount and announce again)."""
         return self.call(op="usb", action=action)
 
+    def power(self, seconds=0.3):
+        """The POWER/STANDBY key (a host control, no place on the panel): press, hold, release. The release is what
+        makes the app go to standby."""
+        self.press("power", seconds)
+
+    def tx_standby(self, window=1.0):
+        """The TX standby flag (byte 0x67 bit 0) of the newest OEM frame logged in the next `window` seconds, or None
+        when no frame arrived. Switches the TX log on."""
+        self.call(op="txlog", on=1)
+        path = self.dir / TX_LOG
+        start = path.stat().st_size if path.exists() else 0
+        time.sleep(window)
+        if not path.exists():
+            return None
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            data = handle.read()
+        flag = None
+        for line in data.splitlines():
+            try:
+                decoded = decode_tx(bytes.fromhex(json.loads(line)["hex"])[3:])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if decoded:
+                flag = decoded["standby"]
+        return flag
+
+    def standby(self, wait=8.0):
+        """Press POWER and wait for the TX standby flag to latch: {"before", "standby", "seconds"}."""
+        before = self.tx_standby(0.5)
+        started = time.monotonic()
+        self.power()
+        flag = self.tx_standby(0.5)
+        while not flag and time.monotonic() - started < wait:
+            flag = self.tx_standby(0.5)
+        return {"before": before, "standby": bool(flag), "seconds": round(time.monotonic() - started, 1)}
+
     def metrics(self):
         return self.call(op="metrics")
 
@@ -193,7 +235,7 @@ def main():
     parser.add_argument("--runtime", required=True, help="session runtime.json")
     parser.add_argument("command", choices=["event", "press", "turn", "touch", "raw", "clear",
                                             "snapshot", "metrics", "txlog", "period", "panelshot", "resize", "adc", "usb",
-                                            "app-restart", "firmware"])
+                                            "app-restart", "firmware", "power", "standby"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=None,
                         help=f"seconds to wait for each reply (default SP16_CONTROL_TIMEOUT or {DEFAULT_TIMEOUT:g})")
@@ -238,6 +280,14 @@ def run_command(session, command, a):
         result = session.usb(a[0] if a else "eject")
     elif command == "adc":
         result = session.adc()
+    elif command == "power":
+        print(f"sessionctl: {STANDBY_WARNING}", file=sys.stderr)
+        session.power(float(a[0]) if a else 0.3)
+        result = {"ok": True, "standby": session.tx_standby()}
+    elif command == "standby":
+        if a[:1] != ["yes"]:
+            raise RuntimeError(f"standby needs the argument yes: {STANDBY_WARNING}")
+        result = session.standby()
     elif command == "app-restart":
         result = session.app_restart()
     elif command == "firmware":

@@ -23,7 +23,8 @@ Wire format (the panel MCU's 128-byte frames; offsets are frame bytes):
      (both 1023 minus the raw word).
   E7 TX frame: byte 0 = 2; 32 RGB lamp channels (3 bytes each, R,G,B): channel 0x10+k -> bytes 1+3k, channel
      k -> bytes 0x31+3k (k = 0..15); 35 mono lamp channels bit-packed into bytes 0x61..0x65, most with a
-     second flag in 0x69..0x6b; extra flags at 0x66, 0x67, 0x68 (bit 0) and a 1..4 level at 0x6e.
+     second flag in 0x69..0x6b; extra flags at 0x66, 0x67, 0x68 (bit 0) and a 1..4 level at 0x6e. Byte 0x67 bit 0 is
+     the standby transition flag, decoded as "standby".
      Channel -> physical lamp assignments are recorded below only when observed.
 
 Per-version measurements (lamp roles, pad curve limits, the selector window) live in the firmware's compatibility
@@ -110,6 +111,9 @@ START_OFF = ("active",)
 COUNTERS = {name: (offset, sign) for name, (offset, sign) in PROFILE["panel"]["counters"].items()}
 
 TX_LENGTH, TX_HEADER, TX_MARKER_OFFSET, TX_MARKER = 128, 2, 0x77, 0xaa
+# The standby transition flag: TX byte 0x67 bit 0. The app sets it once it has handled the power key's release (and in
+# its start-up frames, so read it only after the home screen has settled); a real unit's M1 then cuts the power.
+TX_STANDBY_OFFSET = 0x67
 
 # E7: RGB lamp channel -> first of three consecutive bytes in the TX frame.
 RGB_CHANNELS = {**{0x10 + k: 1 + 3 * k for k in range(16)}, **{k: 0x31 + 3 * k for k in range(16)}}
@@ -136,7 +140,8 @@ def decode_tx(frame):
     mono = {ch: (frame[b] >> bit & 1, None if second is None else frame[second] >> bit & 1)
             for ch, (b, bit, second) in MONO_CHANNELS.items()}
     return {"rgb": rgb, "mono": mono, "level": frame[0x6e],
-            "extra": (frame[0x66] & 1, frame[0x67] & 1, frame[0x68] & 1)}
+            "extra": (frame[0x66] & 1, frame[0x67] & 1, frame[0x68] & 1),
+            "standby": bool(frame[TX_STANDBY_OFFSET] & 1)}
 
 
 # Lamp-only ids shared with panel-layout.json (they have no input).
