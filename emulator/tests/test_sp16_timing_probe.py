@@ -157,14 +157,18 @@ class TxTests(unittest.TestCase):
         self.assertEqual(probe.verdict(under)["onset_sigma_below_1ms"], True)
         self.assertEqual(probe.verdict(under)["tx_stall_max_below_40ms"], True)
 
-    def test_a_stall_the_bridge_also_saw_sits_at_or_before_its_receive(self):
-        report = {"tx": {"stalls_over_limit": 1},
-                  "link": {"gaps_over_limit": 1, "gap_max_ms": 76.5}}
+    def test_a_stall_only_the_bridge_saw_sits_at_or_before_its_receive(self):
+        report = {"tx": {"stalls_over_limit": 0}, "link": {"gaps_over_limit": 1, "gap_max_ms": 76.5}}
         self.assertEqual(probe.stall_hop(report), "guest-to-bridge")
 
     def test_a_stall_only_the_app_logged_sits_after_the_bridge(self):
         report = {"tx": {"stalls_over_limit": 1}, "link": {"gaps_over_limit": 0, "gap_max_ms": None}}
         self.assertEqual(probe.stall_hop(report), "bridge-to-app")
+
+    def test_a_window_with_both_kinds_is_mixed_not_wholly_upstream(self):
+        """A stall the bridge saw does not account for one it did not, so the window is not entirely guest-to-bridge."""
+        report = {"tx": {"stalls_over_limit": 2}, "link": {"gaps_over_limit": 1, "gap_max_ms": 76.5}}
+        self.assertEqual(probe.stall_hop(report), "mixed")
 
     def test_a_clean_window_says_none_and_a_blind_one_says_nothing(self):
         self.assertEqual(probe.stall_hop({"tx": {"stalls_over_limit": 0}, "link": {"gaps_over_limit": 0}}), "none")

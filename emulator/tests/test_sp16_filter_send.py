@@ -54,6 +54,20 @@ class MetricTest(unittest.TestCase):
     def test_a_silent_reading_is_zero_not_missing(self):
         self.assertEqual(filter_send.measure(reading())["send_peak"], 0.0)
 
+    def test_a_stream_the_sink_never_reported_reads_as_none_not_as_silence(self):
+        """A measured 0.0 is silence; a stream absent from the reply is no measurement, and the report must say so."""
+        seen = filter_send.measure({"audio": {"streams": {"ak4458audio-0": {"peak": 0.9, "nonzero_frames": 10}}},
+                                    "guest": {"board": {}}})
+        self.assertIsNone(seen["send_peak"])
+        self.assertIsNone(seen["nonzero_send_frames"])
+        self.assertIsNone(seen["loop_send_peak"])
+        self.assertEqual(seen["master_peak"], 0.9)
+
+    def test_a_zero_reading_is_kept_as_zero(self):
+        seen = filter_send.measure(reading(send_peak=0.0, nonzero=0, loop=(0.0, 0.0, 0)))
+        self.assertEqual(seen["send_peak"], 0.0)
+        self.assertEqual(seen["loop_underruns"], 0)
+
 
 class SampleWindowTest(unittest.TestCase):
     def test_each_figure_is_the_worst_seen_in_the_window(self):
@@ -78,12 +92,21 @@ class SampleWindowTest(unittest.TestCase):
         self.assertEqual(seen["send_peak"], 0.0)
         self.assertEqual(seen["nonzero_send_frames"], 0)
 
-    def test_an_empty_metrics_reply_does_not_raise(self):
+    def test_an_empty_metrics_reply_leaves_every_figure_missing(self):
         session = FakeSession([{}])
         with mock.patch.object(filter_send.time, "sleep"), mock.patch.object(filter_send.time, "monotonic",
                                                                             side_effect=[0, 0, 5]):
             seen = filter_send.sample(session, 1.0)
-        self.assertEqual(seen["send_peak"], 0.0)
+        self.assertIsNone(seen["send_peak"])
+        self.assertIsNone(seen["nonzero_send_frames"])
+
+    def test_a_missing_reading_does_not_erase_a_measured_one(self):
+        session = FakeSession([{}, reading(send_peak=0.4, nonzero=7), {}])
+        with mock.patch.object(filter_send.time, "sleep"), mock.patch.object(filter_send.time, "monotonic",
+                                                                            side_effect=[0, 0, 0, 0, 5]):
+            seen = filter_send.sample(session, 1.0)
+        self.assertEqual(seen["send_peak"], 0.4)
+        self.assertEqual(seen["nonzero_send_frames"], 7)
 
 
 if __name__ == "__main__":
