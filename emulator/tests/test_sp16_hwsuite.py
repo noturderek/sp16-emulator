@@ -562,12 +562,13 @@ class TestmodePageTests(unittest.TestCase):
 
     def test_wait_midi_check_reads_ok_and_reports_the_last_text_on_timeout(self):
         session = FakeSession()
-        with mock.patch.object(hwsuite, "ocr", side_effect=["MIDI CHECK : ---", "MIDI CHECK : OK"]), \
+        with mock.patch.object(hwsuite, "ocr", side_effect=["——", "OK"]) as reader, \
                 mock.patch.object(hwsuite.time, "sleep"):
             ok, text = hwsuite.wait_midi_check(session, timeout=30)
         self.assertTrue(ok)
-        self.assertIn("OK", text)
-        with mock.patch.object(hwsuite, "ocr", return_value="MIDI CHECK : ---"), \
+        self.assertEqual(text, "OK")
+        self.assertEqual(reader.call_args.args[1], hwsuite.MIDI_CHECK_STATUS_BOX)
+        with mock.patch.object(hwsuite, "ocr", return_value="---"), \
                 mock.patch.object(hwsuite.time, "sleep"), \
                 mock.patch.object(hwsuite.time, "monotonic", side_effect=[0.0, 0.0, 31.0]):
             ok, text = hwsuite.wait_midi_check(session, timeout=30)

@@ -30,6 +30,9 @@ expect() { # log-line-regex: the stub's own log from the run just finished
 CC="arm-linux-gnueabi-gcc -Wall -Wextra"
 PRE="qemu-arm-static -L /usr/arm-linux-gnueabi -E LD_PRELOAD=/opt/sp16/libsp16-ui.so"
 run sp16_stub_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
+expect 'backlight level=0'
+expect 'backlight level=255'
+run sp16_network_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE -E SP16_NET_GLINK=1 /tmp/run/t up; $PRE -E SP16_NET_GLINK=0 /tmp/run/t down; $PRE /tmp/run/t off; $PRE /tmp/run/t arp; $PRE -E SP16_NET_ARP=1 /tmp/run/t arp"
 run sp16_din_queue_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/t; /tmp/run/t"
 run sp16_din_contract "$CC /tmp/test.c /opt/sp16/libsp16-ui.so -o /tmp/run/t; $PRE /tmp/run/t"
 expect 'rawmidi hw:snddinmidi,0 ->'
@@ -49,7 +52,8 @@ run sp16_audio_transport_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.
 expect 'audio transport hw:ak4458audio,0 -> /tmp/run/port stream=0 fmt=2 channels=0..15 of 16 rate=44100'
 expect 'audio transport hw:ak4452audio,1 -> /tmp/run/port stream=2 fmt=6 channels=0..1 of 2 rate=44100'
 expect 'converted bit-exact'
-run sp16_board_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_ANY_FORMAT=1 -E SP16_ANALOG=/tmp/run/analog -E SP16_MIDI_LOOPBACK=1 -E SP16_FAKE_ETH0=1 /tmp/run/t"
+run sp16_board_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_ANY_FORMAT=1 -E SP16_ANALOG=/tmp/run/analog -E SP16_MIDI_LOOPBACK=1 -E SP16_FAKE_ETH0=1 -E SP16_USB_OC_PATH=/tmp/run/usb-oc /tmp/run/t"
+expect 'gpio GPIO4_IO14=0 USBPWR_OC'
 expect 'dac hpf word=0x1fff ctrl=1 code=4095 writes=1'
 expect 'analog board state mapped from /tmp/run/analog'
 expect 'midi loopback /dev/ttymxc1 first bytes=4'

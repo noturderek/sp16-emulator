@@ -155,6 +155,7 @@ ANALOG_LEVELS = re.compile(r"\[sp16-ui-stub\] analog levels limiter=([01]) in_pe
                            r"out_dbu_peak=(-?[0-9.]+) limited=(\d+) main_out_gain=([0-9.]+) input_gain=([0-9.]+) source=(off|tone|wav)$")
 TX_DROPPED = re.compile(r"\[sp16-ui-stub\] panel TX frames dropped=(\d+) errno=(\d+)$")
 GPIO_LINE = re.compile(r"\[sp16-ui-stub\] gpio (GPIO\d_IO\d\d)=([01]) ([A-Za-z_/?]+)$")
+BACKLIGHT_LEVEL = re.compile(r"\[sp16-ui-stub\] backlight level=(\d+)$")
 MIDI_LOOP = re.compile(r"\[sp16-ui-stub\] midi loopback (/dev/[a-z0-9_]+) first bytes=(\d+)$")
 
 
@@ -187,6 +188,10 @@ def board_line(line):
     match = GPIO_LINE.match(line)
     if match:
         return "gpio", (match.group(1), int(match.group(2)))
+    match = BACKLIGHT_LEVEL.match(line)
+    if match:
+        level = int(match.group(1))
+        return ("backlight", level) if 0 <= level <= 255 else None
     return None
 
 
@@ -210,6 +215,8 @@ def main():
     counters = Counters()
     link = LinkTiming(counters)
     state = {"txlog": False, "generation": 0, "lamps": {}, "live": False}
+    usb_oc_path = Path(f"{ROOT}/dev/sp16-usb-oc")
+    usb_oc_path.write_bytes(b"1")
     logged_lines = 0
 
     def diagnostics():
@@ -477,6 +484,10 @@ def main():
                         model.clear_overrides()
                     elif op == "period":
                         timing["period"] = offset / 1000
+                    elif op == "usb-oc":
+                        temporary = usb_oc_path.with_suffix(".next")
+                        temporary.write_bytes(b"0" if offset else b"1")
+                        temporary.replace(usb_oc_path)
                     else:
                         state["txlog"] = bool(offset)
                     continue

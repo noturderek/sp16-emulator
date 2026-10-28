@@ -359,6 +359,8 @@ class PanelModel:
         if action == "up":
             return self._lcd_touch_raw(0, 0, False)
         raw_x, raw_y = panel_map.screen_to_touch_raw(screen_x, screen_y, self.touch_calibration)
+        limit = panel_map.ANALOG_FULL_SCALE
+        raw_x, raw_y = min(limit, max(0, raw_x)), min(limit, max(0, raw_y))
         return self._lcd_touch_raw(raw_x, raw_y, True)
 
     def lcd_touch_raw(self, raw_x, raw_y, contact):

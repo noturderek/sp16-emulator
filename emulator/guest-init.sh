@@ -281,6 +281,11 @@ if [ -n "$sp16_app_arg" ]; then
   # A real eth0 (--net) is answered by the kernel; the fake one is only for runs without a NIC.
   [ -n "$sp16_have_nic" ] || sp16_midi_env="$sp16_midi_env -E SP16_FAKE_ETH0=1"
 fi
+# Only a configured virtio NIC gets synthetic carrier and real ARP traffic.
+sp16_net_env=
+if [ -n "$sp16_have_nic" ]; then
+  sp16_net_env="-E SP16_NET_GLINK=1 -E SP16_NET_ARP=1"
+fi
 # Research builds only (native.py --research --trace): opt-in QEMU user-mode tracing, default off.
 sp16_trace_args=
 case " $(cat /proc/cmdline) " in
@@ -633,7 +638,7 @@ fi
     SP16_APP_CWD=$sp16_app_cwd python3 /opt/sp16/enter.py /tmp/sp16-root /qemu-arm-static $sp16_trace_args -cpu $sp16_cpu \
      -E DISPLAY=127.0.0.1:99 -E LD_LIBRARY_PATH=$sp16_ldpath \
      -E LD_PRELOAD=$sp16_preload -E ALSA_CONFIG_PATH=/etc/sp16-alsa.conf \
-     -E SP16_PANEL_INPUT=1 $sp16_tap_env $sp16_audio_env $sp16_midi_env \
+     -E SP16_PANEL_INPUT=1 -E SP16_USB_OC_PATH=/dev/sp16-usb-oc $sp16_tap_env $sp16_audio_env $sp16_midi_env $sp16_net_env \
      $sp16_app_path $sp16_app_arg >> /output/application.txt 2>&1 &
     echo $! > /run/sp16-app.pid
     echo "SP16_APP_STARTED pid=$!" > /dev/console

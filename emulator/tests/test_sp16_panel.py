@@ -51,7 +51,10 @@ class ProtocolTests(unittest.TestCase):
     def test_research_operations_are_bounded(self):
         self.assertEqual(protocol.decode_research(bytes([1, 0x3c, 0xaa])), ("raw", 0x3c, b"\xaa"))
         self.assertEqual(protocol.decode_research(bytes([2, 1, 2, 3, 4]))[0], "cdc")
-        for bad in (b"", bytes([1, 127, 1, 2]), bytes([2, 1]), bytes([4, 2]), bytes([9])):
+        self.assertEqual(protocol.decode_research(bytes([6, 0])), ("usb-oc", 0, b""))
+        self.assertEqual(protocol.decode_research(bytes([6, 1])), ("usb-oc", 1, b""))
+        for bad in (b"", bytes([1, 127, 1, 2]), bytes([2, 1]), bytes([4, 2]),
+                    bytes([6]), bytes([6, 2]), bytes([6, 0, 1]), bytes([9])):
             with self.assertRaises(ValueError):
                 protocol.decode_research(bad)
 
@@ -361,6 +364,17 @@ class LcdTouchTests(unittest.TestCase):
         self.assertEqual(raw, (512, 533))
         self.assertNotEqual(raw, panel_map.screen_to_touch_raw(400, 240))
 
+    def test_screen_touch_clamps_raw_words_under_non_default_calibration(self):
+        calibration = dict(panel_map.LCD_TOUCH_CALIBRATION)
+        calibration["raw_x"], calibration["raw_y"] = (1100, -100), (-100, 1200)
+        model = panel.PanelModel(touch_calibration=calibration)
+        self.assertEqual(model.lcd_touch(0, 0, "down"), protocol.INPUT_OK)
+        frame = model.frame()
+        self.assertEqual((self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                          self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET)), (1023, 0))
+        self.assertIsNotNone(panel.decode_rx(frame))
+        self.assertTrue(model.touch_contact)
+
     def test_raw_injection_bypasses_calibration_and_is_range_checked(self):
         model = panel.PanelModel()
         self.assertEqual(model.lcd_touch_raw(500, 400, True), protocol.INPUT_OK)
@@ -549,6 +563,9 @@ class BoardModelTests(unittest.TestCase):
                          ("midi_loopback", {"node": "/dev/ttymxc1", "first_bytes": 4}))
         self.assertIsNone(board_line("[sp16-ui-stub] dac write of 7 bytes ignored (expected 2)"))
         self.assertEqual(board_line("[sp16-ui-stub] gpio GPIO5_IO05=1 SEL_xTHRU/DSF"), ("gpio", ("GPIO5_IO05", 1)))
+        self.assertEqual(board_line("[sp16-ui-stub] backlight level=0"), ("backlight", 0))
+        self.assertEqual(board_line("[sp16-ui-stub] backlight level=255"), ("backlight", 255))
+        self.assertIsNone(board_line("[sp16-ui-stub] backlight level=256"))
 
     def test_shim_board_lines_match_the_bridge_patterns(self):
         source = (TOOLS / "hardware_stub.c").read_text()

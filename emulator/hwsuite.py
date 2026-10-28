@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-53 checks (HW-01..HW-54; HW-47..HW-54 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
+54 checks (HW-01..HW-54; HW-47..HW-54 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
@@ -1207,8 +1207,9 @@ def testmode_goto(session, page, timeout=120.0):
 
 # Page 8 (DEVICE TEST): the MIDI CHECK touch button (about (115, 112)) opens /dev/ttymxc1 twice, writes a 4-byte
 # pattern, polls 2 s and reads it back through the DIN MIDI loopback (service manual); the page then shows
-# "MIDI CHECK : OK" (the colon is drawn as a box on some revisions, so the separator is loose).
-MIDI_CHECK_OK = re.compile(r"MIDI\s*CHECK[\s:\[\]=]*OK", re.I)
+# The status sits to the right of the coloured button. OCR of the entire white page misses both button text and
+# status; the tight status crop reads the actual ---/OK glyphs reliably.
+MIDI_CHECK_STATUS_BOX = (200, 80, 260, 145)
 
 
 def wait_midi_check(session, timeout=30.0):
@@ -1217,8 +1218,8 @@ def wait_midi_check(session, timeout=30.0):
     deadline = time.monotonic() + timeout
     text = ""
     while True:
-        text = norm(ocr(session.image("midi"), psm=6, scale=3))
-        if MIDI_CHECK_OK.search(text):
+        text = norm(ocr(session.image("midi"), MIDI_CHECK_STATUS_BOX, psm=7, scale=3))
+        if text == "OK":
             return True, text
         if time.monotonic() > deadline:
             return False, text

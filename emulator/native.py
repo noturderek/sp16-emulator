@@ -609,7 +609,7 @@ def net_environment(mode, net_ip=None):
 
 
 def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overlay=None, no_ui_input=False,
-           no_audio_files=False, net=None, net_ip=None):
+           no_audio_files=False, net=None, net_ip=None, midi=False):
     host_check()
     output = private_path(output)
     assets = validated_assets(output)
@@ -639,12 +639,12 @@ def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overla
         + (["--dev-overlay", dev_overlay_path(dev_overlay)] if dev_overlay else []) \
         + (["--no-ui-input"] if no_ui_input else []) + (["--no-audio-files"] if no_audio_files else [])
     env_args = [arg for key, value in net_env.items() for arg in ("--env", f"{key}={value}")]
-    midi_since = time.time()
+    midi_since = time.time() if midi else None
     run(["open", "-n", *(["-g"] if no_ui_input else []), *env_args, assets["app_bundle"],
          *(["--args", *app_args] if app_args else [])])
     # The app owns QEMU's lifetime; this bridge joins its DIN socket and exits when that socket closes.
     # Keep it separate from the panel bridge's virtio port.
-    if output.is_dir():
+    if midi and output.is_dir():
         with (output / "din-midi.log").open("a") as midi_log:
             subprocess.Popen([sys.executable, "-m", "midi.din", "--wait-for-session", str(output),
                               "--since", str(midi_since), "--build-dir", str(output.parent),
@@ -799,6 +799,7 @@ def main():
     launcher.add_argument("--no-audio-files", action="store_true",
                           help="audio builds: the sink keeps reading and counting the guest's PCM (metrics) but "
                                "writes no WAV into the session folder")
+    launcher.add_argument("--midi", action="store_true", help="start the CoreMIDI DIN bridge for this session")
     fw = commands.add_parser("firmware", help="decoupled builds: import, list, check and manage user-supplied firmware")
     fw.add_argument("action", choices=("import", "list", "show", "check", "rename", "remove", "select", "audit",
                                        "profile"))
@@ -833,7 +834,7 @@ def main():
             return diagnostics_command(args)
         else:
             launch(args.output, args.ephemeral, args.usb_image, args.firmware, args.dev_overlay, args.no_ui_input,
-                   args.no_audio_files, args.net, args.net_ip)
+                   args.no_audio_files, args.net, args.net_ip, args.midi)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"native emulator failed: {exc}\n")
 

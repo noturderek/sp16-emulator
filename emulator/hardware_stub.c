@@ -249,12 +249,30 @@ static int gpio_open(void) {
     devices[pair[0]]=(struct state){ .kind=GPIO,.peer=pair[1] };
     return pair[0];
 }
+static uint8_t usb_oc_level(void) {
+    const char *path=getenv("SP16_USB_OC_PATH");
+    if (!path || !*path) return 1;
+    int fd=original_open(path,O_RDONLY|O_CLOEXEC);
+    if (fd<0) return 1;
+    char value=0;
+    ssize_t count=original_read(fd,&value,1);
+    original_close(fd);
+    return count==1 && value=='0' ? 0 : 1;
+}
 static ssize_t gpio_io(struct state *s,void *buffer,size_t count,int writing) {
     uint8_t *b=buffer;
     size_t n=0;
     for (;n<count && s->offset<GPIO_LINES;n++,s->offset++) {
         unsigned line=s->offset;
-        if (!writing) { b[n]=gpio_level[line]; continue; }
+        if (!writing) {
+            if (line==3*32+14) {
+                uint8_t level=usb_oc_level();
+                if (__atomic_exchange_n(&gpio_level[line],level,__ATOMIC_ACQ_REL)!=level)
+                    fprintf(stderr,"[sp16-ui-stub] gpio GPIO4_IO14=%u USBPWR_OC\n",level);
+            }
+            b[n]=__atomic_load_n(&gpio_level[line],__ATOMIC_ACQUIRE);
+            continue;
+        }
         uint8_t level=b[n]&1;
         __atomic_add_fetch(&gpio_writes,1,__ATOMIC_RELAXED);
         int first=!__atomic_exchange_n(&gpio_written[line],1,__ATOMIC_ACQ_REL);
@@ -305,7 +323,7 @@ static ssize_t midi_write(struct state *s,const void *buffer,size_t count) {
 typedef struct _snd_rawmidi snd_rawmidi_t;
 #define RAWMIDI_MAGIC 0x534d4944u
 #define MIDI_BYTE_NS 320000ULL
-struct fake_rawmidi { uint32_t magic; int fd, input; };
+struct fake_rawmidi { uint32_t magic; int fd, input, nonblock; };
 static volatile int rawmidi_wire_lock;
 static uint64_t rawmidi_next_ns;
 static int rawmidi_fd=-1;
@@ -316,7 +334,7 @@ static int rawmidi_open_port(void) {
     if (rawmidi_fd>=0) return rawmidi_fd;
     const char *path=getenv("SP16_DIN_PORT");
     if (!path) path="/dev/sp16-din";
-    int fd=original_open(path,O_RDWR|O_CLOEXEC);
+    int fd=original_open(path,O_RDWR|O_CLOEXEC|O_NONBLOCK);
     if (fd>=0) rawmidi_fd=fd;
     return fd;
 }
@@ -330,8 +348,8 @@ int snd_rawmidi_open(snd_rawmidi_t **input,snd_rawmidi_t **output,const char *na
     struct fake_rawmidi *in=NULL,*out=NULL;
     if (input) { in=calloc(1,sizeof(*in)); if (!in) return -ENOMEM; }
     if (output) { out=calloc(1,sizeof(*out)); if (!out) { free(in); return -ENOMEM; } }
-    if (in) { in->magic=RAWMIDI_MAGIC; in->fd=port; in->input=1; *input=(snd_rawmidi_t *)in; }
-    if (out) { out->magic=RAWMIDI_MAGIC; out->fd=port; *output=(snd_rawmidi_t *)out; }
+    if (in) { in->magic=RAWMIDI_MAGIC; in->fd=port; in->input=1; in->nonblock=!!(mode&1); *input=(snd_rawmidi_t *)in; }
+    if (out) { out->magic=RAWMIDI_MAGIC; out->fd=port; out->nonblock=!!(mode&1); *output=(snd_rawmidi_t *)out; }
     fprintf(stderr,"[sp16-ui-stub] rawmidi %s -> %s input=%d output=%d\n",name,
             getenv("SP16_DIN_PORT")?getenv("SP16_DIN_PORT"):"/dev/sp16-din",!!input,!!output);
     return 0;
@@ -347,19 +365,46 @@ int snd_rawmidi_close(snd_rawmidi_t *handle) {
 int snd_rawmidi_nonblock(snd_rawmidi_t *handle,int nonblock) {
     int (*real)(snd_rawmidi_t *,int)=dlsym(RTLD_NEXT,"snd_rawmidi_nonblock");
     if (!rawmidi_is_fake(handle)) return real?real(handle,nonblock):-ENOSYS;
-    int flags=fcntl(((struct fake_rawmidi *)handle)->fd,F_GETFL);
-    return flags<0?-errno:fcntl(((struct fake_rawmidi *)handle)->fd,F_SETFL,nonblock?flags|O_NONBLOCK:flags&~O_NONBLOCK)<0?-errno:0;
+    __atomic_store_n(&((struct fake_rawmidi *)handle)->nonblock,!!nonblock,__ATOMIC_RELEASE);
+    return 0;
+}
+static int rawmidi_write_byte(int fd,uint8_t byte,int nonblock) {
+    while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
+    uint64_t now=mono_ns();
+    uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
+    struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
+    int slept;
+    do { slept=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); } while (slept==EINTR);
+    int error=slept;
+    if (!error) for (;;) {
+        ssize_t wrote=original_write(fd,&byte,1);
+        if (wrote==1) break;
+        error=wrote==0 ? EIO : errno;
+        if (error!=EAGAIN || nonblock) break;
+        struct pollfd ready={ .fd=fd,.events=POLLOUT };
+        if (poll(&ready,1,-1)<0 && errno!=EINTR) { error=errno; break; }
+        error=0;
+    }
+    rawmidi_next_ns=target;
+    __sync_lock_release(&rawmidi_wire_lock);
+    return error ? -error : 0;
 }
 ssize_t snd_rawmidi_read(snd_rawmidi_t *handle,void *buffer,size_t count) {
     ssize_t (*real)(snd_rawmidi_t *,void *,size_t)=dlsym(RTLD_NEXT,"snd_rawmidi_read");
     if (!rawmidi_is_fake(handle)) return real?real(handle,buffer,count):-ENOSYS;
     struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
     if (!fake->input) return -EBADF;
-    ssize_t n=original_read(fake->fd,buffer,count);
+    ssize_t n;
+    for (;;) {
+        n=original_read(fake->fd,buffer,count);
+        if (n>=0 || errno!=EAGAIN || __atomic_load_n(&fake->nonblock,__ATOMIC_ACQUIRE)) break;
+        struct pollfd ready={ .fd=fake->fd,.events=POLLIN };
+        if (poll(&ready,1,-1)<0 && errno!=EINTR) return -errno;
+    }
     if (n>0 && gpio_ready && __atomic_load_n(&gpio_level[5],__ATOMIC_ACQUIRE)==1) {
         /* MIDI_PASS is the hardware THRU gate. Echo incoming bytes to the host, not back to the app. */
         const uint8_t *bytes=buffer;
-        for (ssize_t i=0;i<n;i++) original_write(fake->fd,bytes+i,1);
+        for (ssize_t i=0;i<n;i++) (void)rawmidi_write_byte(fake->fd,bytes[i],0);
     }
     return n<0?-errno:n;
 }
@@ -370,17 +415,8 @@ ssize_t snd_rawmidi_write(snd_rawmidi_t *handle,const void *buffer,size_t count)
     if (fake->input) return -EBADF;
     const uint8_t *bytes=buffer;
     for (size_t i=0;i<count;i++) {
-        while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
-        uint64_t now=mono_ns();
-        uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
-        struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
-        int sleep_result;
-        do { sleep_result=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); }
-        while (sleep_result==EINTR);
-        ssize_t wrote=sleep_result? -1 : original_write(fake->fd,bytes+i,1);
-        rawmidi_next_ns=target;
-        __sync_lock_release(&rawmidi_wire_lock);
-        if (wrote!=1) return i?(ssize_t)i:-(sleep_result?sleep_result:errno);
+        int result=rawmidi_write_byte(fake->fd,bytes[i],__atomic_load_n(&fake->nonblock,__ATOMIC_ACQUIRE));
+        if (result) return i?(ssize_t)i:result;
     }
     return (ssize_t)count;
 }
@@ -583,6 +619,30 @@ static void note_ioctl(unsigned long request, enum device kind) {
 #define SP16_SIOCGIFNETMASK 0x891bUL
 #define SP16_SIOCGIFHWADDR 0x8927UL
 #define SP16_SIOCETHTOOL 0x8946UL
+/* A networked guest has a real eth0, but QEMU user-mode can reject its carrier
+ * query. Only an explicit opt-in supplies the ETHTOOL_GLINK result. */
+static int network_glink_ioctl(unsigned long request, void *arg, int *result) {
+    const char *value=getenv("SP16_NET_GLINK");
+    if (!value || (strcmp(value,"0") && strcmp(value,"1")) ||
+        request!=SP16_SIOCETHTOOL || !arg) return 0;
+    struct ifreq *ifr=arg;
+    if (strncmp(ifr->ifr_name,"eth0",IFNAMSIZ)) return 0;
+    if (!ifr->ifr_data) { errno=EFAULT; *result=-1; return 1; }
+    uint32_t *ethtool=(uint32_t *)ifr->ifr_data;
+    if (ethtool[0]!=10) return 0; /* ETHTOOL_GLINK only */
+    ethtool[1]=value[0]=='1' ? 1U : 0U;
+    static int logged;
+    if (!__atomic_exchange_n(&logged,1,__ATOMIC_RELAXED))
+        fprintf(stderr,"[sp16-ui-stub] network eth0 GLINK=%u\n",ethtool[1]);
+    *result=0;
+    return 1;
+}
+
+static int network_arp_enabled(void) {
+    const char *value=getenv("SP16_NET_ARP");
+    return value && !strcmp(value,"1");
+}
+
 static int fake_eth0_enabled(void) {
     static int enabled=-1;
     if (enabled<0) { const char *v=getenv("SP16_FAKE_ETH0"); enabled = v && !strcmp(v,"1"); }
@@ -637,6 +697,7 @@ int ioctl(int fd, unsigned long request, ...) {
     struct state *s = device(fd);
     if (!s) {
         int fake_result;
+        if (network_glink_ioctl(request, arg, &fake_result)) return fake_result;
         if (fake_eth0_ioctl(request, arg, &fake_result)) return fake_result;
         return original_ioctl(fd, request, arg);
     }
@@ -646,7 +707,16 @@ int ioctl(int fd, unsigned long request, ...) {
 }
 
 static int device_ioctl(struct state *s, int fd, unsigned long request, void *arg) {
-    if (s->kind==BACKLIGHT && request==0x40047000UL) return arg?0:(errno=EFAULT,-1);
+    if (s->kind==BACKLIGHT && request==0x40047000UL) {
+        if (!arg) { errno=EFAULT; return -1; }
+        uint32_t level=*(const uint32_t *)arg;
+        static uint32_t last_level=UINT32_MAX;
+        if (level!=last_level) {
+            last_level=level;
+            fprintf(stderr,"[sp16-ui-stub] backlight level=%u\n",level);
+        }
+        return 0;
+    }
     if (s->kind==MIDI) {
         /* A UART line setting has no meaning on the cable: TCGETS reports a zeroed kernel termios (36 bytes on
          * ARM), the TCSETS family and TCFLSH are accepted, FIONREAD is answered by the socket. */
@@ -752,7 +822,8 @@ static const char *access_label(int access) {
 }
 int snd_pcm_open(snd_pcm_t **handle, const char *name, int stream, int mode) {
     int (*real)(snd_pcm_t **,const char *,int,int)=dlsym(RTLD_NEXT,"snd_pcm_open");
-    int matched=!strcmp(name,"hw:ak4452audio,0") || !strcmp(name,"hw:ak4452audio,1") || !strcmp(name,"hw:ak4458audio,0");
+    int matched=!strcmp(name,"hw:ak4452audio,0") || !strcmp(name,"hw:ak4452audio,1") ||
+                !strncmp(name,"hw:ak4458audio,",15);
     int result=real(handle,matched?"null":name,stream,mode);
     if (matched) {
         fprintf(stderr,"[sp16-ui-stub] PCM %s -> null stream=%d result=%d\n",name,stream,result);
@@ -788,7 +859,7 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
 static int codec_refuses(const struct pcm_state *s,int format) {
     const char *any=getenv("SP16_PCM_ANY_FORMAT");
     if (!s || (any && !strcmp(any,"1"))) return 0;
-    if (!strcmp(s->name,"hw:ak4458audio,0")) return format!=2;
+    if (!strncmp(s->name,"hw:ak4458audio,",15)) return format!=2;
     if (!strncmp(s->name,"hw:ak4452audio,",15)) return format!=2 && format!=6;
     return 0;
 }
@@ -1702,7 +1773,7 @@ int poll(struct pollfd *fds,nfds_t count,int timeout) {
 
 int socket(int domain,int type,int protocol) {
     int (*real)(int,int,int)=dlsym(RTLD_NEXT,"socket");
-    if (domain==AF_PACKET && (type&0xf)==SOCK_DGRAM && protocol==1544) {
+    if (domain==AF_PACKET && (type&0xf)==SOCK_DGRAM && protocol==1544 && !network_arp_enabled()) {
         int fd=idle_socket(PACKET);
         fprintf(stderr,"[sp16-ui-stub] ARP socket -> isolated idle fd=%d\n",fd);
         return fd;
