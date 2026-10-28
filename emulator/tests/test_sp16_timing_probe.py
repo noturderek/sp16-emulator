@@ -157,6 +157,34 @@ class TxTests(unittest.TestCase):
         self.assertEqual(probe.verdict(under)["onset_sigma_below_1ms"], True)
         self.assertEqual(probe.verdict(under)["tx_stall_max_below_40ms"], True)
 
+    def test_a_stall_the_bridge_also_saw_sits_at_or_before_its_receive(self):
+        report = {"tx": {"stalls_over_limit": 1},
+                  "link": {"gaps_over_limit": 1, "gap_max_ms": 76.5}}
+        self.assertEqual(probe.stall_hop(report), "guest-to-bridge")
+
+    def test_a_stall_only_the_app_logged_sits_after_the_bridge(self):
+        report = {"tx": {"stalls_over_limit": 1}, "link": {"gaps_over_limit": 0, "gap_max_ms": None}}
+        self.assertEqual(probe.stall_hop(report), "bridge-to-app")
+
+    def test_a_clean_window_says_none_and_a_blind_one_says_nothing(self):
+        self.assertEqual(probe.stall_hop({"tx": {"stalls_over_limit": 0}, "link": {"gaps_over_limit": 0}}), "none")
+        self.assertIsNone(probe.stall_hop({"tx": {"error": "too few frames"}, "link": {"gaps_over_limit": 0}}))
+        self.assertIsNone(probe.stall_hop({"tx": {"stalls_over_limit": 2}, "link": None}))
+
+    def test_the_link_window_takes_counter_differences_and_a_growing_maximum(self):
+        before = {"tx_recv": 4000, "tx_gaps_over_40ms": 2, "tx_gap_max_ms": 50.0, "lock_wait_max_ms": 3.0,
+                  "frame_write_max_ms": 9.0, "outbox_dropped": 0}
+        after = {"tx_recv": 4100, "tx_gaps_over_40ms": 3, "tx_gap_max_ms": 76.5, "lock_wait_max_ms": 3.0,
+                 "frame_write_max_ms": 9.0, "outbox_dropped": 0}
+        window = probe.link_window(before, after)
+        self.assertEqual(window["tx_recv"], 100)
+        self.assertEqual(window["gaps_over_limit"], 1)
+        self.assertEqual(window["gap_max_ms"], 76.5)          # it grew, so this is the window's own maximum
+        self.assertEqual(window["gap_max_ms_at_session_start"], 50.0)
+        self.assertIsNone(probe.link_window(before, {**after, "tx_gap_max_ms": 50.0})["gap_max_ms"])
+        self.assertIsNone(probe.link_window(None, after))
+        self.assertEqual(probe.link_window(before, {**after, "tx_recv": 4100})["tx_recv"], 100)
+
     def test_a_lost_frame_makes_the_window_unclean_whichever_counter_shows_it(self):
         base = {"jitter_sigma_ms": 0.0}
         self.assertFalse(probe.verdict({"audio": {**base, "gap_frames_in_window": 64, "guest_drops_in_window": 0}})["audio_window_clean"])

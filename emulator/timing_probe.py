@@ -12,7 +12,9 @@ measurements over the same window:
   threshold) give the step interval and its jitter in samples and milliseconds, and a straight-line fit of onset
   against step index gives the tempo and the residual jitter.
 * TX stalls: the intervals between the firmware's panel (lamp) frames as the host received them. A stall is a gap
-  above the limit (40 ms by default); the maximum is the number to watch.
+  above the limit (40 ms by default); the maximum is the number to watch. The bridge counts the same frames at its own
+  end, so the report also says which hop a stall sat on: `guest-to-bridge` when the bridge itself waited between two
+  arriving frames, `bridge-to-app` when it received them on time and the host app's reader or log writer was late.
 
 The audio clock and the panel link are independent paths: the jitter is the emulated sampler's own timing, the stalls
 are what the host sees of the panel. Both depend on host load, so the report carries the load average and the number
@@ -189,6 +191,48 @@ def bridge_timing(session):
     return (guest.get("board") or {}).get("bridge_timing")
 
 
+def link_window(before, after):
+    """The bridge's own link counters for the window, and which hop the app's stalls happened on.
+
+    The app logs each panel frame when its own reader has taken it; the bridge counts each one when it arrives from the
+    guest. Comparing the two over the same window says where a stall sat: a gap the bridge counted happened at or
+    before its receive (the guest's pacing or the datagram path), and a gap only the app's log shows happened between
+    the bridge's receive and the log line."""
+    if not before or not after:
+        return None
+
+    def delta(key):
+        first, last = before.get(key), after.get(key)
+        return None if first is None or last is None else last - first
+
+    # tx_gap_max_ms is a running maximum, so a value that grew during the window is that window's own maximum; a value
+    # that did not grow says only that the window stayed under the earlier maximum, which is not a measurement of it.
+    grew = (before.get("tx_gap_max_ms") is not None and after.get("tx_gap_max_ms") is not None
+            and after["tx_gap_max_ms"] > before["tx_gap_max_ms"])
+    return {"tx_recv": delta("tx_recv"), "gaps_over_limit": delta("tx_gaps_over_40ms"),
+            "gap_max_ms": after.get("tx_gap_max_ms") if grew else None,
+            "gap_max_ms_at_session_start": before.get("tx_gap_max_ms"),
+            "lock_wait_max_ms": after.get("lock_wait_max_ms"),
+            "frame_write_max_ms": after.get("frame_write_max_ms"), "outbox_dropped": after.get("outbox_dropped")}
+
+
+def stall_hop(report):
+    """Where the window's panel-frame stalls sat, or None when the run cannot say.
+
+    `guest-to-bridge` means the bridge itself waited that long between two arriving frames; `bridge-to-app` means the
+    bridge received them on time and the delay is in the host app's own reader and log writer."""
+    stalls = (report.get("tx") or {}).get("stalls_over_limit")
+    link = report.get("link") or {}
+    bridge = link.get("gaps_over_limit")
+    if stalls is None or bridge is None:
+        return None
+    if stalls and bridge:
+        return "guest-to-bridge"
+    if stalls:
+        return "bridge-to-app"
+    return "none"
+
+
 def run(args):
     sys.path.insert(0, str(TOOLS))
     import hwsuite
@@ -251,6 +295,7 @@ def run(args):
                       "gap_frames_in_window": counters_end["gap_frames"] - counters_start["gap_frames"],
                       "guest_drops_in_window": counters_end["guest_drops"] - counters_start["guest_drops"]},
             "tx": tx_stalls(read_tx_times(session.dir, tx_start), args.stall_ms),
+            "link": link_window(link_before, link_after),
             "bridge_timing": {"before": link_before, "after": link_after}}
         if not args.no_setup:
             runner.select_track(2)
@@ -310,6 +355,7 @@ def main(argv=None):
     else:
         report = run(args)
         report["targets_met"] = verdict(report)
+        report["stall_hop"] = stall_hop(report)
     print(json.dumps(report, indent=1))
     return 0
 

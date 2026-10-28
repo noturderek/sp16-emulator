@@ -163,3 +163,60 @@ where MODE1 and MODE3 read 1000.01 Hz: a 3 % rise through the modelled loop, wit
 shim's loop rate or the firmware's send path, and this lane did not separate them. It matters for two things already
 recorded: HW-46's informational headphone levels, and the filter-send probe (section 4), whose return path is the same
 one.
+
+## 3. The residual panel-frame stall: it is no longer in the bridge
+
+`pt-i44.33` asked for the probe's two figures over 60 s and for the panel-frame (TX) stalls to be found and fixed.
+Section 6 of [l2-audio-timing.md](l2-audio-timing.md) is the history: 164 ms maximum before that lane, 76.5 ms after
+its bridge and App Nap fixes. Two things were missing from the tool: it could not say *which hop* a stall sat on, and
+so a residual stall could not be attributed to a file.
+
+### What changed in `timing_probe.py`
+
+`run` now also reports a `link` block and a `stall_hop`: the bridge counts each panel frame when it arrives from the
+guest and the host app logs each one when its own reader has taken it, so comparing the two over the same window says
+where the delay was. `link_window()` takes the counter differences and treats `tx_gap_max_ms` correctly as a running
+maximum — a value that grew during the window *is* that window's maximum, and a value that did not grow is reported as
+`null` rather than as a measurement of zero. `stall_hop()` returns `guest-to-bridge` when the bridge itself waited that
+long between two arriving frames, `bridge-to-app` when it received them on time and the app's reader or log writer was
+late, and `none` for a clean window.
+
+### Two 60 s runs
+
+Commands (load read at the start of each window, from the same worktree and build as section 1):
+
+```sh
+python3 emulator/timing_probe.py run --build ld-measure --seconds 60
+```
+
+| Run | load1 before / after | VMs | onset sigma | TX frames | period mean / sigma | TX stall max | stalls > 40 ms | bridge's own max gap | bridge gaps > 40 ms | `stall_hop` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 7.8 / 7.3 | 1 | 0.006 ms | 4137 | 15.03 / 1.56 ms | **21.9 ms** | 0 | ≤ 34.6 ms (unchanged) | 0 | `none` |
+| 2 | 8.3 / 10.2 | 2 | 0.006 ms | 4144 | 15.06 / 2.15 ms | **46.9 ms** | 3 | 36.5 ms (grew from 27.5) | 0 | **`bridge-to-app`** |
+
+Both runs: tempo 120.000 BPM, `step_samples_fitted` 5512.5 against 5512.5 nominal, no missing steps, no short or long
+intervals, `gap_frames_in_window` 0, `guest_drops_in_window` 0, every stream `speed=1.00x`. Run 1's report carries
+`targets_met` true on all three; run 2 meets the audio target and misses the 40 ms stall ceiling on three frames.
+
+Run 2 was taken with another lane's emulator running (two QEMU processes, load 8.3 rising to 10.2), which is what
+makes it the interesting one: the audio path stayed sample accurate (0.006 ms sigma) while the panel log stalled three
+times, so the two paths really are independent, as the probe's own note says.
+
+### What the localisation means
+
+In run 2 the bridge received every frame with a worst gap of **36.5 ms** and **no** gap over the 40 ms limit, while the
+host app's own log shows three gaps over 40 ms with a worst of **46.9 ms**. The extra latency and the three stalls are
+therefore not the guest's pacing, not the datagram path and not the bridge's reader; they happened between the bridge
+handing the frame to the app and the app's `writeTxLog` line. That path is `emulator/native-window.swift`, which this
+lane does not own, and the reason is visible in it: `writeTxLog` takes the shared `lock` and then writes the file
+inside that lock, on the socket-reader thread, taking its timestamp only after it got in. That lane's own hardening
+note (cross-lane request 1 of [l2-audio-timing.md](l2-audio-timing.md)) asks for exactly the fix; this run is the
+evidence that it is still needed and now names the hop rather than guessing at it. The exact change is in this file's
+cross-lane requests, item 1.
+
+The bridge side needs nothing: its own worst gap stayed under the limit in both runs, `lock_wait_max_ms` was 0.9 and
+4.5 ms, `frame_write_max_ms` 4.6 and 1.5 ms, and `outbox_dropped` was 0.
+
+Before and after, for the record: 164 ms maximum (20 s run, before that lane) → 76.5 ms (one frame in 4098, after its
+bridge and App Nap fixes) → 21.9 ms with no stall over 40 ms in 4137 frames on a quiet host, and 46.9 ms with three in
+4144 when another emulator shares the machine.
