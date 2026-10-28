@@ -59,9 +59,11 @@ enum Kind {
     static let txFrame: UInt8 = 10, stats: UInt8 = 11
 }
 
-/// Host power state machine (QRT1001 p15): BOOT (boot overlay) → RUN at the first LCD frame, OFF (dark panel, WAKE UP
-/// lit) when the firmware's standby flag (TX byte 0x67 bit 0) latches, and back to BOOT when it clears.
-enum PowerState { case boot, run, off, fault }
+/// Host power state machine (QRT1001 p15): BOOT (boot overlay) → RUN at the first LCD frame. Standby (OFF: dark panel,
+/// WAKE UP lit) and the power fault (dark panel, WAKE UP blinking red) are two independent overlays held as separate
+/// flags (`standby` and `faultActive` below) and combined when the panel is drawn, so any order of standby/wake and
+/// fault on/off ends in the same drawn state.
+enum PowerState { case boot, run }
 
 /// Minimal synchronous QMP (QEMU Machine Protocol) client over a unix socket, used only to hot-swap the virtual USB
 /// stick's backing image while QEMU runs. One connection per swap; QMP messages are newline-delimited JSON, and a
@@ -188,6 +190,11 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     var terminating = false
     /// The power/boot state machine, driven on the main thread from the TX standby flag and the first LCD frame.
     var powerState: PowerState = .boot
+    /// The standby overlay: the firmware's TX standby flag (byte 0x67 bit 0) latched. Independent of `faultActive`;
+    /// the panel combines the two (`panelDark` = standby, `fault` = faultActive) when it draws.
+    var standby = false
+    /// The forced power-fault overlay (QRT1001 p24). Independent of `standby`.
+    var faultActive = false
     var pendingFrame: Data?
     var drawing = false
     var lastPixels: Data?
@@ -754,37 +761,38 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         return payload[frame + 0x67] & 1 == 1
     }
 
-    /// Drive the panel from the firmware's standby flag: latch OFF (dark, WAKE UP lit) on standby, return to BOOT when
-    /// it clears. Main thread only.
+    /// Drive the panel from the firmware's standby flag: latch the standby overlay on (dark, WAKE UP lit) and off.
+    /// Standby and the power fault are two independent overlays (`standby` / `faultActive`), and the panel derives the
+    /// drawn state from both, so a fault during standby and standby during a fault each survive the other. Main thread
+    /// only.
     func applyStandby(_ standby: Bool) {
+        guard standby != self.standby else { return }
+        self.standby = standby
         if standby {
-            guard powerState != .off else { return }
-            powerState = .off
             panel.releaseAll()
             panel.setPanelDark(true)
             screenSeen = false
             AppLog.log("panel: standby — dark with WAKE UP lit")
-        } else if powerState == .off {
-            powerState = .boot
+        } else {
+            powerState = .boot   // the next content frame re-arms RUN
             panel.setPanelDark(false)
-            screenSeen = false   // the next content frame re-arms RUN
+            screenSeen = false
             AppLog.log("panel: wake from standby")
         }
     }
 
     /// Force or clear the power-fault display (QRT1001 p24). Main thread only; the firmware keeps running behind the
-    /// veil, so clearing returns to the state the panel was already in.
+    /// veil, so clearing only drops the fault overlay and returns to the state the panel was already in (standby still
+    /// dark, otherwise live). Independent of `standby`.
     func setFault(_ on: Bool) {
+        guard on != faultActive else { return }
+        faultActive = on
         if on {
-            guard powerState != .fault else { return }
-            powerState = .fault
             panel.releaseAll()
             panel.setFault(true)
             AppLog.log("panel: fault — dark with WAKE UP blinking red")
         } else {
-            guard powerState == .fault else { return }
             panel.setFault(false)
-            powerState = screenSeen ? .run : .boot
             AppLog.log("panel: fault cleared")
         }
     }
