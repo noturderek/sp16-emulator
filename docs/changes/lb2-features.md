@@ -45,7 +45,7 @@ the unchanged 1.60 binary — so the loss is in the firmware's own track-volume�
 
 ### 3. `pt-i44.37` — MIDI routing preferences window: `8938732`
 
-`emulator/midi-routing.swift` (new), `emulator/native-window.swift`, `emulator/native.py`.
+`emulator/midi-routing.swift` (new), `emulator/native-window.swift`.
 
 A new preferences window (menu **MIDI > Routing…**) with one row per CoreMIDI endpoint (sources then destinations,
 remembered by name + unique ID so a re-plugged device keeps its settings) and In / Out / Send clock / Receive clock
@@ -56,8 +56,9 @@ live through a `MIDINotifyProc`. Every choice persists in UserDefaults and is al
 `~/Library/Application Support/SP-16 Emulator/midi-routing.json` (clock source, BPM, one entry per touched port) for
 the Python DIN/USB bridges to read.
 
-- `cd emulator && xcrun swiftc -typecheck -parse-as-library $(python3 -c 'import native; print(" ".join(native.SWIFT_SOURCES))')`
-  — no errors (only the pre-existing macOS 27 deprecation warnings).
+- `cd emulator && xcrun swiftc -typecheck -parse-as-library native-window.swift panel-view.swift data-image.swift audio-sink.swift audio-output.swift firmware-library.swift firmware-window.swift app-diagnostics.swift midi-routing.swift`
+  — no errors (only the pre-existing macOS 27 deprecation warnings). `midi-routing.swift` is listed manually because
+  `native.py`'s `SWIFT_SOURCES` is lane B1's file (see cross-lane requests).
 - Quick set + `test_sp16_native`/`test_sp16_cli`/`test_sp16_smoke` — **606/606** (`OK`).
 
 **Not run:** a panelshot (needs the app window on screen; a research build was made but a screenshot of the routing
@@ -118,6 +119,10 @@ recipe work was not attempted in budget.
 
 ## Cross-lane requests
 
+- **Lane B1** (`native.py`): add `midi-routing.swift` to `SWIFT_SOURCES` (the tuple after `app-diagnostics.swift`) so the
+  new MIDI routing window is compiled into the app. `native.py` is lane B1's file, so this lane did not edit it; the
+  exact change is:
+  `SWIFT_SOURCES = ("native-window.swift", "panel-view.swift", "data-image.swift", "audio-sink.swift", "audio-output.swift", "firmware-library.swift", "firmware-window.swift", "app-diagnostics.swift", "midi-routing.swift")`
 - **Lane A** (`hardware_stub.c` audio loop): the ~5 dB master-level gap behind HW-35 is not in lane B2's files (the
   host WAV is a faithful copy and the firmware is unchanged). The gap investigation should sample the shim's ALSA PCM
   serving / analog board model at runtime to find which stage lost the 5 dB since 2026-10-12.
