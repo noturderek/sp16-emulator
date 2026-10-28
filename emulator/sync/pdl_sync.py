@@ -14,8 +14,10 @@ and net/fake_master.py builds. Stdlib only.
 """
 from __future__ import annotations
 
+import re
 import socket
 import struct
+import time
 
 from midi import clock
 
@@ -101,6 +103,7 @@ class CarabinerLink:
     def __init__(self, host: str = "127.0.0.1", port: int = 17000):
         self.host, self.port = host, port
         self.sock: socket.socket | None = None
+        self._file = None
 
     @staticmethod
     def set_tempo_message(bpm: float) -> bytes:
@@ -110,13 +113,39 @@ class CarabinerLink:
     def force_beat_at_time_message(beat: float, when_micros: int, quantum: int = 4) -> bytes:
         return f"force-beat-at-time {beat:.6f} {when_micros} {quantum}\n".encode()
 
+    @staticmethod
+    def parse_status(line) -> dict | None:
+        """Carabiner's `status` reply -> {'peers', 'bpm', 'start', 'beat'} (`start` in microseconds), or None when the
+        reply does not carry every field."""
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", "replace")
+        fields = {}
+        for key in ("peers", "bpm", "start", "beat"):
+            match = re.search(rf":{key}\s+([^\s}}]+)", line)
+            if not match:
+                return None
+            value = match.group(1)
+            fields[key] = float(value) if "." in value else int(value)
+        return fields
+
     def connect(self) -> None:
         self.sock = socket.create_connection((self.host, self.port), timeout=2.0)
+        self._file = self.sock.makefile("rb")
 
     def send(self, message: bytes) -> None:
         if self.sock is None:
             self.connect()
         self.sock.sendall(message)
+
+    def status(self) -> dict | None:
+        """The current Carabiner status (its Link-timeline `start`, in microseconds), or None when not connected."""
+        try:
+            self.send(b"status\n")
+            if self._file is None:
+                return None
+            return self.parse_status(self._file.readline())
+        except OSError:
+            return None
 
     def set_tempo(self, bpm: float) -> None:
         self.send(self.set_tempo_message(bpm))
@@ -125,6 +154,9 @@ class CarabinerLink:
         self.send(self.force_beat_at_time_message(beat, when_micros, quantum))
 
     def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
         if self.sock is not None:
             self.sock.close()
             self.sock = None
@@ -138,11 +170,22 @@ class PdlClockBridge:
     """
 
     def __init__(self, generator: clock.ClockGenerator | None = None, link: CarabinerLink | None = None,
-                 sample_rate: float = clock.SAMPLE_RATE):
+                 sample_rate: float = clock.SAMPLE_RATE, now_micros=None, host_now=None):
         self.tracker = TempoTracker()
         self.generator = generator or clock.ClockGenerator(sample_rate=sample_rate)
         self.link = link
         self._sent_bpm: float | None = None
+        self._now_micros = now_micros or self._link_now
+        self._host_now = host_now or time.monotonic
+
+    def _link_now(self) -> int:
+        """The Link-domain clock in microseconds: Carabiner's `status` `:start`, or host monotonic microseconds when no
+        Carabiner is connected (which still exercises the phase path before a real Link peer joins)."""
+        if isinstance(self.link, CarabinerLink):
+            status = self.link.status()
+            if status and isinstance(status.get("start"), (int, float)):
+                return int(status["start"])
+        return int(time.monotonic() * 1e6)
 
     def _on_tempo(self, bpm: float) -> None:
         if self._sent_bpm is not None and abs(self._sent_bpm - bpm) < 1e-6:
@@ -152,10 +195,22 @@ class PdlClockBridge:
             self.link.set_tempo(bpm)
         self._sent_bpm = bpm
 
+    def _align_link(self, t: float) -> None:
+        """Force Carabiner's phase on a downbeat: place beat 0 of the next bar one bar-period after host time `t`,
+        expressed on the Link clock through `_now_micros`. Called from the beat path only (a status packet re-carries
+        the same beat-in-bar and would otherwise force twice)."""
+        if self.link is None:
+            return
+        period = self.tracker.bar_period
+        when = self._now_micros() + int(max(0.0, (t + period) - self._host_now()) * 1e6)
+        self.link.force_beat_at_time(0.0, when, 4)
+
     def feed_beat(self, payload: bytes, t: float) -> dict:
         beat = parse_beat_packet(payload)
         self.tracker.update(beat["bpm"], beat["pitch_frac"], beat["beat_in_bar"], t)
         self._on_tempo(self.tracker.effective_bpm)
+        if beat["beat_in_bar"] == 1:
+            self._align_link(t)
         return beat
 
     def feed_status(self, payload: bytes, t: float) -> dict:

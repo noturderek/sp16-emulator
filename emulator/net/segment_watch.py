@@ -6,9 +6,13 @@ decodes the frames: ARP, and UDP on 50000-50002 with the Pro DJ Link magic (keep
   segment_watch.py [--port 34567] [--seconds 10] [--pcap FILE]   (--pcap writes a file Wireshark opens, with the nudge dissectors)
 """
 import argparse
+import os
 import socket
 import struct
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fake_master
 

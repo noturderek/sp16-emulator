@@ -1,0 +1,98 @@
+"""emulator/sync/bridge.py: the segment -> tempo -> MIDI clock pipeline, without CoreMIDI."""
+import socket
+import statistics
+import sys
+import time
+import unittest
+from pathlib import Path
+
+TOOLS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TOOLS))
+sys.path.insert(0, str(TOOLS / "net"))
+
+import net.segment as segment  # noqa: E402
+import sync.bridge as bridge  # noqa: E402
+import sync.pdl_sync as pdl  # noqa: E402
+
+
+def load_fake_master():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("fake_master", TOOLS / "net" / "fake_master.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+fake_master = load_fake_master()
+
+
+def framed(payload, dport):
+    return segment.udp_frame("02:00:00:00:00:07", "ff:ff:ff:ff:ff:07", "169.254.7.7", "169.254.255.255",
+                             dport, dport, payload)
+
+
+class FeedTests(unittest.TestCase):
+    def test_feed_retunes_the_bridge_from_a_beat_packet(self):
+        bridge_obj = pdl.PdlClockBridge()
+        beat = fake_master.beat_packet("CDJ-3000", 1, 128.0, 0.02, 1, 100)
+        parsed = segment.parse_frame(framed(beat, 50001))
+        result = bridge.feed(bridge_obj, parsed, 0.0)
+        self.assertEqual(result["bpm"], 128.0)
+        self.assertAlmostEqual(bridge_obj.tracker.effective_bpm, 130.56, delta=0.01)
+
+    def test_feed_ignores_non_master_packets(self):
+        bridge_obj = pdl.PdlClockBridge()
+        arp = bytes.fromhex("ffffffffffff") + bytes.fromhex("020000000007") + b"\x08\x06" + bytes(46)
+        self.assertIsNone(bridge.feed(bridge_obj, {"payload": b"Qspt1WmJOL", "dst_port": 50000}, 0.0))
+        self.assertIsNone(bridge.feed(bridge_obj, {"payload": b"not a packet"}, 0.0))
+
+
+class ClockEmitterTests(unittest.TestCase):
+    def test_the_emitter_sends_24_ppqn_at_the_bpm(self):
+        sent = []
+        emitter = bridge.ClockEmitter(sent.append)
+        emitter.set_bpm(120.0)
+        emitter.start()
+        time.sleep(0.6)
+        emitter.stop()
+        self.assertGreater(len(sent), 20)  # 120 BPM = 48 pulses/s, so ~29 in 0.6 s
+        self.assertLess(len(sent), 60)
+
+    def test_the_emitter_retunes_without_restarting(self):
+        sent = []
+        emitter = bridge.ClockEmitter(sent.append)
+        emitter.set_bpm(60.0)
+        emitter.start()
+        time.sleep(0.5)
+        emitter.set_bpm(240.0)
+        time.sleep(0.5)
+        emitter.stop()
+        # 60 BPM = 24 p/s (12 in 0.5 s) then 240 BPM = 96 p/s (48 in 0.5 s): clearly more than a steady 60 BPM stream
+        self.assertGreater(len(sent), 40)
+
+
+class RunTests(unittest.TestCase):
+    def test_run_feeds_master_packets_and_emits_clock(self):
+        class FakeSeg:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            def settimeout(self, t):
+                pass
+
+            def recvfrom(self, n):
+                if self.frames:
+                    return self.frames.pop(0), None
+                time.sleep(0.01)  # a real socket blocks on its recv timeout; don't starve the clock thread
+                raise socket.timeout()
+
+        beat = fake_master.beat_packet("CDJ-3000", 1, 128.0, 0.02, 1, 100)
+        frame = framed(beat, 50001)
+        sent = []
+        fed = bridge.run(FakeSeg([frame]), sent.append, duration=0.6)
+        self.assertEqual(fed, 1)
+        self.assertGreater(len(sent), 20)  # the emitter ran at 130.56 BPM for the window
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,4 +1,6 @@
 """emulator/net/segment.py: the IPv4/UDP/Ethernet framing a host peer uses on an `--net mcast` segment."""
+import contextlib
+import io
 import socket
 import struct
 import unittest
@@ -7,7 +9,6 @@ import sys
 
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
-sys.path.insert(0, str(TOOLS / "net"))
 import net.segment as segment  # noqa: E402
 
 
@@ -87,6 +88,24 @@ class FrameTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             segment.udp_frame("zz", "ff:ff:ff:ff:ff:ff", "1.2.3.4", "5.6.7.8", 1, 1, b"")
 
+    def test_parse_rejects_a_udp_length_that_overruns_the_frame(self):
+        frame = segment.udp_frame("02:00:00:00:00:07", "ff:ff:ff:ff:ff:ff", "169.254.7.7", "169.254.255.255",
+                                  50000, 50000, b"x" * 10)
+        ihl = (frame[14] & 0x0F) * 4
+        corrupted = bytearray(frame)
+        corrupted[14 + ihl + 4:14 + ihl + 6] = b"\x7f\xff"  # udp_length claims 32767 bytes
+        with self.assertRaises(KeyError):
+            segment.parse_frame(bytes(corrupted))
+
+    def test_parse_rejects_a_udp_length_below_eight(self):
+        frame = segment.udp_frame("02:00:00:00:00:07", "ff:ff:ff:ff:ff:ff", "169.254.7.7", "169.254.255.255",
+                                  50000, 50000, b"x")
+        ihl = (frame[14] & 0x0F) * 4
+        corrupted = bytearray(frame)
+        corrupted[14 + ihl + 4:14 + ihl + 6] = b"\x00\x00"
+        with self.assertRaises(KeyError):
+            segment.parse_frame(bytes(corrupted))
+
 
 class SegmentMasterTests(unittest.TestCase):
     """The segment fake master imports and carries the same packet layouts as fake_master."""
@@ -113,6 +132,42 @@ class SegmentMasterTests(unittest.TestCase):
         for port, payload in ((50001, beat), (50002, status)):
             self.assertEqual(self.master.frame_name(segment.parse_frame(framed(payload, port, port))), "CDJ-3000",
                              msg=port)
+
+    def test_keepalive_fields_skips_a_malformed_magic_frame(self):
+        # A MAGIC-only payload has no type byte or name: skipped, not a crash.
+        parsed = segment.parse_frame(framed(b"Qspt1WmJOL", 50000, 50000))
+        self.assertIsNone(self.master.keepalive_fields(parsed))
+        # A name shorter than its packet family's field: skipped.
+        short = b"Qspt1WmJOL" + b"\x06\x00" + b"short"
+        self.assertIsNone(self.master.keepalive_fields(segment.parse_frame(framed(short, 50000, 50000))))
+
+    def test_keepalive_fields_reads_a_well_formed_keepalive(self):
+        parsed = segment.parse_frame(framed(sp16_keepalive("TORAIZ"), 50000, 50000))
+        self.assertEqual(self.master.keepalive_fields(parsed), (0x06, "TORAIZ"))
+
+    def test_drain_frames_drains_a_burst_and_skips_malformed(self):
+        class FakeSeg:
+            def __init__(self, frames):
+                self.frames = list(frames)
+                self.timeout = 0.2
+            def gettimeout(self):
+                return self.timeout
+            def settimeout(self, t):
+                self.timeout = t
+            def recvfrom(self, _n):
+                if self.frames:
+                    return self.frames.pop(0), None
+                raise BlockingIOError()
+        arp = bytes.fromhex("ffffffffffff") + bytes.fromhex("020000000007") + b"\x08\x06" + bytes(46)
+        malformed = framed(b"Qspt1WmJOL", 50000, 50000)  # MAGIC only, too short
+        good = framed(sp16_keepalive("TORAIZ"), 50000, 50000)
+        seg = FakeSeg([arp, malformed, good, good])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            seen = self.master.drain_frames(seg, self.master.MASTER_MAC, 0)
+        self.assertEqual(seen, 2)
+        self.assertEqual(seg.timeout, 0.2)  # the non-blocking drain restored the socket timeout
+        self.assertIn("name 'TORAIZ'", out.getvalue())
 
 
 class SegmentWatchTests(unittest.TestCase):

@@ -175,6 +175,89 @@ def host_load():
             "qemu_processes": sum(1 for line in listing.splitlines() if "qemu-system" in line.split(" ")[0])}
 
 
+def launch_net(build, usb_image, net, timeout=120):
+    """Launch a `--net` research session directly and wait for SP16_NATIVE_READY.
+
+    hwsuite.launch has no `--net` and hwsuite.py is not this lane's file, so a follow run starts its own session here
+    (same native.py launch path, same ready wait) and stops it by its exact pid at the end.
+    Returns (app pid, runtime.json path).
+    """
+    import subprocess
+    sys.path.insert(0, str(TOOLS))
+    import hwsuite
+    apps, _ = hwsuite.build_processes(build)
+    if apps:
+        raise RuntimeError(f"a session of {build} is already running (pid {apps})")
+    t0 = time.time()
+    args = [sys.executable, str(TOOLS / "native.py"), "launch", "--output", str(build)]
+    if usb_image:
+        args += ["--usb-image", str(usb_image)]
+    args += ["--ephemeral", "--net", net]
+    out = subprocess.run(args, capture_output=True, text=True)
+    if out.returncode:
+        raise RuntimeError("launch failed: " + (out.stdout[-400:] + out.stderr[-1200:]).strip())
+    runtime = None
+    while time.time() - t0 < timeout:
+        candidates = [p for p in (build / "sessions").glob("native-*/runtime.json") if p.stat().st_mtime >= t0 - 1]
+        if candidates:
+            runtime = max(candidates, key=lambda p: p.stat().st_mtime)
+            console = (runtime.parent / "console.txt").read_text(errors="replace") if (runtime.parent / "console.txt").exists() else ""
+            if "SP16_NATIVE_READY" in console:
+                apps, _ = hwsuite.build_processes(build)
+                if len(apps) == 1:
+                    return apps[0], runtime
+        time.sleep(.2)
+    raise RuntimeError(f"no SP16_NATIVE_READY within {timeout} s")
+
+
+def start_master(bpm, pitch, duration, log_path):
+    """Start the segment fake master (net/segment_master.py) and return its Popen; stop it by its exact pid."""
+    import subprocess
+    return subprocess.Popen([sys.executable, str(TOOLS / "net" / "segment_master.py"),
+                             "--bpm", str(bpm), "--pitch", str(pitch),
+                             "--duration", str(duration), "--log", str(log_path)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def read_master_beats(path):
+    """(monotonic_ns, beat_in_bar) pairs from a segment_master `--log` file."""
+    beats = []
+    with open(path) as handle:
+        for line in handle:
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == "beat":
+                try:
+                    beats.append((int(parts[1]), int(parts[2])))
+                except ValueError:
+                    continue
+    return beats
+
+
+def follow_phase(onsets, master_beats, window_t0_ns, bpm, rate=RATE):
+    """Phase error in ms between the SP-16's downbeats and the master's.
+
+    The click fixture sits on every one of the 16 steps, so every 16th onset (step 1 of each bar) is a bar's downbeat
+    in 4/4. `onsets` are frame offsets from the measurement window's first frame; `window_t0_ns` is the host monotonic
+    time of that frame; `master_beats` are (monotonic_ns, beat_in_bar) pairs. The error is reduced modulo the bar
+    period, so a follower that is a whole bar late is not counted as a phase error.
+    """
+    downbeats = [t for t, b in master_beats if b == 1]
+    if len(downbeats) < 2 or len(onsets) < 32:
+        return {"error": "too little data"}
+    bar_ms = 4 * 60.0 / bpm * 1000.0
+    sp_downbeats = [window_t0_ns + int(on / rate * 1e9) for on in onsets[::16]]
+    errors = []
+    for sp in sp_downbeats:
+        nearest = min(downbeats, key=lambda m: abs(m - sp))
+        phase = (sp - nearest) / 1e6 % bar_ms
+        if phase > bar_ms / 2:
+            phase -= bar_ms
+        errors.append(phase)
+    return {"phase_median_ms": round(statistics.median(abs(e) for e in errors), 3),
+            "phase_max_ms": round(max(abs(e) for e in errors), 3),
+            "downbeats": len(errors)}
+
+
 def audio_counters(session):
     """Frames recorded and frames the guest dropped on the master stream so far (metrics of the host sink)."""
     stream = ((session.metrics().get("audio") or {}).get("streams") or {}).get("ak4458audio-0") or {}
@@ -250,6 +333,8 @@ def run(args):
     fixtures = out / "fixtures"
     hwsuite.make_fixtures(fixtures, (profile.get("usb") or {}).get("sample_dir") or "PIONEER DJ SAMPLER/Samples")
     pid = None
+    master = None
+    master_log = None
     if args.runtime:
         runtime = Path(args.runtime)  # a session whose stick holds the suite's hw-click.wav
     else:  # a fresh ephemeral session with the suite's fixture stick; stopped by its exact process id at the end
@@ -257,13 +342,24 @@ def run(args):
         payload, total = hwsuite.stick_image(hwsuite.fixture_wavs(), (profile.get("usb") or {}).get("sample_dir")
                                              or "PIONEER DJ SAMPLER/Samples")
         hwsuite.write_sparse(stick, payload, total)
-        pid, runtime, _ = hwsuite.launch(build, None, stick, ephemeral=True)
+        if args.net:
+            master_log = out / "master-beats.txt"
+            master = start_master(args.master_bpm, args.master_pitch, args.lead + args.seconds + 20, master_log)
+            pid, runtime = launch_net(build, stick, args.net)
+        else:
+            pid, runtime, _ = hwsuite.launch(build, None, stick, ephemeral=True)
     session = None
     try:
         runner = hwsuite.Runner(profile, profile_path, build, None, out, fixtures, "smoke", None, None, runtime)
         runner.session = hwsuite.Session(runtime)
         session = runner.session
         session.txlog(True)
+        if args.net:
+            import menu.sync_source as sync_recipes
+            time.sleep(8.0)  # the firmware's touch panel lags SP16_NATIVE_READY; wait before the first tap
+            hwsuite.wait_settled(session, stable=1.0, timeout=30.0)
+            sync_recipes.run(session, sync_recipes.SYNC_SOURCE_PDL)
+            time.sleep(4.0)  # let the firmware acquire the master tempo before PLAY
         bpm = profile["audio"]["default_bpm"]
         step = 60 / bpm / 4 * RATE
         if not args.no_setup:
@@ -281,6 +377,7 @@ def run(args):
         time.sleep(args.lead)
         counters_start = audio_counters(session)
         frames_start = counters_start["frames"]
+        window_t0_ns = time.monotonic_ns()
         tx_start = session.tx_offset()
         load_before = host_load()
         link_before = bridge_timing(session)
@@ -293,15 +390,24 @@ def run(args):
         time.sleep(.5)
         first = max(0, frames_start - PREROLL)
         samples = read_wav_channel(wav, first, frames_end, first_channel)
+        onsets = onsets_in_window(samples, frames_start - first, int(0.5 * step))
         report = {
             "build": str(build), "seconds": args.seconds, "bpm": bpm, "host": {"before": load_before, "after": load_after},
-            "audio": {**onset_jitter(onsets_in_window(samples, frames_start - first, int(0.5 * step)), step),
+            "audio": {**onset_jitter(onsets, step),
                       "window_s": round((frames_end - frames_start) / RATE, 1),
                       "gap_frames_in_window": counters_end["gap_frames"] - counters_start["gap_frames"],
                       "guest_drops_in_window": counters_end["guest_drops"] - counters_start["guest_drops"]},
             "tx": tx_stalls(read_tx_times(session.dir, tx_start), args.stall_ms),
             "link": link_window(link_before, link_after),
             "bridge_timing": {"before": link_before, "after": link_after}}
+        if args.net and master_log is not None and master_log.exists():
+            effective = args.master_bpm * (1 + args.master_pitch / 100.0)
+            report["follow"] = {
+                "master_bpm": args.master_bpm, "master_pitch_pct": args.master_pitch,
+                "master_effective_bpm": effective,
+                "measured_tempo_bpm": report["audio"].get("tempo_bpm"),
+                "tempo_error_bpm": round((report["audio"].get("tempo_bpm") or 0.0) - effective, 3),
+                "phase": follow_phase(onsets, read_master_beats(master_log), window_t0_ns, effective)}
         if not args.no_setup:
             runner.select_track(2)
             for n in range(1, 17):
@@ -312,6 +418,12 @@ def run(args):
     finally:
         if session:
             session.close()
+        if master is not None:
+            master.terminate()
+            try:
+                master.wait(timeout=10)
+            except Exception:
+                master.kill()
         if pid:
             hwsuite.stop(build, pid)
 
@@ -341,6 +453,10 @@ def main(argv=None):
     r.add_argument("--lead", type=float, default=8.0, help="seconds of PLAY before the window opens (default 8)")
     r.add_argument("--stall-ms", type=float, default=STALL_MS)
     r.add_argument("--no-setup", action="store_true", help="the click pattern is already on track 1")
+    r.add_argument("--net", help="guest network for a follow run (e.g. mcast): starts the segment master and sets "
+                              "SYNC SOURCE = PRO DJ LINK")
+    r.add_argument("--master-bpm", type=float, default=128.0, help="the fake master's BPM with --net (default 128)")
+    r.add_argument("--master-pitch", type=float, default=0.0, help="the fake master's pitch percent with --net (default 0)")
     w = sub.add_parser("wav", help="onset jitter of a WAV")
     w.add_argument("file")
     w.add_argument("--bpm", type=float, default=120.0)
