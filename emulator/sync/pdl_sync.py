@@ -163,10 +163,12 @@ class CarabinerLink:
     def _deliver(self, message: bytes) -> bool:
         """Send `message` to Carabiner, tolerating one that is not listening: drop the dead socket, print one
         diagnostic for this link and return False. `status()` swallows the same OSError; the tempo and phase calls
-        go through here so a missing Carabiner can never crash the bridge."""
+        go through here so a missing Carabiner can never crash the bridge.
+
+        The one-diagnostic latch is cleared by a send that succeeds, so an outage after a recovery (Carabiner quit
+        again) warns once more instead of silently losing Link sync for the rest of the run."""
         try:
             self.send(message)
-            return True
         except OSError as exc:
             self._drop()
             if not self._warned:
@@ -174,6 +176,8 @@ class CarabinerLink:
                 print(f"sync: no Carabiner listening on {self.host}:{self.port} ({exc}); "
                       f"Link tempo/phase sync is off", file=sys.stderr, flush=True)
             return False
+        self._warned = False
+        return True
 
     def set_tempo(self, bpm: float) -> bool:
         return self._deliver(self.set_tempo_message(bpm))
