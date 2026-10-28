@@ -16,7 +16,7 @@ titles, probe coordinates, lamp roles). A check whose profile data is missing is
 
 ## Checks
 
-46 checks, `HW-01` to `HW-46`:
+54 checks, `HW-01` to `HW-54`:
 
 | Area | Checks | What is proven |
 |---|---|---|
@@ -32,9 +32,48 @@ titles, probe coordinates, lamp roles). A check whose profile data is missing is
 | Storage, power, soak | HW-40..44 | persistence across clean and hard restarts, isolation between firmware data images, clean quit, 5-minute soak |
 | Driver coverage | HW-45 | every device node and ioctl the firmware uses is served; unknown ones are reported |
 | Analog board model | HW-46 | ACTIVE drives the filter select line; the shim's filter loop carries a tone injected at the filter input; headphone levels with ACTIVE on/off and CUTOFF open/lowest are recorded, not judged (how the firmware uses the return is still open) |
+| Extras | HW-47..54 | standby latch and wake recovery (HW-47); factory test pages 1-2 lamps/LCD (HW-48), page 4 button matrix with per-control status attribution (HW-49), page 5 pots and strip (HW-50), page 6 encoders (HW-51); home screen and panel screenshot baseline (HW-52); page 3 pad calibration walkthrough (HW-53); page 8 MIDI CHECK touch button (HW-54) |
 
-Tiers: **smoke** (16 checks, about 8 minutes), **core** (all but the soak), **full** (all 46, about 31 minutes).
-Only a full-tier run can mark a profile verified.
+Tiers: **smoke** (16 checks, about 8 minutes), **core** (all but the soak), **full** (all 46 baseline checks HW-01..HW-46, about 31 minutes), and **extra** (HW-47..HW-54).
+Only a full-tier run can mark a profile verified. The extra tier is never part of a full run and never decides profile verification.
+
+### Extras tier and test mode
+
+Checks HW-48 to HW-51, HW-53 and HW-54 interact with the firmware's factory test mode pages (QRT1001 pp. 40-43)
+and require a test mode build passed with `--testmode-build NAME` (defaulting to `build/NAME-testmode`):
+
+```sh
+# Build a testmode research build (shares the verified library and QEMU clone)
+./sp16 build --name sp16-dev-testmode --research --audio file --app-arg testmode
+# Run the extras tier
+./sp16 hwsuite --profile 1.60 --tier extra --testmode-build sp16-dev-testmode
+```
+
+- **HW-47 (Standby):** presses POWER/STANDBY, verifies the standby flag latches, the USB stick unmounts,
+  project saves are blocked while the UI/socket remains alive, then restarts the app and checks clean recovery.
+- **HW-48..HW-51 (Factory test pages):** runs pages 1 and 2 (all RGB pad/step colours and all mono lamps,
+  then dark screen and all lamps off), page 4 (verifies each of 50 controls moves RESULT and verifies per-control
+  name attribution on the status line; `--testmode-skip bar4` provides a negative control), page 5 (MASTER,
+  DSF DRIVE, DSF HIGHPASS 0-1023 and touch strip 0-127), and page 6 (encoders +3 and -2, push encoder status).
+- **HW-52 (Screenshot baseline):** captures settled home screen LCD and panel shots and compares them against
+  recorded references using `--shots`.
+- **HW-53 (Pad calibration):** walks pads 1 to 5 at 300, 48, 504, 47 and 505 on page 3, confirms three WAKE UP
+  passes per pad, and checks the staged `padcalibration.xml` updates only for valid values (48..504).
+- **HW-54 (Page 8 MIDI check):** taps the touch button at (115, 112) on PAGE 8: DEVICE TEST to run the DIN
+  MIDI loopback and polls for `MIDI CHECK : OK`.
+
+Without `--testmode-build`, test mode checks report `N/A`. The testmode build's firmware must match the
+profile's application SHA-256 or the run is refused before any VM starts.
+
+### Screenshot regression layer (`--shots`)
+
+`--shots record|compare` adds pixel regression testing for LCD snapshots and panel shots using `shotdiff.py`:
+- `record` writes captures and promotes them to references in `private/hwsuite-shots/<version>/` only when the check passed.
+- `compare` verifies captures against references within `--shots-tolerance N` (per-channel tolerance 0..254, default 8)
+  and `--shots-share F` (allowed fraction of changed pixels, default 0). Differences generate diff heat maps and
+  report bounding boxes.
+- The bottom status line of panelshots (frame counters and ack latency) is masked automatically. Reference images
+  are per firmware version and display scale, and are stored under git-ignored `private/`.
 
 ## Running it
 
@@ -79,7 +118,8 @@ profile declares absent, on the exact firmware image and profile being marked.
 ## Not in this suite
 
 Firmware features (menus, sequencer editing, effects, scales, project workflows) belong to a per-version feature
-check, not to hardware verification. Hardware that is not emulated is listed as such in every suite report: MIDI beyond
-the factory test's DIN loopback and USB-B MIDI, sync sources and PRO DJ LINK, audio input and live sampling (a research
-tone stands in for the input), output routing beyond the main stereo pair, the analog filter acting on sampler playback
-(the filter loop exists but only carries a research tone), network and physical pad force.
+check, not to hardware verification. Hardware that is not emulated is listed as such in every suite report: DIN MIDI
+beyond the factory test loopback (HW-54) and USB-B MIDI, sync sources and PRO DJ LINK (port 50000 UDP keep-alive/sync),
+audio input and live sampling (a research tone or injected WAV stands in for the input), output routing beyond the
+monitored pairs, the analog filter acting on sampler playback (the filter loop exists but only carries a research
+tone), network traffic beyond the carrier/ARP compatibility layer, and physical pad force.
