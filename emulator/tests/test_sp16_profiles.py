@@ -44,7 +44,11 @@ class LegacyProfileTests(unittest.TestCase):
     def test_1_60_profile_reproduces_the_pre_m1_constants(self):
         profile = profiles.legacy()
         self.assertEqual(profile["status"], "verified")
-        self.assertEqual(panel_map.LAMP_ROLES, PRE_M1_LAMP_ROLES)
+        # M1 moved these literal values into profiles/sp16-1.60.json; the lamp table then dropped the SHIFT role, because
+        # the service manual's LED matrix shows mono 4 driving no LED (E15). Everything else is unchanged.
+        self.assertNotIn("shift", panel_map.LAMP_ROLES)
+        self.assertEqual(panel_map.LAMP_ROLES,
+                         {role: spec for role, spec in PRE_M1_LAMP_ROLES.items() if role != "shift"})
         self.assertEqual((panel_map.PAD_A_MIN, panel_map.PAD_A_MAX, panel_map.PAD_B_CONTACT), (172, 874, 512))
         self.assertEqual(panel_map.PAD_CURVE(1), (172, 512))
         self.assertEqual(panel_map.PAD_CURVE(127), (874, 512))

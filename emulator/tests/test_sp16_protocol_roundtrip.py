@@ -273,16 +273,13 @@ class GoldenTableTests(unittest.TestCase):
                 self.assertEqual((placed, placed_bit), (byte, bit))
 
     def test_lamp_roles_match_the_reference(self):
-        canonical = {role: spec for role, spec in panel_map.LAMP_ROLES.items() if role != "shift"}
-        self.assertEqual(canonical, GOLDEN_LAMP_ROLES)
+        self.assertEqual(panel_map.LAMP_ROLES, GOLDEN_LAMP_ROLES)
 
-    @unittest.expectedFailure
     def test_shift_has_no_lamp_role(self):
-        """Known discrepancy, cross-lane request: the reference (E15) says mono 4 drives no physical LED, yet
-        panel_map.LAMP_ROLES maps a shift lamp to it. panel_map.py is held by another lane, so this stays an expected
-        failure until that file drops the role. When it is fixed, this unexpected pass fails the module: remove the
-        decorator then."""
+        """E15: mono 4 drives no physical LED (the manual's matrix has none on SHIFT or MODE), so the role is gone
+        from the lamp table. The channel itself stays decoded and is declared unassigned in the profiles."""
         self.assertNotIn("shift", panel_map.LAMP_ROLES)
+        self.assertIn(4, panel_map.MONO_CHANNELS)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

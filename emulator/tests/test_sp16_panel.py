@@ -713,14 +713,14 @@ class MapTests(unittest.TestCase):
         def decode(level):
             frame = bytearray(128)
             frame[0], frame[0x77], frame[0x6e] = 2, 0xaa, level
-            frame[99] = 0x80                      # shift (mono 4), no second flag
+            frame[99] = 0x01                      # HOLD (mono 10), no second flag
             frame[0x31:0x34] = bytes((0x25, 0x13, 0x25))  # RGB already scaled by the firmware
             return panel_map.decode_lamps(bytes(frame))
-        shift, step1 = panel_map.CONTROL_IDS["shift"], panel_map.CONTROL_IDS["step1"]
-        self.assertEqual(decode(4)[shift], (255, 255, 255))
-        self.assertEqual(decode(2)[shift], (188, 188, 188))
-        self.assertEqual(decode(1)[shift], (137, 137, 137))
-        self.assertEqual(decode(0)[shift], (255, 255, 255))  # no level: full
+        hold, step1 = panel_map.CONTROL_IDS["hold"], panel_map.CONTROL_IDS["step1"]
+        self.assertEqual(decode(4)[hold], (255, 255, 255))
+        self.assertEqual(decode(2)[hold], (188, 188, 188))
+        self.assertEqual(decode(1)[hold], (137, 137, 137))
+        self.assertEqual(decode(0)[hold], (255, 255, 255))  # no level: full
         self.assertEqual(decode(4)[step1], decode(1)[step1])  # RGB is not rescaled again
 
     def test_proven_lamp_roles_decode_buttons_steps_and_bars(self):

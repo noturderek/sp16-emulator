@@ -288,10 +288,6 @@
         "mono",
         3
       ],
-      "shift": [
-        "mono",
-        4
-      ],
       "rec": [
         "mono",
         5
@@ -1997,5 +1993,5 @@
     "pad15",
     "pad16"
   ],
-  "lamp_required_note": "not required: shift (never driven), usb_stop (mono 24, the STBY LED on the USB STOP/WAKE UP key; never lit in any suite action), bar 2-4 and their position lamps (the default project has one bar)"
+  "lamp_required_note": "not required and not in lamp_roles: shift (mono 4 drives no LED), usb_stop (mono 24, the STBY LED on the USB STOP/WAKE UP key; never lit in any suite action), bar 2-4 and their position lamps (the default project has one bar)"
 }

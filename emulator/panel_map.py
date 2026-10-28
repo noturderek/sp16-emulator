@@ -159,7 +159,8 @@ LAMP_NAMES = {
 LAMP_IDS = {name: lamp for lamp, name in LAMP_NAMES.items()}
 
 # E8/E10: lamp roles -> ("rgb"|"mono", channel), from the firmware profile. The service manual's LED matrix has 8
-# ribbon LEDs (Ribbon0..7), no LED on SHIFT or MODE (mono 4 drives nothing), the STBY LED on the USB STOP/WAKE UP key
+# ribbon LEDs (Ribbon0..7), no LED on SHIFT or MODE (mono 4 drives nothing, so it has no role here; the profiles list
+# it under lamp_unassigned and the channel stays decoded), the STBY LED on the USB STOP/WAKE UP key
 # (mono 24), and four LEDs M1 drives directly: ACTIVE (23), STBY (24), OVER (34) and USB CONNECT (25).
 # Evidence for the 1.60 profile: E8 buttons; E13 USB LED = mono 25 (lit while the virtual stick is mounted, blinking
 # during USB STOP hold and file writes); E14 OVER LED = mono 34 (master output peaks at or above about -0.9 dBFS,
