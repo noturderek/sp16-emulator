@@ -1209,8 +1209,8 @@ HWSUITE_OPTS = [
     Opt("--tier", "smoke, core, full or extra (default full); extra runs the factory-test pages and the screenshot "
         "checks too, which need --testmode-build and a recorded reference.", "TIER",
         choices=("smoke", "core", "full", "extra")),
-    Opt("--testmode-build", "The build made with --app-arg testmode that the factory-test checks (HW-48..HW-53) drive "
-        "(default: build/NAME-testmode when it exists).", "NAME", emit=False),
+    Opt("--testmode-build", "The build made with --app-arg testmode that the factory-test checks (HW-48..HW-51, HW-53, "
+        "HW-54) drive (default: build/NAME-testmode when it exists).", "NAME", emit=False),
     Opt("--smoke", "Same as --tier smoke.", flag=True),
     Opt("--only", "Comma-separated check ids, such as HW-24.", "IDS"),
     Opt("--fixtures", "Fixture folder (default <out>/fixtures).", "DIR", path=True),

@@ -19,8 +19,7 @@ What every update of the product shares; used by the importer before a version h
 | `update.images_dir`, `update.tar_layers[]`, `update.squashfs_layers[]` | where the firmware layers are inside the update and where each is unpacked |
 | `update.revision_files[]` | small version files copied into the manifest |
 | `update.mount_points[]` | directories created in the assembled tree |
-| `update.max_boot_read_bytes` | hardware read-length limit for each layer archive (`rootfs1`..`rootfs4`, `pdj`) |
-| `update.enforce_boot_read` | layer archives whose size limits are enforced at unpack and repack (`rootfs2`, `pdj`) |
+| `update.max_boot_read_bytes`, `update.enforce_boot_read` | per layer, inside `update.tar_layers[]`: the hardware read-length limit for that layer's archive (`rootfs1`..`rootfs4`, `pdj`) and whether the limit is enforced at unpack and repack (`rootfs2`, `pdj`) |
 | `app_candidates[]`, `loader_candidates[]` | where the application and the ARM loader may be |
 
 ## Compatibility profile (`profiles/sp16-<version>.json`)
