@@ -41,16 +41,16 @@ int main(void) {
     if (!child) {
         int peer=accept(listener,NULL,NULL);
         CHECK(peer>=0);
-        char command;
-        CHECK(recv(peer,&command,1,0)==1 && command=='I');
+        uint8_t command[3];
+        CHECK(recv(peer,command,sizeof command,0)==sizeof command && command[0]=='I' && command[1]==129 && command[2]==0);
         struct snd_seq_event incoming={.type=SNDRV_SEQ_EVENT_NOTEON};
         incoming.source.client=128; incoming.source.port=0;
         incoming.dest.client=129; incoming.dest.port=0;
         incoming.data.note.note=0; incoming.data.note.velocity=100;
         CHECK(send(peer,&incoming,sizeof incoming,0)==sizeof incoming);
-        CHECK(recv(peer,&command,1,0)==1 && command=='i');
-        CHECK(recv(peer,&command,1,0)==1 && command=='I');
-        CHECK(recv(peer,&command,1,0)==1 && command=='O');
+        CHECK(recv(peer,command,sizeof command,0)==sizeof command && command[0]=='i');
+        CHECK(recv(peer,command,sizeof command,0)==sizeof command && command[0]=='I');
+        CHECK(recv(peer,command,sizeof command,0)==sizeof command && command[0]=='O');
         uint8_t packet[1+sizeof(struct snd_seq_event)];
         CHECK(recv(peer,packet,sizeof packet,0)==sizeof packet);
         CHECK(packet[0]=='E');

@@ -58,7 +58,7 @@ static int transmit(struct wire *wire, int fd, uint64_t now) {
     return 1;
 }
 #ifndef SP16_QUEUE_CONTRACT
-struct proxy_client { int fd; unsigned input, output; };
+struct proxy_client { int fd; unsigned input, output; uint8_t guest_client, input_port; };
 static int proxy_listener(void) {
     int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
     if (fd<0) return -1;
@@ -85,9 +85,9 @@ static void proxy_input(struct proxy_client *client,struct wire *wire,snd_midi_e
         ssize_t n=recv(client->fd,packet,sizeof packet,0);
         if (n<0 && (errno==EAGAIN || errno==EINTR)) break;
         if (n<=0) { close(client->fd); client->fd=-1; break; }
-        if (n==1) {
+        if (n==3) {
             switch (packet[0]) {
-            case 'I': client->input=1; break;
+            case 'I': client->input=1; client->guest_client=packet[1]; client->input_port=packet[2]; break;
             case 'i': client->input=0; break;
             case 'O': client->output=1; break;
             case 'o': client->output=0; break;
@@ -103,12 +103,18 @@ static void proxy_input(struct proxy_client *client,struct wire *wire,snd_midi_e
         }
     }
 }
-static void send_proxy_event(struct proxy_client clients[MAX_PROXY_CLIENTS],const snd_seq_event_t *event) {
+static void send_proxy_event(struct proxy_client clients[MAX_PROXY_CLIENTS],const snd_seq_event_t *event,
+                             int source_client,int source_port) {
     if (event->flags&SND_SEQ_EVENT_LENGTH_MASK) return;
     /* The fixed 32-bit ABI has a 16-byte header and a 12-byte data union. */
-    uint8_t packet[ARM_EVENT_SIZE];
-    memcpy(packet,event,sizeof packet);
     for (int i=0;i<MAX_PROXY_CLIENTS;i++) if (clients[i].fd>=0 && clients[i].input) {
+        snd_seq_event_t addressed=*event;
+        addressed.source.client=(uint8_t)source_client;
+        addressed.source.port=(uint8_t)source_port;
+        addressed.dest.client=clients[i].guest_client;
+        addressed.dest.port=clients[i].input_port;
+        uint8_t packet[ARM_EVENT_SIZE];
+        memcpy(packet,&addressed,sizeof packet);
         if (send(clients[i].fd,packet,sizeof packet,MSG_NOSIGNAL|MSG_DONTWAIT)<0 &&
             errno!=EAGAIN) { close(clients[i].fd); clients[i].fd=-1; }
     }
@@ -200,7 +206,7 @@ int main(void) {
                     snd_seq_ev_set_subs(&event);
                     snd_seq_ev_set_direct(&event);
                     snd_seq_event_output_direct(seq,&event);
-                    send_proxy_event(clients,&event);
+                    send_proxy_event(clients,&event,snd_seq_client_id(seq),port);
                 }
             }
         }

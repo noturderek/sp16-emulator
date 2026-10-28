@@ -136,8 +136,11 @@ int snd_seq_event_input(snd_seq_t *handle,snd_seq_event_t **event) {
     if (!real) return -ENOSYS;
     int result=real(handle,event);
     static unsigned events;
-    if (result>=0 && __atomic_fetch_add(&events,1,__ATOMIC_RELAXED)<16)
-        fprintf(stderr,"[sp16-ui-stub] MIDI seq input event=%d\n",result);
+    if (result>=0 && event && *event && __atomic_fetch_add(&events,1,__ATOMIC_RELAXED)<16)
+        fprintf(stderr,"[sp16-ui-stub] MIDI seq input event=%d type=%u source=%u:%u dest=%u:%u channel=%u note=%u velocity=%u\n",
+                result,(*event)->type,(*event)->source.client,(*event)->source.port,
+                (*event)->dest.client,(*event)->dest.port,(*event)->data.note.channel,
+                (*event)->data.note.note,(*event)->data.note.velocity);
     return result;
 }
 
@@ -925,9 +928,10 @@ static int device_ioctl(struct state *s, int fd, unsigned long request, void *ar
             int to_din=sub->dest.client==128 && sub->dest.port==0 &&
                 sub->sender.client==s->offset && sub->sender.port<s->bytes;
             if (!from_din && !to_din) { errno=EINVAL; return -1; }
-            char command=from_din?'I':'O';
-            if (request==SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT) command=(char)(command+('a'-'A'));
-            if (send(fd,&command,1,MSG_NOSIGNAL)!=1) return -1;
+            uint8_t command[3]={from_din?'I':'O',(uint8_t)s->offset,
+                                from_din?sub->dest.port:sub->sender.port};
+            if (request==SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT) command[0]=(uint8_t)(command[0]+('a'-'A'));
+            if (send(fd,command,sizeof command,MSG_NOSIGNAL)!=sizeof command) return -1;
             fprintf(stderr,"[sp16-ui-stub] MIDI seq %s %u:%u -> %u:%u\n",
                     request==SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT?"subscribe":"unsubscribe",
                     sub->sender.client,sub->sender.port,sub->dest.client,sub->dest.port);
