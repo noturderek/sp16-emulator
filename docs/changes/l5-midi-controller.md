@@ -47,7 +47,10 @@ needed: the helper talks to Python in text lines over pipes. The same helper can
   detents (relative encoders directly, absolute controls as the change in value); analog pots get value 0..1000;
   `strip` gets contact and position (released after 0.6 s idle, or at pitch-bend centre); START/STOP/CONTINUE are a
   60 ms tap on the bound button. A binding may be `{"action": ..., "velocity": N, "invert": true, "scale": X}`;
-  `knob3+` / `knob3-` on a button steps a knob one detent. A burst of controller traffic collapses to one call per
+  `knob3+` / `knob3-` on a button steps a knob one detent. `scale` multiplies the step for every input kind: the
+  fraction of an absolute pot (analog and strip targets), and the detents or analog units of a relative encoder, an
+  absolute control bound to a knob, or a stepping button; the part of a detent a move leaves over is carried to the
+  next event of that input, so `scale: 0.5` turns two single ticks into one detent. A burst of controller traffic collapses to one call per
   input (last absolute value, summed deltas).
 - `leds.py`: switches the session's TX frame log on (`txlog`), follows `tx-frames.jsonl`, decodes frames with
   `panel_map.decode_lamps` and sends a lamp's brightness (brightest RGB channel, 0..127) as note or CC velocity when

@@ -244,6 +244,79 @@ class TranslatorTests(unittest.TestCase):
         t.handle([M("cc", 0, 74, 63)])
         self.assertEqual(self.target.calls, [("knob2", "delta", -6)])
 
+    # -- scale, every input kind (button, absolute, relative) against every control kind (button, detent, analog, strip)
+    def scaled(self, bound, messages, **options):
+        """Calls made for `messages` (one batch each) by a translator whose input `bound` has `options` added."""
+        target, logged = Recorder(), []
+        mapping = pad_mapping(**{bound[0]: {"action": bound[1], **options}})
+        t = Translator(target, pad_profile(), mapping, analog_start={"main_out": 500}, clock=self.clock, log=logged.append)
+        for message in messages:
+            t.handle([message])
+        return target.calls, logged
+
+    def test_scale_button_to_detent_accumulates(self):
+        presses = [M("cc", 0, 20, 127), M("cc", 0, 20, 0)] * 2
+        calls, _ = self.scaled(("rec", "knob3+"), presses, scale=0.5)
+        self.assertEqual(calls, [("knob3", "delta", 1)])                  # the second press completes a detent
+        calls, _ = self.scaled(("rec", "knob3-"), presses[:2], scale=3)
+        self.assertEqual(calls, [("knob3", "delta", -3)])
+
+    def test_scale_button_to_button_leaves_velocity_alone(self):
+        calls, _ = self.scaled(("pad1", "pad2"), [M("note_on", 9, 36, 99), M("note_off", 9, 36, 0)], scale=0.5)
+        self.assertEqual(calls, [("pad2", "press", 99), ("pad2", "release", 0)])
+
+    def test_scale_button_cannot_drive_analog_or_strip(self):
+        for action in ("main_out", "strip"):
+            calls, logged = self.scaled(("rec", action), [M("cc", 0, 20, 127)], scale=0.5)
+            self.assertEqual((calls, len(logged)), ([], 1), action)
+
+    def test_scale_absolute_to_detent(self):
+        calls, _ = self.scaled(("cut", "knob2"), [M("cc", 0, 74, v) for v in (60, 64, 65, 66)], scale=0.5)
+        self.assertEqual(calls, [("knob2", "delta", 2), ("knob2", "delta", 1)])
+
+    def test_scale_absolute_to_analog_and_strip(self):
+        calls, _ = self.scaled(("cut", "main_out"), [M("cc", 0, 74, 127)], scale=0.4)
+        self.assertEqual(calls, [("main_out", "value", 400)])
+        calls, _ = self.scaled(("cut", "strip"), [M("cc", 0, 74, 127)], scale=0.5)
+        self.assertEqual(calls, [("strip", "value", 500)])
+        calls, _ = self.scaled(("ribbon", "strip"), [M("pitchbend", 0, 0, 16383)], scale=0.25)
+        self.assertEqual(calls, [("strip", "value", 250)])
+
+    def test_scale_absolute_cannot_drive_a_button(self):
+        calls, logged = self.scaled(("cut", "pad2"), [M("cc", 0, 74, 127)], scale=0.5)
+        self.assertEqual((calls, len(logged)), ([], 1))
+
+    def test_scale_relative_to_detent_accumulates_across_events(self):
+        calls, _ = self.scaled(("enc", "knob1"), [M("cc", 0, 16, 1)] * 2, scale=0.5)
+        self.assertEqual(calls, [("knob1", "delta", 1)])                  # one tick alone sends nothing
+        calls, _ = self.scaled(("enc", "knob1"), [M("cc", 0, 16, 1)] * 10, scale=0.1)
+        self.assertEqual(calls, [("knob1", "delta", 1)])                  # float sums must not fall just short
+        calls, _ = self.scaled(("enc", "knob1"), [M("cc", 0, 16, 1)] * 3, scale=2)
+        self.assertEqual(calls, [("knob1", "delta", 2)] * 3)
+        calls, _ = self.scaled(("enc", "knob1"), [M("cc", 0, 16, 127)] * 2, scale=0.5, invert=True)
+        self.assertEqual(calls, [("knob1", "delta", 1)])                  # inverted: -(-1) per tick
+
+    def test_scale_relative_to_detent_carry_survives_a_reversal(self):
+        calls, _ = self.scaled(("enc", "knob1"), [M("cc", 0, 16, 1), M("cc", 0, 16, 127), M("cc", 0, 16, 1)], scale=0.5)
+        self.assertEqual(calls, [])                                       # +0.5, -0.5, +0.5: never a whole detent
+
+    def test_scale_relative_to_detent_keeps_the_clamp(self):
+        calls, _ = self.scaled(("enc", "knob1"), [M("cc", 0, 16, 60)], scale=10)
+        self.assertEqual(calls, [("knob1", "delta", 64)])
+
+    def test_scale_relative_to_analog(self):
+        calls, _ = self.scaled(("enc", "main_out"), [M("cc", 0, 16, 4)], scale=0.5)
+        self.assertEqual(calls, [("main_out", "value", 520)])             # 4 ticks * 10 units * 0.5
+        calls, _ = self.scaled(("enc", "main_out"), [M("cc", 0, 16, 1)] * 4, scale=0.05)
+        self.assertEqual(calls, [("main_out", "value", 501), ("main_out", "value", 502)])   # half a unit carried over
+        calls, _ = self.scaled(("enc", "main_out"), [M("cc", 0, 16, 5)], scale=1000)
+        self.assertEqual(calls, [("main_out", "value", 1000)])            # still clamped to the control's range
+
+    def test_scale_relative_cannot_drive_a_button_or_the_strip(self):
+        for action in ("pad2", "strip"):
+            calls, logged = self.scaled(("enc", action), [M("cc", 0, 16, 1)], scale=0.5)
+            self.assertEqual((calls, len(logged)), ([], 1), action)
+
     def test_failed_call_is_counted_not_raised(self):
         class Broken:
             def event(self, *args):

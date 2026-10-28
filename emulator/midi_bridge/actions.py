@@ -48,7 +48,7 @@ class Translator:
         self.index = prof.Index(profile)
         self.analog = dict(analog_start or {})          # last value sent per analog control
         self.last = {}                                  # last absolute value per input (for detents)
-        self.carry = {}                                 # input name -> scaled detents not yet sent (absolute -> detent)
+        self.carry = {}                                 # input name -> scaled change not yet sent (a fraction of a unit)
         self.held = {}                                  # input name -> control currently pressed
         self.timers = []                                # (due, control, action, value)
         self.strip_until = None
@@ -67,6 +67,14 @@ class Translator:
 
     def later(self, seconds, name, action, value=0):
         self.timers.append((self.clock() + seconds, name, action, value))
+
+    def scaled(self, name, amount, entry):
+        """`amount` times the binding's `scale`, as whole units; what a small move leaves over is carried to the next
+        event of the same input, so scale 0.5 turns two single steps into one unit instead of dropping both."""
+        total = round(self.carry.get(name, 0.0) + amount * entry.get("scale", 1.0), 9)
+        units = int(total)
+        self.carry[name] = total - units
+        return units
 
     def tick(self, now=None):
         now = self.clock() if now is None else now
@@ -131,7 +139,7 @@ class Translator:
             return
         if kind == "detent":
             if pressed:
-                self.event(action.rstrip("+-"), "delta", -1 if action.endswith("-") else 1)
+                self.step(name, action, entry, -1 if action.endswith("-") else 1)
             return
         if kind != "button":
             self.log(f"{name}: a button cannot drive {action}")
@@ -160,12 +168,7 @@ class Translator:
             self.last[name] = message.value
             if last is not None and message.value != last:
                 diff = message.value - last
-                # scale applies as it does to the other kinds; the part of a detent a small move leaves over is carried
-                total = self.carry.get(name, 0.0) + (-diff if entry.get("invert") else diff) * entry.get("scale", 1.0)
-                detents = int(total)
-                self.carry[name] = total - detents
-                if detents:
-                    self.event(action.rstrip("+-"), "delta", max(-MAX_DELTA, min(MAX_DELTA, detents)))
+                self.step(name, action, entry, -diff if entry.get("invert") else diff)
         elif kind == "strip":
             centred = spec["type"] == "pitchbend" and abs(message.value - 8192) <= 64
             if centred:
@@ -183,14 +186,19 @@ class Translator:
         if not delta:
             return
         if kind == "detent":
-            delta *= entry.get("scale", 1)
-            delta = max(-MAX_DELTA, min(MAX_DELTA, int(delta)))
-            self.event(action.rstrip("+-"), "delta", delta)
+            self.step(name, action, entry, delta)
         elif kind == "analog":
-            start = self.analog.get(action, 500)
-            self.set_analog(action, start + delta * RELATIVE_STEP)
+            units = self.scaled(name, delta * RELATIVE_STEP, entry)
+            if units:
+                self.set_analog(action, self.analog.get(action, 500) + units)
         else:
             self.log(f"{name}: a relative control cannot drive {action}")
+
+    def step(self, name, action, entry, amount):
+        """A signed number of detents (before `scale`) for the knob or selector `action` names."""
+        detents = self.scaled(name, amount, entry)
+        if detents:
+            self.event(action.rstrip("+-"), "delta", max(-MAX_DELTA, min(MAX_DELTA, detents)))
 
     def set_analog(self, action, value):
         value = max(0, min(1000, int(value)))
