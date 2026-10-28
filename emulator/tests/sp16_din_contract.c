@@ -61,8 +61,49 @@ static void nonblock_full_port_case(void) {
     assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
 }
 
+/* A successful nonblocking write still takes the UART's 320 us/byte wire slot: the second byte of a back-to-back pair
+ * is refused (EAGAIN) until the slot elapses, so the bridge never bursts MIDI past the 31,250 baud line rate. The
+ * port is opened once per process, so this runs in a child before the parent opens the PTY port. */
+static void nonblock_pacing_case(void) {
+    pid_t child=fork();
+    assert(child>=0);
+    if (!child) {
+        int master=posix_openpt(O_RDWR|O_NOCTTY);
+        assert(master>=0 && grantpt(master)==0 && unlockpt(master)==0);
+        char *slave=ptsname(master);
+        assert(slave && setenv("SP16_DIN_PORT",slave,1)==0);
+        int control=open(slave,O_RDWR|O_NOCTTY);
+        assert(control>=0);
+        struct termios terminal;
+        assert(tcgetattr(control,&terminal)==0);
+        cfmakeraw(&terminal);
+        assert(tcsetattr(control,TCSANOW,&terminal)==0);
+        snd_rawmidi_t *out=NULL;
+        assert(snd_rawmidi_open(NULL,&out,"hw:snddinmidi,0",1)==0 && out);
+        assert(snd_rawmidi_nonblock(out,1)==0);
+        uint8_t byte=0x90;
+        uint64_t begin=ns();
+        assert(snd_rawmidi_write(out,&byte,1)==1);        /* the first byte: the slot is free */
+        assert(snd_rawmidi_write(out,&byte,1)==-EAGAIN);  /* the slot is busy: paced, never back to back */
+        while (snd_rawmidi_write(out,&byte,1)==-EAGAIN) { /* retry until the slot elapses */
+            assert(ns()-begin<5000000ULL);
+            struct timespec nap={ .tv_nsec=20000000 };
+            nanosleep(&nap,NULL);
+        }
+        assert(ns()-begin>=300000ULL);                    /* the second byte waited a full wire slot */
+        assert(read(master,&byte,1)==1 && byte==0x90);
+        assert(read(master,&byte,1)==1 && byte==0x90);
+        assert(snd_rawmidi_close(out)==0);
+        assert(close(control)==0 && close(master)==0);
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+}
+
 int main(void) {
     nonblock_full_port_case();
+    nonblock_pacing_case();
     int master=posix_openpt(O_RDWR|O_NOCTTY);
     assert(master>=0 && grantpt(master)==0 && unlockpt(master)==0);
     char *slave=ptsname(master);

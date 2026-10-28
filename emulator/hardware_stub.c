@@ -526,10 +526,14 @@ static int rawmidi_write_byte(int fd,uint8_t byte,int nonblock) {
     uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
     int error=0;
     if (nonblock) {
-        /* A nonblocking write must not spend the wire slot before it knows the port can take the byte: try it first and
-         * hand back EAGAIN at once, leaving the slot for the byte that does go out. */
-        ssize_t wrote=original_write(fd,&byte,1);
-        if (wrote!=1) error=wrote==0 ? EIO : errno;
+        /* A nonblocking write must not spend the wire slot before it knows the port can take the byte, and it must not
+         * burst successful writes out back to back past the UART's 320 us/byte rate: when the previous byte's slot has
+         * not elapsed, hand back EAGAIN at once, leaving the slot for the byte that does go out. */
+        if (now<rawmidi_next_ns) error=EAGAIN;
+        else {
+            ssize_t wrote=original_write(fd,&byte,1);
+            if (wrote!=1) error=wrote==0 ? EIO : errno;
+        }
     } else {
         struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
         int slept;

@@ -103,6 +103,7 @@ static int unlink_stale_socket(const char *path) {
     int error=errno;
     close(probe);
     if (live) { errno=EADDRINUSE; return -1; }
+    if (error==ENOENT) return 0;   /* the path went away between lstat and connect: a free socket path */
     if (error!=ECONNREFUSED) { errno=error; return -1; }
     return unlink(path);
 }

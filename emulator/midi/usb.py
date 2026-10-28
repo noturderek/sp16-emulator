@@ -33,8 +33,10 @@ def signal_stop(pending, timeout=1.0):
             try:
                 pending.get_nowait()
             except Empty:
-                if time.monotonic() >= deadline:
-                    return False
+                pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)   # back off instead of spinning: the queue is being consumed (or refilled) elsewhere
 
 
 def bridge(path, build_dir=None, name="SP-16 USB"):
@@ -83,8 +85,12 @@ def bridge(path, build_dir=None, name="SP-16 USB"):
         closed.set()
         with suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
-        signal_stop(pending)
+        if not signal_stop(pending):
+            print("USB MIDI: the input thread did not see the shutdown sentinel within 1 s",
+                  file=sys.stderr, flush=True)
         worker.join(timeout=1)
+        if worker.is_alive():
+            print("USB MIDI: the input thread is still alive after shutdown", file=sys.stderr, flush=True)
         if port is not None:
             port.close()
         sock.close()
