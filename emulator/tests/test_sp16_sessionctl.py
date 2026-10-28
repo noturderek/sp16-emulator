@@ -4,6 +4,8 @@ A heavily loaded host can take more than ten seconds to answer a call; the clien
 10 s with a traceback ending inside `readline`, which read like the app had hung up. The tests serve the socket from a
 thread in this process (a fake app that answers, hangs up, stays silent or answers garbage); no emulator runs.
 """
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -220,6 +222,45 @@ class SessionctlTests(unittest.TestCase):
         threading.Timer(0.05, append).start()
         self.assertTrue(session.tx_standby(0.3))
         self.assertEqual(app.received[0], {"op": "txlog", "on": 1})
+
+    def test_pressure_holds_a_raw_pad_pressure_through_the_pressure_control(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        session.pressure("pad3", 300)
+        session.pressure(16, 0)
+        self.assertEqual([(c["id"], c["action"], c["value"]) for c in app.received],
+                         [(sessionctl.CONTROL_IDS["pressure3"], 3, 300), (sessionctl.CONTROL_IDS["pressure16"], 3, 0)])
+        with self.assertRaises(ValueError):
+            session.pressure(17, 100)
+
+    def test_calibrate_holds_the_pad_presses_wake_up_once_per_pass_and_lets_go(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        with mock.patch.object(sessionctl.time, "sleep"):
+            session.calibrate(2, 300)
+        pressure, wake_up = sessionctl.CONTROL_IDS["pressure2"], sessionctl.CONTROL_IDS["usb_stop"]
+        self.assertEqual([(c["id"], c["action"], c["value"]) for c in app.received],
+                         [(pressure, 3, 300)] + [(wake_up, 1, 100), (wake_up, 0, 0)] * 3 + [(pressure, 3, 0)])
+
+    def test_calibrate_lets_go_of_the_pad_when_a_pass_fails(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        with mock.patch.object(sessionctl.time, "sleep"), \
+                mock.patch.object(session, "press", side_effect=RuntimeError("the app hung up")):
+            with self.assertRaises(RuntimeError):
+                session.calibrate("pad7", 120)
+        self.assertEqual([(c["id"], c["value"]) for c in app.received],
+                         [(sessionctl.CONTROL_IDS["pressure7"], 120), (sessionctl.CONTROL_IDS["pressure7"], 0)])
+
+    def test_calibrate_on_the_command_line_names_the_page_it_needs(self):
+        session = mock.Mock()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = sessionctl.run_command(session, "calibrate", ["3"])
+        session.calibrate.assert_called_once_with("3", sessionctl.CALIBRATION_RAW)
+        self.assertEqual(result, {"ok": True, "pad": "3", "raw": sessionctl.CALIBRATION_RAW, "passes": 3})
+        self.assertIn("test page 3", stderr.getvalue())
+        self.assertIn("48..504", stderr.getvalue())
 
     def test_standby_on_the_command_line_needs_yes(self):
         runtime = self.runtime(self.app("answer"))

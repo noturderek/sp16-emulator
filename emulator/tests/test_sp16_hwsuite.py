@@ -24,10 +24,10 @@ def all_pass(ids=None):
 
 class CheckTableTests(unittest.TestCase):
     def test_table_matches_the_spec(self):
-        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 53)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 54)])
         self.assertEqual(list(hwsuite.SMOKE_IDS), SPEC_SMOKE)
         self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "L"], ["HW-44"])
-        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 53)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 54)])
 
     def test_tiers_and_only(self):
         self.assertEqual(hwsuite.select_checks("smoke"), SPEC_SMOKE)
@@ -37,7 +37,7 @@ class CheckTableTests(unittest.TestCase):
         self.assertEqual(hwsuite.select_checks("smoke", ["HW-02", "HW-05"]), ["HW-05"])
         # Extras stay out of full and core, and run by tier or by name.
         self.assertNotIn("HW-47", hwsuite.select_checks("full"))
-        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 53)])
+        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 54)])
         self.assertEqual(hwsuite.select_checks("full", ["HW-47", "HW-05"]), ["HW-05", "HW-47"])
         with self.assertRaises(ValueError):
             hwsuite.select_checks("full", ["HW-99"])
@@ -356,6 +356,110 @@ class TestmodePageTests(unittest.TestCase):
         import panel_map
         self.assertTrue(all(name in panel_map.CONTROL_IDS for name in controls))
         self.assertFalse({"selector", "back", "home"} & set(controls))
+
+    def test_page_3_start_button_is_idle_when_red_and_busy_when_pale(self):
+        from PIL import Image, ImageDraw
+        for colour, idle in (((228, 60, 60), True), ((240, 160, 160), False)):
+            image = Image.new("RGB", (800, 480), (255, 255, 255))
+            ImageDraw.Draw(image).rectangle((726, 138, 795, 207), fill=colour)
+            self.assertEqual(hwsuite.testmode_start_ready(image), idle, colour)
+
+    def test_page_3_pad_cells_form_a_four_by_four_grid_from_the_bottom_left(self):
+        seen = []
+
+        def fake_ocr(image, box, **kwargs):
+            seen.append(box)
+            return "300"
+        with mock.patch.object(hwsuite, "ocr", fake_ocr):
+            self.assertEqual([hwsuite.testmode_pad_raw(None, pad) for pad in (1, 4, 13, 16)], [300] * 4)
+        self.assertEqual([((b[0] + b[2]) // 2, (b[1] + b[3]) // 2) for b in seen], [(45, 408), (585, 408), (45, 108), (585, 108)])
+
+    def test_the_calibration_file_is_read_from_the_data_image(self):
+        fat = hwsuite.Fat32(64 << 20)
+        xml = "<PadCalibrationData " + " ".join(f'CALIB_VALUE_PAD{n}="{300 if n == 3 else 242}"' for n in range(1, 17)) + "/>"
+        fat.add_file(fat.path([".sp16", "data"]), "padcalibration.xml", xml.encode())
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "emmc.img"
+            payload, total = fat.image()
+            hwsuite.write_sparse(image, payload, total)
+            values = hwsuite.calibration_values(image)
+            self.assertEqual((len(values), values[3], values[16]), (16, 300, 242))
+            self.assertEqual(hwsuite.calibration_values(image, "elsewhere.xml"), {})
+
+    def calibration_runner(self, tmp):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        runner = hwsuite.Runner(json.loads(profile_path.read_text()), profile_path, tmp, None, tmp, tmp, "extra",
+                                ["HW-53"], testmode_build=tmp)
+        runner.session = FakeSession()
+        return runner
+
+    def walk(self, runner, before, after, ready=True):
+        with mock.patch.object(hwsuite.time, "sleep"), mock.patch.object(hwsuite, "wait_settled"), \
+                mock.patch.object(hwsuite, "testmode_pad_raw", return_value=300), \
+                mock.patch.object(hwsuite, "testmode_start_ready", return_value=ready), \
+                mock.patch.object(hwsuite.Runner, "calibration_now", side_effect=after):
+            return runner.calibration_walk(1, 300, before)
+
+    def test_a_calibration_walk_holds_the_pad_makes_three_passes_and_lets_go(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.calibration_runner(tmp)
+            result = self.walk(runner, {1: 242}, [{1: 242}, {1: 300}])
+        self.assertEqual(result, (300, True, {1: 300}))
+        self.assertEqual(runner.session.calls, [("event", "pressure1", "value", 300)] + [("press", "usb_stop")] * 3
+                         + [("event", "pressure1", "value", 0)])
+
+    def test_a_calibration_walk_lets_go_of_the_pad_even_when_the_session_fails(self):
+        class Failing(FakeSession):
+            def press(self, name, hold=0.15, value=100):
+                super().press(name, hold, value)
+                raise hwsuite.SessionLost("socket error")
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.calibration_runner(tmp)
+            runner.session = Failing()
+            with self.assertRaises(hwsuite.SessionLost):
+                self.walk(runner, {1: 242}, [{1: 242}])
+        self.assertEqual(runner.session.calls[-1], ("event", "pressure1", "value", 0))
+
+    def run_hw53(self, outcomes, start=None):
+        """hw53 with the walks stubbed: outcomes[pad] = (page reading, START idle, the file's value for that pad)."""
+        walks = []
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.calibration_runner(tmp)
+            default = runner.p["calibration"]["default"]
+            staged = start if start is not None else {pad: default for pad in range(1, 17)}
+
+            def walk(pad, raw, before):
+                walks.append((pad, raw))
+                shown, idle, value = outcomes[pad]
+                return shown, idle, {**before, pad: value}
+            with mock.patch.object(hwsuite.Runner, "testmode_page_is", return_value=hwsuite.sub("stepped to page 3", True)), \
+                    mock.patch.object(hwsuite, "wait_settled"), \
+                    mock.patch.object(hwsuite.Runner, "calibration_now", return_value=staged), \
+                    mock.patch.object(hwsuite.Runner, "calibration_walk", side_effect=walk):
+                return runner.hw53(), walks
+
+    GOOD_WALKS = {1: (300, True, 300), 2: (48, True, 48), 3: (504, True, 504), 4: (47, True, 242), 5: (505, True, 242)}
+
+    def test_hw53_passes_when_the_range_edges_are_honoured(self):
+        result, walks = self.run_hw53(self.GOOD_WALKS)
+        self.assertEqual((result["status"], len(result["subresults"])), ("PASS", 12))
+        self.assertEqual(walks, [(1, 300), (2, 48), (3, 504), (4, 47), (5, 505)])
+
+    def test_hw53_fails_when_an_out_of_range_value_is_recorded(self):
+        result, _ = self.run_hw53({**self.GOOD_WALKS, 4: (47, True, 47)})
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("just below the range is not recorded", result["reason"])
+
+    def test_hw53_fails_when_a_valid_value_is_not_recorded_or_the_passes_do_not_finish(self):
+        self.assertEqual(self.run_hw53({**self.GOOD_WALKS, 2: (48, True, 242)})[0]["status"], "FAIL")
+        result, _ = self.run_hw53({**self.GOOD_WALKS, 1: (300, False, 300)})
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("pad 1 held at 300: the page shows it", result["reason"])
+
+    def test_hw53_fails_when_the_staged_file_does_not_start_at_the_default(self):
+        result, _ = self.run_hw53(self.GOOD_WALKS, start={pad: 242 if pad != 7 else 300 for pad in range(1, 17)})
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("synthetic default", result["reason"])
 
     def test_extras_without_a_testmode_build_are_n_a_with_a_precondition(self):
         profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())

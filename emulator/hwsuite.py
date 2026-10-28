@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-52 checks (HW-01..HW-52; HW-47..HW-52 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
+53 checks (HW-01..HW-53; HW-47..HW-53 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
@@ -142,12 +142,14 @@ CHECKS = [
     Check("HW-51", "Factory test", "Page 6: the six encoders and the push encoder count and report their state", "X"),
     Check("HW-52", "Screenshots", "The settled home screen and the panel match the suite's own earlier captures", "X",
           ["home.title_regex"], ["HW-01"]),
+    Check("HW-53", "Factory test", "Page 3: three WAKE UP passes record a held pad's calibration, only inside the valid range", "X",
+          ["calibration.pads", "calibration.range", "calibration.default"]),
 ]
-TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51")
+TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51", "HW-53")
 EXTRA_IDS = ("HW-47",) + TESTMODE_IDS + ("HW-52",)
 CHECK_BY_ID = {check.id: check for check in CHECKS}
 SMOKE_IDS = tuple(c.id for c in CHECKS if c.tier == "S")
-assert len(CHECKS) == 52 and len(SMOKE_IDS) == 16
+assert len(CHECKS) == 53 and len(SMOKE_IDS) == 16
 
 
 def checks_hash():
@@ -1215,6 +1217,12 @@ TESTMODE_GAUGES = {"main_out": (64, 96, 1023), "drive": (100, 132, 1023), "hp_cu
 TESTMODE_GAUGE_X, TESTMODE_OK_X = (502, 657), (662, 800)
 # Page 6 (encoder test): value column x >= 365; row centres.
 TESTMODE_ENCODER_ROWS = {"selector": 80, "selector_state": 116, **{f"knob{n}": 188 + 36 * (n - 1) for n in range(1, 7)}}
+# Page 3 (pad calibration): a 4 x 4 grid, pad 1 at the bottom left; each cell shows the raw AD value over the stored
+# calibration value. One press of WAKE UP (the USB STOP key) measures one pass (a 3 s spare period, then a 1 s average),
+# so three presses make one calibration. The START button is pale while passes run and red when the page is idle.
+TESTMODE_START_BOX = (728, 150, 748, 190)
+CALIBRATION_FILE = ".sp16/data/padcalibration.xml"      # the guest's data directory, on the eMMC image
+CALIBRATION_PASS_SECONDS = 7.0                           # a pass takes about 4.5 s; the next press must not land inside it
 
 
 # Regions that move on their own, as fractions (x0, y0, x1, y1) of the capture, left out of every comparison. The panel
@@ -1252,6 +1260,32 @@ def testmode_encoder(image, name):
         return match.group(1) if match else None
     value = signed_value(text)
     return None if value is None else int(value) & 0xFFFF
+
+
+def testmode_start_ready(image):
+    """Page 3: whether the START button is the saturated red of an idle page (True) or the pale one of a measurement
+    in progress (False)."""
+    import numpy as np
+    pixels = np.asarray(image.convert("RGB").crop(TESTMODE_START_BOX)).astype(int)
+    return int(pixels[..., 1].mean()) < 110
+
+
+def testmode_pad_raw(image, pad):
+    """Page 3: the raw AD number in pad `pad`'s cell (None when unreadable)."""
+    x, y = 45 + 180 * ((pad - 1) % 4), 408 - 100 * ((pad - 1) // 4)
+    value = signed_value(ocr(image, (x - 40, y - 14, x + 40, y + 14), psm=7, scale=3))
+    return None if value is None else int(value)
+
+
+def calibration_values(data_image, path=CALIBRATION_FILE):
+    """{pad: value} of the CALIB_VALUE_PADn attributes in the calibration file of an eMMC image ({} if there is none)."""
+    reader = FatReader(data_image)
+    try:
+        data = reader.read(path)
+    finally:
+        reader.close()
+    text = data.decode(errors="replace") if data else ""
+    return {int(n): int(v) for n, v in re.findall(r'CALIB_VALUE_PAD(\d+)="(\d+)"', text)}
 
 
 def run_recipe(session, steps, params=None, log=None):
@@ -3653,7 +3687,7 @@ class Runner:
             for hw in wanted:
                 self.verdicts[hw] = verdict(hw, "N/A", "precondition: no --testmode-build (a build made with --app-arg testmode)")
             return
-        checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51}
+        checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51, "HW-53": self.hw53}
         pid = None
         try:
             pid, self.runtime_path, _ = launch(self.testmode_build, self.firmware_id, None, ephemeral=True)
@@ -3835,6 +3869,68 @@ class Runner:
         wait_settled(s, 1.5, 30)
         self.shots_into(subs, "testmode-page6-lcd", s.image("p6"))
         return from_subresults("HW-51", subs)
+
+    def calibration_now(self):
+        """The calibration file on the running session's eMMC image: {pad: value}."""
+        return calibration_values(runtime_drive(self.session.runtime, "sp16emmc"))
+
+    def calibration_walk(self, pad, raw, before):
+        """Hold pad `pad` at `raw` and press WAKE UP once per pass, as test page 3 asks. Returns the raw value the page
+        showed, whether START was red (idle) again, and the file afterwards. The pass takes seconds and the page redraws
+        later, so the last press is followed by a wait, and the file by a short poll for the write."""
+        s = self.session
+        s.event(f"pressure{pad}", "value", raw)
+        try:
+            time.sleep(2.5)
+            wait_settled(s, 1.5, 30)
+            shown = testmode_pad_raw(s.image("p3"), pad)
+            for _ in range(3):
+                s.press("usb_stop", 0.4)
+                time.sleep(CALIBRATION_PASS_SECONDS)
+            deadline = time.monotonic() + 30
+            while not testmode_start_ready(s.image("p3")) and time.monotonic() < deadline:
+                time.sleep(1.0)
+            idle = testmode_start_ready(s.image("p3"))
+            deadline = time.monotonic() + 8
+            after = self.calibration_now()
+            while after == before and time.monotonic() < deadline:
+                time.sleep(1.0)
+                after = self.calibration_now()
+        finally:
+            s.event(f"pressure{pad}", "value", 0)
+        return shown, idle, after
+
+    def hw53(self):
+        """Test page 3: each walk holds a pad at a raw value and makes the three passes; the staged calibration file
+        must take the value if it is inside the valid range (the manual: 48 to 504, others are not recorded) and stay as it
+        was if not, and no other pad's value may move."""
+        s, calibration = self.session, self.p["calibration"]
+        low, high = calibration["range"]
+        default = calibration["default"]
+        subs = [self.testmode_page_is(3, "pad calibration")]
+        if subs[-1]["status"] != "PASS":
+            return from_subresults("HW-53", subs)
+        wait_settled(s, 1.5, 30)
+        file = self.calibration_now()
+        subs.append(sub("the staged file starts at the synthetic default for every pad",
+                        file == {pad: default for pad in range(1, calibration["pads"] + 1)},
+                        f"{len(file)} pads, values {sorted(set(file.values()))}"))
+        walks = ((1, 300, 300, "a value inside the range is recorded"),
+                 (2, low, low, "the lowest valid value is recorded"),
+                 (3, high, high, "the highest valid value is recorded"),
+                 (4, low - 1, default, "a value just below the range is not recorded"),
+                 (5, high + 1, default, "a value just above the range is not recorded"))
+        for pad, raw, expected, why in walks:
+            shown, idle, after = self.calibration_walk(pad, raw, file)
+            moved = {p: v for p, v in after.items() if p != pad and file.get(p) != v}
+            subs.append(sub(f"pad {pad} held at {raw}: the page shows it and the three passes run to idle", shown == raw and idle,
+                            f"page read {shown}, START idle {idle}"))
+            subs.append(sub(f"pad {pad} held at {raw}: {why}", after.get(pad) == expected and not moved,
+                            f"file {file.get(pad)} -> {after.get(pad)} (expected {expected}), other pads changed {moved}"))
+            file = after
+        wait_settled(s, 1.5, 30)
+        self.shots_into(subs, "testmode-page3-lcd", s.image("p3"))
+        return from_subresults("HW-53", subs)
 
     # ------------------------------------------------------------------ HW-42, HW-44, HW-45, HW-24
     def library_files(self):

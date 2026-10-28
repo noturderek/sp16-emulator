@@ -51,8 +51,9 @@ CONTROL_NAMES = {
 # Controls with no place in the panel layout (driven through the research socket): POWER/STANDBY is the M1 key that M2
 # relays as RX bit (5,4) (service manual key matrix; the app's PowerManager handles button object 14); INPUT LEVEL is
 # the rear analog gain pot; INPUT TONE is a test signal on the input jack and FILTER TONE one at the analog filter's
-# input, where the send DAC plays (research stimuli, level 0..1000, 0 = off).
-HOST_CONTROL_NAMES = {100: "power", 101: "input_level", 102: "input_tone", 103: "filter_tone"}
+# input, where the send DAC plays (research stimuli, level 0..1000, 0 = off); PRESSURE 1..16 holds a pad's raw pressure.
+HOST_CONTROL_NAMES = {100: "power", 101: "input_level", 102: "input_tone", 103: "filter_tone",
+                      **{109 + i: f"pressure{i}" for i in range(1, 17)}}
 ALL_CONTROL_NAMES = {**CONTROL_NAMES, **HOST_CONTROL_NAMES}
 CONTROL_IDS = {name: control for control, name in ALL_CONTROL_NAMES.items()}
 # Analog controls the board applies outside the firmware (no MCU sees them, or, for MAIN OUT, in addition to its ADC
@@ -61,6 +62,10 @@ CONTROL_IDS = {name: control for control, name in ALL_CONTROL_NAMES.items()}
 # and 5 (offset 22), so FILTER TONE is at offset 24.
 HOST_ANALOG = ("main_out", "input_level", "lp_cutoff", "lp_resonance", "input_tone", "filter_tone")
 INPUT_TONE_HZ = 1000
+# PRESSURE n (ids 110..125) holds pad n's raw pressure word (0..PAD_RAW_MAX, the AD value the factory test's pad
+# calibration page shows) instead of a velocity, so a calibration walkthrough can send 48..504 exactly. A value above 0
+# also sets the contact word; 0 lets go. The pad's velocity press and release keep working and override it.
+PAD_RAW_MAX = 1023
 
 FRAME_BYTES = 128
 PAD_A_OFFSET, PAD_B_OFFSET = 0x06, 0x3f

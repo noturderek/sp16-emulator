@@ -399,6 +399,36 @@ class BoardModelTests(unittest.TestCase):
         self.assertEqual(frames(model, 4)[5] & 0x10, 0)
         self.assertNotIn(100, panel_map.CONTROL_NAMES)  # no place in the panel layout
 
+    def test_pressure_controls_hold_a_raw_pad_pressure_word(self):
+        model = panel.PanelModel()
+        ids = panel_map.CONTROL_IDS
+        self.assertEqual([ids[f"pressure{n}"] for n in (1, 16)], [110, 125])
+        self.assertEqual(len(set(panel_map.ALL_CONTROL_NAMES)), len(panel_map.ALL_CONTROL_NAMES))
+        for pad, raw in ((1, 48), (5, 242), (16, 504)):
+            self.assertEqual(model.apply(ids[f"pressure{pad}"], "value", raw), protocol.INPUT_OK)
+        frame = frames(model)
+        for pad, raw in ((1, 48), (5, 242), (16, 504)):
+            self.assertEqual(counter(frame, panel_map.PAD_A_OFFSET + 2 * (pad - 1)), raw)
+            self.assertEqual(counter(frame, panel_map.PAD_B_OFFSET + 2 * (pad - 1)), panel_map.PAD_B_CONTACT)
+        self.assertEqual(counter(frame, panel_map.PAD_A_OFFSET + 2), 0)             # pad 2 untouched
+        model.apply(ids["pressure1"], "value", 0)
+        frame = frames(model)
+        self.assertEqual((counter(frame, panel_map.PAD_A_OFFSET), counter(frame, panel_map.PAD_B_OFFSET)), (0, 0))
+
+    def test_pressure_controls_reject_other_actions_and_out_of_range_values(self):
+        model = panel.PanelModel()
+        control = panel_map.CONTROL_IDS["pressure3"]
+        self.assertEqual(model.apply(control, "press", 100), protocol.INPUT_INVALID)
+        self.assertEqual(model.apply(control, "value", 1024), protocol.INPUT_INVALID)
+        self.assertEqual(model.apply(control, "value", -1), protocol.INPUT_INVALID)
+
+    def test_a_velocity_press_still_overrides_a_held_pressure(self):
+        model = panel.PanelModel()
+        model.apply(panel_map.CONTROL_IDS["pressure1"], "value", 300)
+        model.apply(panel_map.CONTROL_IDS["pad1"], "press", 127)
+        frame = frames(model, 6)
+        self.assertEqual(counter(frame, panel_map.PAD_A_OFFSET), panel_map.PAD_CURVE(127)[0])
+
     def test_bridge_reads_the_board_model_lines(self):
         spec = importlib.util.spec_from_file_location("sp16_bridge_lines", TOOLS / "guest-bridge.py")
         source = (TOOLS / "guest-bridge.py").read_text()
