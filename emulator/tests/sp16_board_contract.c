@@ -101,6 +101,21 @@ int main(void) {
     for (int i=0;i<N*2;i++) back[i]=9;
     assert(snd_pcm_readi(ret,back,N)==N);
     for (int i=0;i<N*2;i++) assert(back[i]==0);
+    /* 1b. S24_LE (the format the app negotiates): send and return carry 24-bit samples low in a 32-bit word,
+     * round-tripped through the float queue to within one LSB. */
+    snd_pcm_t *send24=pcm("hw:ak4452audio,1",0,6), *ret24=pcm("hw:ak4452audio,1",1,6);
+    settle(send24);
+    int32_t s24[N*2], b24[N*2];
+    for (int i=0;i<N*2;i++) s24[i]=(int32_t)((uint32_t)(i*100003u)%16777216u)-8388608;   /* full signed 24-bit range */
+    assert(snd_pcm_writei(send24,s24,N)==N);
+    assert(snd_pcm_readi(ret24,b24,N)==N);
+    for (int i=0;i<N*2;i++) assert(b24[i]==0);                              /* the settle silence comes back first */
+    assert(snd_pcm_readi(ret24,b24,N)==N);
+    for (int i=0;i<N*2;i++) { int32_t d=s24[i]-b24[i]; assert(d>=-1 && d<=1); }
+    for (int i=0;i<N*2;i++) b24[i]=9;
+    assert(snd_pcm_readi(ret24,b24,N)==N);
+    for (int i=0;i<N*2;i++) assert(b24[i]==0);                              /* empty queue returns silence */
+    assert(snd_pcm_close(send24)==0 && snd_pcm_close(ret24)==0);
     /* 2. A DAC7811 word turns the high-pass on: DC through the loop decays to nothing. */
     int dac=open("/dev/dac_spi4.0",O_WRONLY);
     assert(dac>=0);
@@ -135,6 +150,17 @@ int main(void) {
         for (int i=0;i<N;i++) assert(tone[2*i]==tone[2*i+1]);
     }
     assert(top>30000);
+    /* 4b. The same tone reaches an S24_LE input capture, sign-extended 24-bit low in a 32-bit word. */
+    snd_pcm_t *in24=pcm("hw:ak4452audio,0",1,6);
+    int32_t tone24[N*2]; int top24=0;
+    for (int k=0;k<4;k++) {
+        memset(tone24,0,sizeof tone24);
+        assert(snd_pcm_readi(in24,tone24,N)==N);
+        for (int i=0;i<N*2;i++) { int m=tone24[i]<0?-tone24[i]:tone24[i]; if (m>top24) top24=m; }
+        for (int i=0;i<N;i++) assert(tone24[2*i]==tone24[2*i+1]);
+    }
+    assert(top24>7000000);
+    assert(snd_pcm_close(in24)==0);
     /* Tone off: the input capture is written with silence; the fake library (like the null plugin) leaves the
      * buffer as given, so it starts as the last tone samples would leave it, non-zero. */
     analog(state,0xffff,0);

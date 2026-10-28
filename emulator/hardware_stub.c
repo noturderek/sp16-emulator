@@ -666,11 +666,13 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
 /* The AK4452 codec driver of the SP-16 kernel declares S16_LE, S24_LE and S20_3LE only (its DAI stream tables); the
  * null plugin also takes FLOAT_LE, which the app's format search tries first, so without a restriction the board
  * streams run a sample path the unit never runs. The shim therefore refuses the formats the codec lacks by default, so
- * the app settles on S24_LE as on the unit. SP16_PCM_ANY_FORMAT=1 (research) restores the null plugin's answer. */
+ * the app settles on S24_LE as on the unit. S20_3LE (three packed bytes) is refused too: the board model's sample
+ * path (bm_width/bm_get/bm_put) carries only 2- and 4-byte layouts, so a 3-byte layout would leave the loop and input
+ * buffers untouched. SP16_PCM_ANY_FORMAT=1 (research) restores the null plugin's answer. */
 static int codec_refuses(const struct pcm_state *s,int format) {
     const char *any=getenv("SP16_PCM_ANY_FORMAT");
     if (!s || (any && !strcmp(any,"1")) || strncmp(s->name,"hw:ak4452audio,",15)) return 0;
-    return format!=2 && format!=6 && format!=36;
+    return format!=2 && format!=6;
 }
 /* The codec master clock is 1024 x 44.1 kHz and has no other setting (service manual clock tree), so every board PCM
  * accepts 44100 Hz only. set_rate refuses anything else as a driver restricted to one rate would; set_rate_near
@@ -895,8 +897,7 @@ static void ax_init(struct pcm_state *s,unsigned channels,int format) {
     unsigned width=tap_width(format);
     if (id>=AX_STREAMS || !width || width*channels>32) return;
     struct ax_ring *r=&ax_rings[id];
-    unsigned first=0, count=channels;
-    if (id==0 && channels==16) { first=12; count=4; } /* ch12/14 carry the metronome and samples; ch13/15 are not audio-like */
+    unsigned first=0, count=channels;   /* by default the whole stream travels, so the host output monitor can pick any pair */
     const char *env=id==0?getenv("SP16_PCM_PORT_CHANNELS"):NULL; /* research override "first:count" */
     char from_share[32];
     if (id==0 && !env && original_open && original_read) { /* the same override from the developer share, for a build whose environment is fixed */
@@ -1024,7 +1025,7 @@ static void *ax_forwarder(void *unused) {
  *  - The filter is an insert loop: the "Send & Return" playback (send DAC) goes through an analog low-pass (CUTOFF,
  *    RESONANCE pots, never seen by any MCU) and a high-pass whose cutoff is a control voltage from a DAC7811 on
  *    /dev/dac_spi4.0, and comes back on the "Send & Return" capture (return ADC). Here the send frames are queued and
- *    returned one period later through a two-pole low-pass and a two-pole high-pass.
+ *    drained by the return capture through a two-pole low-pass and a two-pole high-pass.
  *  - MAIN OUT is an analog volume after the master DAC (its pot position also reaches the firmware as an ADC word),
  *    INPUT LEVEL an analog gain before the input ADC (no MCU sees it).
  * Host-only state (MAIN OUT gain, INPUT LEVEL, CUTOFF, RESONANCE, a test tone on the input) comes from the bridge
@@ -1058,7 +1059,8 @@ static float bm_log2(float x) { /* log2 for x > 0, error < 1e-4: exponent from t
     return (float)e+2.8853901f*t*(1+t2/3*(1+t2*3/5*(1+t2*5/7)));
 }
 /* Level scale (grade I, not measured on a unit): the converters' full scale is the rated maximum level of the jacks,
- * +16 dBu (input and output). The dBu readouts in the metrics are dBFS + 16. */
+ * +16 dBu (input and output). The dBu readouts in the metrics are peak-equivalent (dBFS + 16 from the peak level);
+ * dBu proper is an RMS unit, so the fields are named *_dbu_peak to keep peak and RMS distinct. */
 #define FS_DBU 16.0f
 static float to_dbu(float peak) { return peak>1e-6f?FS_DBU+6.0205999f*bm_log2(peak):-99.0f; }
 
@@ -1165,8 +1167,9 @@ static float svf_run(struct svf *f,unsigned c,float x,int high) {
     return high?x-f->k*v1-v2:v2;
 }
 
-/* The loop: the send playback is queued as stereo float; the return capture takes it one period later. A capture
- * that finds the queue empty returns silence (counted), a full queue drops the newest send frames (counted). */
+/* The loop: the send playback is queued as stereo float and the return capture drains it on demand (a FIFO, no fixed
+ * one-period delay). A capture that finds the queue empty returns silence (counted), a full queue drops the newest
+ * send frames (counted). */
 #define LOOP_FRAMES 8192u
 static float loop_buf[LOOP_FRAMES][2];
 static uint32_t loop_head, loop_tail;
@@ -1391,7 +1394,7 @@ static void meter_report(uint64_t now,int force) {
     static const char *const names[]={"off","tone","wav"};
     float in=meter_in_peak, out=meter_out_peak;
     meter_report_ns=now; meter_limiter_logged=lim;
-    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu=%.1f out_peak=%.4f out_dbu=%.1f limited=%lu "
+    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu_peak=%.1f out_peak=%.4f out_dbu_peak=%.1f limited=%lu "
             "main_out_gain=%.4f input_gain=%.4f source=%s\n",lim,(double)in,(double)to_dbu(in),(double)out,(double)to_dbu(out),
             meter_limited,(double)a.main_gain,(double)a.input_gain,names[meter_source]);
     meter_in_peak=meter_out_peak=0; meter_limited=0;

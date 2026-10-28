@@ -19,7 +19,7 @@ class NetEnvironmentTests(unittest.TestCase):
 
     def test_mcast_needs_no_daemon(self):
         self.assertEqual(native.net_environment("mcast"),
-                         {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": "230.0.0.1:34567"})
+                         {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": "230.0.0.1:34567", "SP16_NET_MODE": "mcast"})
         self.assertEqual(native.net_environment("mcast:40000")["SP16_NET_TARGET"], "230.0.0.1:40000")
 
     def test_refused_modes(self):
@@ -38,19 +38,37 @@ class NetEnvironmentTests(unittest.TestCase):
     def test_host_uses_the_daemon_socket(self):
         with mock.patch.object(native, "vmnet_socket_path", return_value="/x/socket_vmnet") as found:
             self.assertEqual(native.net_environment("host"),
-                             {"SP16_NET_KIND": "unix", "SP16_NET_TARGET": "/x/socket_vmnet"})
+                             {"SP16_NET_KIND": "unix", "SP16_NET_TARGET": "/x/socket_vmnet", "SP16_NET_MODE": "host"})
             native.net_environment("bridged:en0")
         found.assert_called_with("socket_vmnet.bridged.en0")
 
+    def test_net_ip_is_validated_and_normalised(self):
+        with mock.patch.object(native, "vmnet_socket_path", return_value="/x/socket_vmnet.bridged.en0"):
+            env = native.net_environment("bridged:en0", "192.168.1.50/24")
+            self.assertEqual(env["SP16_NET_MODE"], "bridged:en0")
+            self.assertEqual(env["SP16_NET_IP"], "192.168.1.50/24")
+            self.assertEqual(native.net_environment("bridged:en0", "192.168.1.50")["SP16_NET_IP"], "192.168.1.50/24")
+        for bad in ("192.168.1.50/", "192.168.1.50/33", "300.1.2.3", "not-an-ip", "192.168.1.50/24/x"):
+            with self.assertRaises(ValueError, msg=bad):
+                native.net_environment("bridged:en0", bad)
+
+    def test_net_ip_requires_bridged(self):
+        with mock.patch.object(native, "vmnet_socket_path", return_value="/x/socket_vmnet"):
+            with self.assertRaises(ValueError):
+                native.net_environment("host", "192.168.1.50/24")
+        for mode in ("mcast", "mcast:40000", None, "none"):
+            with self.assertRaises(ValueError, msg=mode):
+                native.net_environment(mode, "192.168.1.50/24")
+
 
 class WrapperTests(unittest.TestCase):
-    def run_wrapper(self, **env):
+    def run_wrapper(self, args=("-m", "1"), **env):
         with tempfile.TemporaryDirectory() as folder:
             Path(folder, "qemu-net.sh").write_bytes((TOOLS / "net/qemu-net.sh").read_bytes())
             Path(folder, "qemu-net.sh").chmod(0o700)
             Path(folder, "qemu-system-aarch64").write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
             Path(folder, "qemu-system-aarch64").chmod(0o700)
-            done = subprocess.run([folder + "/qemu-net.sh", "-m", "1"], capture_output=True, text=True,
+            done = subprocess.run([folder + "/qemu-net.sh", *args], capture_output=True, text=True,
                                   env={"PATH": os.environ["PATH"], **env})
         return done.returncode, done.stdout.split("\n")[:-1]
 
@@ -72,6 +90,22 @@ class WrapperTests(unittest.TestCase):
     def test_unix_uses_the_stream_backend(self):
         _, args = self.run_wrapper(SP16_NET_KIND="unix", SP16_NET_TARGET="/x/socket_vmnet")
         self.assertEqual(args[3], "stream,id=sp16net,server=off,addr.type=unix,addr.path=/x/socket_vmnet")
+
+    def test_bridged_appends_the_mode_and_address_to_the_cmdline(self):
+        args = ("-m", "1", "-append", "console=ttyAMA0 rdinit=/init", "-device", "virtio-serial-device")
+        code, lines = self.run_wrapper(args, SP16_NET_KIND="unix", SP16_NET_TARGET="/x/sock",
+                                       SP16_NET_MODE="bridged:en0", SP16_NET_IP="192.168.1.50/24")
+        self.assertEqual(code, 0)
+        at = lines.index("-append")
+        self.assertEqual(lines[at + 1], "console=ttyAMA0 rdinit=/init sp16.net=bridged:en0 sp16.netip=192.168.1.50/24")
+
+    def test_mcast_appends_only_the_mode(self):
+        args = ("-m", "1", "-append", "console=ttyAMA0 rdinit=/init")
+        code, lines = self.run_wrapper(args, SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:34567",
+                                       SP16_NET_MODE="mcast")
+        self.assertEqual(code, 0)
+        at = lines.index("-append")
+        self.assertEqual(lines[at + 1], "console=ttyAMA0 rdinit=/init sp16.net=mcast")
 
 
 
