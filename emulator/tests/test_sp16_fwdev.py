@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
@@ -217,6 +218,72 @@ class FwdevHostTests(unittest.TestCase):
         # the share is in the app's root before the supervisor loop starts the app
         self.assertLess(init.index(bind), init.index("enter.py /tmp/sp16-root"))
         self.assertEqual(subprocess.run(["sh", "-n", str(TOOLS / "guest-init.sh")]).returncode, 0)
+
+
+class ConsoleWaitTests(unittest.TestCase):
+    """The session writes runtime.json before the app has created its console.txt, so fwdev must wait for the console
+    instead of reporting a missing file: on the second `mod run` of a day that error looked like a launch failure."""
+
+    def runtime(self):
+        session = Path(tempfile.mkdtemp()).resolve() / "sessions/native-abc"
+        session.mkdir(parents=True)
+        return {"session": str(session), "control_socket": str(session / "ctl.sock")}
+
+    def test_waits_for_a_console_the_app_writes_after_the_runtime(self):
+        runtime = self.runtime()
+        text = "booting\nSP16_NATIVE_READY\nSP16_DEV applied\n"
+        looks = []
+
+        def appear(seconds):
+            looks.append(seconds)
+            if len(looks) == 3:                     # the app creates the file a few polls later
+                (Path(runtime["session"]) / "console.txt").write_text(text)
+        with mock.patch.object(fwdev.time, "sleep", side_effect=appear):
+            data, length = fwdev.console_since(runtime, 0)
+        self.assertEqual((data, length), (text, len(text)))
+        self.assertEqual(looks, [.1, .1, .1])
+
+    def test_a_console_that_never_appears_is_a_clear_error(self):
+        runtime = self.runtime()
+        with mock.patch.object(fwdev.time, "sleep"):
+            with self.assertRaises(fwdev.ModError) as caught:
+                fwdev.console_since(runtime, 0, timeout=0.3)
+        message = str(caught.exception)
+        self.assertIn("no console.txt", message)
+        self.assertIn(runtime["session"], message)
+
+    def test_the_offset_returns_only_what_the_app_restart_added(self):
+        runtime = self.runtime()
+        path = Path(runtime["session"]) / "console.txt"
+        path.write_text("old\nSP16_DEV one\n")
+        offset = fwdev.console_since(runtime, 0)[1]
+        path.write_text("old\nSP16_DEV one\nSP16_DEV two\n")
+        self.assertEqual(fwdev.console_since(runtime, offset), ("SP16_DEV two\n", 30))
+        # An app restart recreates the console, so an offset past its end reads the whole new text, not nothing.
+        path.write_text("fresh\n")
+        self.assertEqual(fwdev.console_since(runtime, offset), ("fresh\n", 6))
+
+    def test_a_nonsense_offset_or_timeout_is_refused(self):
+        runtime = self.runtime()
+        (Path(runtime["session"]) / "console.txt").write_text("x\n")
+        for bad in ({"offset": -1}, {"offset": 0, "timeout": 0}, {"offset": 0, "timeout": -2}):
+            with self.subTest(bad=bad), self.assertRaises(fwdev.ModError):
+                fwdev.console_since(runtime, bad["offset"], bad.get("timeout", 15.0))
+
+    def test_a_half_written_runtime_json_is_skipped_not_raised(self):
+        build = Path(tempfile.mkdtemp()).resolve()
+        sessions = build / "sessions"
+        good, torn = sessions / "native-good", sessions / "native-torn"
+        for folder in (good, torn):
+            folder.mkdir(parents=True)
+        (good / "runtime.json").write_text(json.dumps({"session": str(good)}))
+        (torn / "runtime.json").write_text('{"session": "' + str(torn))   # mid-write: no closing brace
+        os.utime(good / "runtime.json", (1000, 1000))                      # the readable session is the older one
+        os.utime(torn / "runtime.json", (2000, 2000))                      # the half-written one is the newest
+        self.assertEqual(fwdev.latest_runtime(build)["session"], str(good))
+        (torn / "runtime.json").unlink()
+        self.assertEqual(fwdev.latest_runtime(build)["session"], str(good))
+        self.assertIsNone(fwdev.latest_runtime(build, since=3000))
 
 
 if __name__ == "__main__":
