@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import socket
 import struct
+import sys
 import time
 
 from midi import clock
@@ -104,6 +105,7 @@ class CarabinerLink:
         self.host, self.port = host, port
         self.sock: socket.socket | None = None
         self._file = None
+        self._warned = False
 
     @staticmethod
     def set_tempo_message(bpm: float) -> bytes:
@@ -147,19 +149,40 @@ class CarabinerLink:
         except OSError:
             return None
 
-    def set_tempo(self, bpm: float) -> None:
-        self.send(self.set_tempo_message(bpm))
+    def _drop(self) -> None:
+        """Close the socket without raising, so the next send attempts a fresh connect."""
+        for closable in (self._file, self.sock):
+            try:
+                if closable is not None:
+                    closable.close()
+            except OSError:
+                pass
+        self._file = None
+        self.sock = None
 
-    def force_beat_at_time(self, beat: float, when_micros: int, quantum: int = 4) -> None:
-        self.send(self.force_beat_at_time_message(beat, when_micros, quantum))
+    def _deliver(self, message: bytes) -> bool:
+        """Send `message` to Carabiner, tolerating one that is not listening: drop the dead socket, print one
+        diagnostic for this link and return False. `status()` swallows the same OSError; the tempo and phase calls
+        go through here so a missing Carabiner can never crash the bridge."""
+        try:
+            self.send(message)
+            return True
+        except OSError as exc:
+            self._drop()
+            if not self._warned:
+                self._warned = True
+                print(f"sync: no Carabiner listening on {self.host}:{self.port} ({exc}); "
+                      f"Link tempo/phase sync is off", file=sys.stderr, flush=True)
+            return False
+
+    def set_tempo(self, bpm: float) -> bool:
+        return self._deliver(self.set_tempo_message(bpm))
+
+    def force_beat_at_time(self, beat: float, when_micros: int, quantum: int = 4) -> bool:
+        return self._deliver(self.force_beat_at_time_message(beat, when_micros, quantum))
 
     def close(self) -> None:
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-        if self.sock is not None:
-            self.sock.close()
-            self.sock = None
+        self._drop()
 
 
 class PdlClockBridge:

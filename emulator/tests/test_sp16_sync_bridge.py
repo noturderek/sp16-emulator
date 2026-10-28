@@ -70,6 +70,17 @@ class ClockEmitterTests(unittest.TestCase):
         # 60 BPM = 24 p/s (12 in 0.5 s) then 240 BPM = 96 p/s (48 in 0.5 s): clearly more than a steady 60 BPM stream
         self.assertGreater(len(sent), 40)
 
+    def test_a_second_start_does_not_double_the_clock(self):
+        sent = []
+        emitter = bridge.ClockEmitter(sent.append)
+        emitter.set_bpm(120.0)
+        emitter.start()
+        emitter.start()  # a second thread would double the rate
+        time.sleep(0.6)
+        emitter.stop()
+        self.assertGreater(len(sent), 20)   # 120 BPM = 48 pulses/s, so ~29 in 0.6 s
+        self.assertLess(len(sent), 45)      # two threads would give ~58
+
 
 class RunTests(unittest.TestCase):
     def test_run_feeds_master_packets_and_emits_clock(self):

@@ -55,6 +55,11 @@ class ClockEmitter:
         self._bpm = float(bpm)
 
     def start(self) -> None:
+        """Start the clock thread. A second start while the thread is running is a no-op: a second thread would
+        double the pulse rate (48 instead of 24 PPQN). After `stop()` the emitter can be started again."""
+        if self._thread is not None:
+            return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
