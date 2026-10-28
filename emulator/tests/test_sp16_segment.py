@@ -68,5 +68,25 @@ class SegmentMasterTests(unittest.TestCase):
         self.assertEqual(master.MASTER_IP, "169.254.7.7")
 
 
+class SegmentWatchTests(unittest.TestCase):
+    """net/segment_watch.py decodes the keep-alive name at offset 0x0c, not 0x0b."""
+
+    def test_describe_reads_the_name_and_mac_and_ip(self):
+        import importlib.util
+        sys.path.insert(0, str(TOOLS / "net"))
+        spec = importlib.util.spec_from_file_location("segment_watch", TOOLS / "net/segment_watch.py")
+        watch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watch)
+        import fake_master
+        import segment
+        keepalive = fake_master.keepalive("TORAIZ", 2, bytes.fromhex("020000000007"), bytes([169, 254, 0, 23]))
+        frame = segment.udp_frame("52:54:00:a1:00:17", "ff:ff:ff:ff:ff:ff", "169.254.0.23", "169.254.255.255",
+                                  50000, 50000, keepalive)
+        text = watch.describe(frame)
+        self.assertIn("PRODJLINK type 0x06 name 'TORAIZ'", text)
+        self.assertIn("mac 02:00:00:00:00:07", text)
+        self.assertIn("ip 169.254.0.23", text)
+
+
 if __name__ == "__main__":
     unittest.main()
