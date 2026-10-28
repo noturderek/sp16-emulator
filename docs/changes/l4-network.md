@@ -88,9 +88,10 @@ S); `hardware_stub.c` (held) may need an ethtool/MII link answer for eth0.
 
 ### Cross-lane requests
 
-1. `emulator/Dockerfile.native-base` (held): the module cull deletes `virtio_net`; keep it and its dependencies, and
-   require it in the check loop. Without this the guest prints `SP16_NET no eth0` and runs as before (O). Patch (also saved in the
-   notes folder as `l4-dockerfile-virtio-net.patch`; the build used for every test above had it applied):
+1. `emulator/Dockerfile.native-base` (held): **applied** on the dispatcher's request, in the last commit of this branch.
+   The module cull used to delete `virtio_net`, so a normal rebuild gave `SP16_NET no eth0` and `--net` had no guest NIC (O).
+   The cull now keeps `virtio_net` and its dependencies `net_failover` and `failover`, and the check loop requires
+   `virtio_net`, so a missing module fails the image build instead of the boot:
 
 ```diff
 -  ! -name 'virtio_blk.ko*' ! -path '*/fs/fat/*' ! -path '*/fs/nls/*' \
@@ -118,6 +119,6 @@ packets or a player number?) stay U.
   `test_sp16_cli`: 141 tests OK. The full suite was not run (owner rule).
 - Builds made: `build/l4` (research, audio file) and `build/l4t` (research, strace); both in the git-ignored `build/`. All
   emulator processes started by this lane (exact pids, `kill`, then `kill -9` for an app that ignored it) are stopped.
-- Temporary: a local edit of `Dockerfile.native-base` was used for the builds and reverted before committing.
+- The `Dockerfile.native-base` edit used for the builds is now committed (cross-lane request 1, applied).
 - Not run: `--net bridged:en0` (no bridged daemon; no sudo), the acceptance `tcpdump` (no BPF access), Wireshark dissector
   decoding (no Wireshark); `segment_watch.py` decodes the same fields for mcast segments.

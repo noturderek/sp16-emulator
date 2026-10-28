@@ -10,12 +10,12 @@ RUN apt-get update \
 # Kept modules: virtio (console, blk), VFAT/NLS (data and USB images), dm-crypt and the kernel crypto modules (import and
 # repack), ISO9660 (update payload), squashfs + overlayfs (firmware image), 9p (developer overlay).
 RUN find /lib/modules -type f -name '*.ko*' ! -path '*/drivers/virtio/*' ! -name virtio_console.ko \
- ! -name 'virtio_blk.ko*' ! -path '*/fs/fat/*' ! -path '*/fs/nls/*' \
+ ! -name 'virtio_blk.ko*' ! -name 'virtio_net.ko*' ! -name 'net_failover.ko*' ! -name 'failover.ko*' ! -path '*/fs/fat/*' ! -path '*/fs/nls/*' \
  ! -path '*/drivers/md/*' ! -path '*/drivers/dax/*' ! -path '*/drivers/cdrom/*' ! -path '*/crypto/*' ! -path '*/fs/isofs/*' ! -path '*/fs/squashfs/*' \
  ! -path '*/fs/overlayfs/*' ! -path '*/fs/9p/*' ! -path '*/net/9p/*' ! -path '*/fs/netfs/*' ! -path '*/fs/fscache/*' \
  ! -path '*/kernel/lib/*' -delete \
  && for sp16_kernel in /lib/modules/*; do sp16_kernel=${sp16_kernel##*/}; depmod "$sp16_kernel"; \
-    sp16_need='virtio_blk vfat dm_crypt isofs squashfs overlay 9p 9pnet_virtio'; \
+    sp16_need='virtio_blk virtio_net vfat dm_crypt isofs squashfs overlay 9p 9pnet_virtio'; \
     while set -- $sp16_need; [ $# -gt 0 ]; do sp16_module=$1; shift; sp16_need="$*"; \
       sp16_deps=$(modinfo -k "$sp16_kernel" -F depends "$sp16_module") || exit 1; \
       sp16_need="$sp16_need $(echo "$sp16_deps" | tr , ' ')"; done; done
