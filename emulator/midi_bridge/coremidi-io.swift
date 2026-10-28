@@ -5,11 +5,14 @@
 //           "ready"       the endpoints are open
 //           "ports in:N out:N"-style lines for `list`
 //   stdin   "out HEX..."  send a MIDI message to the chosen output
+//           "burst HEX | HEX | ..."  send several messages in one packet list
 //           "quit"
 // Modes:
 //   list                         print every source and destination
 //   run --in NAME [--out NAME]   open the first source whose name contains NAME (case-insensitive); the optional
 //                                destination receives "out" lines
+//   decode HEX | HEX | ...       build one packet list from the messages and run the receive path on it, printing
+//                                what it decodes (a self-test of the list walk, no CoreMIDI endpoint involved)
 //   virtual NAME                 create a virtual source and destination called NAME: what "out" writes comes out of
 //                                the source, what arrives at the destination is printed as "in" (a stand-in
 //                                controller for tests, without hardware)
@@ -26,11 +29,12 @@ func name(_ object: MIDIObjectRef) -> String {
 
 func bytes(_ hex: Substring) -> [UInt8] { hex.split(separator: " ").compactMap { UInt8($0, radix: 16) } }
 
-func emit(_ packets: UnsafePointer<MIDIPacketList>) {
-    var packet = packets.pointee.packet
-    for _ in 0..<packets.pointee.numPackets {
-        let length = Int(packet.length)
-        let data = withUnsafeBytes(of: packet.data) { Array($0.prefix(length)) }
+func emit(_ list: UnsafePointer<MIDIPacketList>) {
+    // Walk the callback's own list: MIDIPacketNext must be given a pointer into it, never into a copy of a packet.
+    for packet in list.unsafeSequence() {
+        let length = Int(packet.pointee.length)
+        let start = UnsafeRawPointer(packet) + MemoryLayout<MIDIPacket>.offset(of: \.data)!
+        let data = Array(UnsafeBufferPointer(start: start.assumingMemoryBound(to: UInt8.self), count: length))
         // Split a packet into messages: a status byte starts one; running status is not expanded (CoreMIDI does not
         // send it). Realtime bytes (>= 0xF8) are single messages.
         var message: [UInt8] = []
@@ -41,18 +45,25 @@ func emit(_ packets: UnsafePointer<MIDIPacketList>) {
             message.append(byte)
         }
         flush()
-        packet = MIDIPacketNext(&packet).pointee
     }
 }
 
-func send(_ message: [UInt8], _ send: (UnsafePointer<MIDIPacketList>) -> Void) {
-    var buffer = [UInt8](repeating: 0, count: 1024)
+// One MIDIPacketList holding a packet per message, in order.
+func send(_ messages: [[UInt8]], _ send: (UnsafePointer<MIDIPacketList>) -> Void) {
+    var buffer = [UInt8](repeating: 0, count: 4096)
     buffer.withUnsafeMutableBytes { raw in
         let list = raw.baseAddress!.assumingMemoryBound(to: MIDIPacketList.self)
-        let packet = MIDIPacketListInit(list)
-        _ = MIDIPacketListAdd(list, 1024, packet, 0, message.count, message)
+        var packet = MIDIPacketListInit(list)
+        for message in messages { packet = MIDIPacketListAdd(list, raw.count, packet, 0, message.count, message) }
         send(UnsafePointer(list))
     }
+}
+
+// "out HEX" is one message, "burst HEX | HEX | HEX" several in one packet list.
+func messages(_ line: String) -> [[UInt8]]? {
+    if line.hasPrefix("out ") { return [bytes(line.dropFirst(4))] }
+    if line.hasPrefix("burst ") { return line.dropFirst(6).split(separator: "|").map { bytes($0) } }
+    return nil
 }
 
 func option(_ flag: String) -> String? {
@@ -92,10 +103,13 @@ case "run":
     print("ready")
     while let line = readLine() {
         if line == "quit" { break }
-        if line.hasPrefix("out "), let destination = destination {
-            send(bytes(line.dropFirst(4))) { MIDISend(outPort, destination, $0) }
-        }
+        if let destination = destination, let list = messages(line) { send(list) { MIDISend(outPort, destination, $0) } }
     }
+
+case "decode":
+    let given = CommandLine.arguments.dropFirst(2).joined(separator: " ")
+    send(given.split(separator: "|").map { bytes($0) }) { emit($0) }
+    exit(0)
 
 case "virtual":
     let label = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "SP16 Test Controller"
@@ -106,9 +120,9 @@ case "virtual":
     print("ready")
     while let line = readLine() {
         if line == "quit" { break }
-        if line.hasPrefix("out ") { send(bytes(line.dropFirst(4))) { MIDIReceived(source, $0) } }
+        if let list = messages(line) { send(list) { MIDIReceived(source, $0) } }
     }
 
 default:
-    fputs("usage: coremidi-io list | run --in NAME [--out NAME] | virtual NAME\n", stderr); exit(2)
+    fputs("usage: coremidi-io list | run --in NAME [--out NAME] | virtual NAME | decode HEX | HEX ...\n", stderr); exit(2)
 }

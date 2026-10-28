@@ -4,6 +4,7 @@ through two virtual CoreMIDI endpoints (skipped where the helper cannot be built
 Run: python3 -m unittest emulator.midi_bridge.tests.test_midi_bridge
 """
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -317,6 +318,35 @@ class TranslatorTests(unittest.TestCase):
             calls, logged = self.scaled(("enc", action), [M("cc", 0, 16, 1)], scale=0.5)
             self.assertEqual((calls, len(logged)), ([], 1), action)
 
+    def test_pitch_bend_to_detents_uses_its_14_bit_range(self):
+        bends = [round(i * 16383 / 127) for i in range(128)]               # a full upward sweep in 127 equal steps
+        calls, _ = self.scaled(("ribbon", "knob1"), [M("pitchbend", 0, 0, v) for v in bends])
+        self.assertEqual(sum(c[2] for c in calls), 127)                   # not 16383, and nothing hits the clamp
+        self.assertTrue(all(c[:2] == ("knob1", "delta") and abs(c[2]) <= 2 for c in calls), calls)
+        calls, _ = self.scaled(("ribbon", "knob1"), [M("pitchbend", 0, 0, v) for v in reversed(bends)])
+        self.assertEqual(sum(c[2] for c in calls), -127)
+
+    def test_pitch_bend_small_bend_is_less_than_a_detent(self):
+        calls, _ = self.scaled(("ribbon", "knob1"), [M("pitchbend", 0, 0, v) for v in (8192, 8260, 8192)])
+        self.assertEqual(calls, [])                                       # +0.5 then -0.5 detent: carried, never sent
+        calls, _ = self.scaled(("ribbon", "knob1"), [M("pitchbend", 0, 0, v) for v in (8192, 8192 + 129)])
+        self.assertEqual(calls, [("knob1", "delta", 1)])                  # 129 of 16383 is a little over one of 127
+
+    def test_pitch_bend_to_detents_scale_invert_and_clamp(self):
+        sweep = [M("pitchbend", 0, 0, v) for v in (0, 16383)]
+        calls, _ = self.scaled(("ribbon", "knob1"), sweep, scale=0.25)
+        self.assertEqual(calls, [("knob1", "delta", 31)])                 # 127 * 0.25 = 31.75, the rest is carried
+        calls, _ = self.scaled(("ribbon", "knob1"), sweep, invert=True, scale=0.25)
+        self.assertEqual(calls, [("knob1", "delta", -31)])
+        calls, _ = self.scaled(("ribbon", "knob1"), sweep)
+        self.assertEqual(calls, [("knob1", "delta", 64)])                 # one jump over the whole range: per-event clamp
+
+    def test_seven_and_fourteen_bit_inputs_turn_a_knob_alike(self):
+        cc, _ = self.scaled(("cut", "knob2"), [M("cc", 0, 74, v) for v in (0, 127)])
+        bend, _ = self.scaled(("ribbon", "knob2"), [M("pitchbend", 0, 0, v) for v in (0, 16383)])
+        self.assertEqual(cc, [("knob2", "delta", 64)])
+        self.assertEqual(bend, cc)
+
     def test_failed_call_is_counted_not_raised(self):
         class Broken:
             def event(self, *args):
@@ -476,6 +506,30 @@ class CoreMidiTests(unittest.TestCase):
         self.assertEqual(got, [M("note_on", 9, 36, 99), M("cc", 0, 16, 1)])
         port.send(M("note_on", 9, 36, 127))
         self.assertEqual(controller.get(2), M("note_on", 9, 36, 127))
+
+    def test_a_long_packet_list_decodes_completely_and_in_order(self):
+        """Regression: the receive path stepped through a list from a copy of its first packet, which only holds while
+        the list is short (the old walk decoded 86 of these 300). `decode` runs that path on a hand-built list."""
+        sent = [f"b0 {i % 100:02x} {i % 128:02x}" for i in range(1, 301)]
+        out = subprocess.run([str(midi.helper_binary()), "decode", " | ".join(sent)], capture_output=True, text=True,
+                             timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.split("\n")[:-1], ["in " + line for line in sent])
+
+    def test_several_packets_in_one_send_arrive_in_order(self):
+        name = f"SP16 L5 burst {int(time.time())}"
+        try:
+            controller = midi.Port(["virtual", name])
+        except RuntimeError as error:
+            self.skipTest(f"CoreMIDI refused a virtual endpoint: {error}")
+        time.sleep(0.3)
+        port = midi.Port(["run", "--in", name])
+        self.addCleanup(controller.close)
+        self.addCleanup(port.close)
+        time.sleep(0.3)
+        sent = [M("note_on", 9, 36, 99), M("cc", 0, 16, 1), M("pitchbend", 2, 0, 12345), M("note_off", 9, 36, 0)]
+        controller.send_many(sent)
+        self.assertEqual([port.get(2) for _ in sent], sent)
 
 
 if __name__ == "__main__":

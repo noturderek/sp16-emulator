@@ -64,7 +64,7 @@ From the 1.60 addendum pp. 47-51 (S): a MIDI track sends on its own channel (TRA
 the track's NOTE (C0..B9); the MIDI CC1 page's six knobs are PITCH BEND, AFTER TOUCH, CC 7, CC 1, CC 2, CC 10 and the CC2
 page CC 71..76; START/STOP/CONTINUE are sent when enabled. Not in the manual: which note each pad sends (a per-track
 setting; the default `--note-base 60` is the screenshot's C5 with C0 = 0, grade I), any LED input over MIDI (U: the
-preset has no lamps), and how the knob values behave on a turn (I: absolute 0..127, turned into detents). Only the
+preset has no lamps), and how the knob values behave on a turn (I: absolute, turned into detents: 127 for a sweep of the whole range, whether 7-bit or 14-bit pitch bend). Only the
 unit's MIDI OUT is mirrored; nothing is sent to the unit.
 
 ## Checks
@@ -90,8 +90,11 @@ second commit. Files: `emulator/midi_bridge/` (`__init__`, `__main__`, `midi`, `
 `presets`, `bridge`, `coremidi-io.swift`, `tests/test_midi_bridge.py`) and this document. No existing file was edited.
 
 Checks (grade O unless noted):
-- `python3 -m unittest emulator.midi_bridge.tests.test_midi_bridge` -> `Ran 34 tests ... OK`, 34 of 34, including a
-  round trip through a virtual CoreMIDI source and destination (note, CC and the reverse direction).
+- `python3 -m unittest emulator.midi_bridge.tests.test_midi_bridge` -> `Ran 54 tests ... OK`, 54 of 54, including a
+  round trip through a virtual CoreMIDI source and destination (note, CC and the reverse direction), four messages sent
+  in one packet list, and a 300-message list run through the helper's receive path (`coremidi-io decode`).
+  Review fixes since the first hand-back are covered by tests: a transport tap still pending at exit, `scale` for every
+  input kind against every control kind, the packet-list walk, and pitch bend as 14 bits.
 - Quick set slice run: `python3 -m unittest emulator.tests.test_sp16_panel emulator.tests.test_sp16_profiles` -> 88 OK.
   The rest of the quick set was not run: nothing outside `emulator/midi_bridge/` changed.
 - Recorded run, research build `l5` (`./sp16 build --name l5 --research --audio file ...`, firmware 1.60, `run --ephemeral`),

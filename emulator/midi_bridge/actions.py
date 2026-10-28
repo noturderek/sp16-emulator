@@ -25,6 +25,7 @@ STRIP_RELEASE_SECONDS = 0.6
 MAX_DELTA = 64                      # panel.Panel.MAX_DELTA: more per event is clamped by the app
 ANALOG = ("main_out", "drive", "lp_cutoff", "lp_resonance", "hp_cutoff", "input_level")
 DETENTS = ("selector", *(f"knob{i}" for i in range(1, 7)))
+DETENTS_PER_SWEEP = 127             # an absolute control moved over its whole range turns a knob this far, whatever its resolution
 RELATIVE_STEP = 10                  # analog value units (of 1000) per detent of a relative encoder
 
 
@@ -152,23 +153,23 @@ class Translator:
             self.event(self.held.pop(name), "release", 0)
 
     def fraction(self, spec, value):
+        """Where `value` sits in its own range, 0..1: 14 bits for pitch bend, 7 for everything else."""
         return value / 16383 if spec["type"] == "pitchbend" else value / 127
 
     def absolute(self, name, spec, entry, message):
         action = entry["action"]
         kind = kind_of(action)
-        fraction = self.fraction(spec, message.value)
-        if entry.get("invert"):
-            fraction = 1 - fraction
+        position = self.fraction(spec, message.value)
+        fraction = 1 - position if entry.get("invert") else position
         fraction = max(0.0, min(1.0, fraction * entry.get("scale", 1.0)))
         if kind == "analog":
             self.set_analog(action, round(fraction * 1000))
         elif kind == "detent":
             last = self.last.get(name)
-            self.last[name] = message.value
-            if last is not None and message.value != last:
-                diff = message.value - last
-                self.step(name, action, entry, -diff if entry.get("invert") else diff)
+            self.last[name] = position
+            if last is not None and position != last:
+                moved = (position - last) * DETENTS_PER_SWEEP        # the same detents per sweep for 7- and 14-bit inputs
+                self.step(name, action, entry, -moved if entry.get("invert") else moved)
         elif kind == "strip":
             centred = spec["type"] == "pitchbend" and abs(message.value - 8192) <= 64
             if centred:

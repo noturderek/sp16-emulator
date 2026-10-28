@@ -9,7 +9,7 @@ used here (grade S, from the manual):
   - START/STOP/CONTINUE are sent when enabled (2.1).
 What the manual does not say, and this preset therefore does not claim: which note each pad sends (it is a track setting;
 `note_base` is the default the screenshot suggests, NOTE C5 = 60 with C0 = 0, grade I), that the unit has any LED input
-over MIDI (U: no lamp mapping is generated) the range and behaviour of the knobs' values (assumed absolute 0..127, grade I: the bridge turns a change of value
+over MIDI (U: no lamp mapping is generated) the range and behaviour of the knobs' values (assumed absolute, grade I: the bridge turns a change of value
 into detents).
 """
 from . import profile as prof

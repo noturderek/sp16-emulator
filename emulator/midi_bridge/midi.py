@@ -160,6 +160,14 @@ class Port:
         except (BrokenPipeError, ValueError):
             pass
 
+    def send_many(self, messages):
+        """Several messages in one CoreMIDI packet list (one packet each), in order."""
+        try:
+            self.process.stdin.write("burst " + " | ".join(hex_line(encode(m)) for m in messages) + "\n")
+            self.process.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+
     def close(self):
         try:
             self.process.stdin.write("quit\n")
