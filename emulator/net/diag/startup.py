@@ -4,7 +4,8 @@ Attach to a fresh --trace gdb session, then:
     command script import emulator/net/diag/startup.py
     continue
 
-Each breakpoint logs once and auto-continues. Only control-flow addresses,
+Each breakpoint logs once and stops; enter `continue` after each observation.
+Only control-flow addresses,
 return values and singleton/guard state are read; no interface identity is read.
 The final CONSTRUCTOR_RETURN line proves construction completed independently
 of the guest bridge's intentional exclusion of OEM stdout from console.txt.
@@ -37,7 +38,7 @@ def hit(frame, location, _internal):
             fields.append(f"{name}=0x{value:x}" if error.Success() else f"{name}=READ_ERROR")
     print(" ".join(fields), flush=True)
     location.GetBreakpoint().SetEnabled(False)
-    return False
+    return True
 
 
 def __lldb_init_module(debugger, _internal):
