@@ -20,7 +20,9 @@ mkdir -p -m 700 private           # git-ignored and owner-only (build/ is create
 ```
 
 `--bundle-suffix dev` gives this build its own bundle id, so it can run next to your normal build. All builds share
-the firmware library `build/library`, so firmware you already imported is available here too.
+the firmware library `build/library`, so firmware you already imported is available here too. When working in a git
+worktree, builds can reuse the main checkout's library and compiled QEMU with
+`--library <path>/build/sp16/library` and `--reuse-qemu-from <path>/build/qemu-source`.
 
 ## A mod folder
 
@@ -157,9 +159,8 @@ SP16_APL_HOOK rc=0
   (keep the `( … )` subshell so a broken script cannot stop the line itself).
 - Child programs (`cp`, `rm`, `sleep`) work: the guest registers a `binfmt_misc` handler for ARM ELF files the first
   time a hook runs. It needs a guest image from this version (rebuild in place as above).
-- A script that is written into `/root/data` through `files/` stays in the data image after the session ends, because
-  the overlay's record of what it wrote is kept in the guest's RAM. Remove it from the script itself or rebuild the
-  data image, or the next session finds it again.
+- The overlay's record of written files is stored in the eMMC image's `.sp16` directory (outside the app's data
+  directory), which survives a VM restart. A file that would overwrite the record itself is refused.
 - Put the marker and the hook line in your own `files/root/pdj/apl_start`, which is a modified copy of a firmware
   file: keep it in your private mod folder and never commit it.
 
@@ -193,6 +194,14 @@ runs the firmware's `apl_start`, so it honours that launcher itself: when the ap
 `sp16-preload.so` and the firmware's `apl_start` contains the marker line `# SP16_PRELOAD_LAUNCHER`, the library is
 loaded after the hardware shim (and before any developer-overlay libraries), and the console shows `SP16_FW_LAUNCHER
 preload=<path>`. Both come from the hash-checked firmware image. A stock update carries neither, so it boots unchanged.
+
+### Boot read-length limits
+
+Firmware boot archives are read into fixed-length memory buffers during boot. When creating or unpacking repacked
+updates (`prepare.py` and `guest-firmware.py`), layer archive lengths are checked against `max_boot_read_bytes`
+from the product profile (`profiles/products/sp16.json`). Two archives are strictly enforced: `rootfs2.tar.gz`
+(maximum 2,422,834 bytes) and `pdj.tar.gz` (maximum 4,561,658 bytes). An archive exceeding its limit is refused
+at repack and unpack, reporting the archive, its size, the limit, and the excess bytes.
 
 A repacked update contains the vendor's firmware. Keep it in `private/`, never distribute it and never flash it to a
 device.
