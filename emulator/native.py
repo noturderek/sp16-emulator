@@ -539,6 +539,7 @@ NET_MCAST_GROUP = "230.0.0.1"
 NET_MCAST_PORT = 34567
 VMNET_DIRECTORIES = ("/opt/homebrew/var/run", "/usr/local/var/run", "/var/run")
 NET_MODES = "none, host, bridged:IF (for example bridged:en0) or mcast[:PORT]"
+NET_IP = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?")
 
 
 def vmnet_socket_path(name):
@@ -550,16 +551,37 @@ def vmnet_socket_path(name):
     return None
 
 
-def net_environment(mode):
-    """`launch --net MODE` -> the environment the QEMU wrapper reads (net/qemu-net.sh), {} for no network.
-    host and bridged:IF need the root socket_vmnet daemon to be running (the user starts it, see docs/changes/l4-network.md);
-    mcast needs nothing and links instances on this Mac only."""
+def validate_net_ip(net_ip):
+    """--net-ip: a.b.c.d or a.b.c.d/prefix, octets 0..255 and prefix 0..32; returned normalised with a /24 when bare."""
+    if net_ip is None:
+        return None
+    if not NET_IP.fullmatch(net_ip):
+        raise ValueError("--net-ip must be a.b.c.d[/prefix], e.g. 192.168.1.50/24")
+    addr, _, prefix = net_ip.partition("/")
+    if any(not octet.isdigit() or int(octet) > 255 for octet in addr.split(".")):
+        raise ValueError("--net-ip has an octet above 255")
+    if prefix and (not prefix.isdigit() or int(prefix) > 32):
+        raise ValueError("--net-ip prefix must be 0..32")
+    return addr + "/" + (prefix or "24")
+
+
+def net_environment(mode, net_ip=None):
+    """`launch --net MODE [--net-ip ADDR]` -> the environment the QEMU wrapper reads (net/qemu-net.sh), {} for no
+    network. host and bridged:IF need the root socket_vmnet daemon to be running (the user starts it, see
+    docs/changes/l4-network.md); mcast needs nothing and links instances on this Mac only. SP16_NET_MODE carries the
+    mode to the guest init (via /proc/cmdline) so a bridged run can add a real-subnet address; SP16_NET_IP is the
+    optional static address for that."""
     if mode in (None, "none"):
+        if net_ip is not None:
+            raise ValueError("--net-ip needs --net bridged:IF")
         return {}
+    net_ip = validate_net_ip(net_ip)
     if mode == "host" or mode.startswith("bridged:"):
         iface = mode.partition(":")[2]
         if mode != "host" and not NET_IFACE.fullmatch(iface):
             raise ValueError("--net bridged:IF needs an interface name such as bridged:en0")
+        if net_ip is not None and mode == "host":
+            raise ValueError("--net-ip needs --net bridged:IF (host mode has no real subnet)")
         name = "socket_vmnet" if mode == "host" else f"socket_vmnet.bridged.{iface}"
         path = vmnet_socket_path(name)
         if path is None:
@@ -568,21 +590,26 @@ def net_environment(mode):
                              "--net mcast, which needs no root and links emulators on this Mac only")
         if "," in path:
             raise ValueError("socket_vmnet path must not contain commas")
-        return {"SP16_NET_KIND": "unix", "SP16_NET_TARGET": path}
+        env = {"SP16_NET_KIND": "unix", "SP16_NET_TARGET": path, "SP16_NET_MODE": mode}
+        if net_ip is not None:
+            env["SP16_NET_IP"] = net_ip
+        return env
     if mode == "mcast" or mode.startswith("mcast:"):
         port = mode.partition(":")[2] or str(NET_MCAST_PORT)
         if not port.isdigit() or not 1024 <= int(port) <= 65535:
             raise ValueError("--net mcast:PORT needs a port from 1024 to 65535")
-        return {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": f"{NET_MCAST_GROUP}:{port}"}
+        if net_ip is not None:
+            raise ValueError("--net-ip needs --net bridged:IF")
+        return {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": f"{NET_MCAST_GROUP}:{port}", "SP16_NET_MODE": mode}
     raise ValueError(f"--net must be {NET_MODES}")
 
 
 def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overlay=None, no_ui_input=False,
-           no_audio_files=False, net=None):
+           no_audio_files=False, net=None, net_ip=None):
     host_check()
     output = private_path(output)
     assets = validated_assets(output)
-    net_env = net_environment(net)
+    net_env = net_environment(net, net_ip)
     if net_env and not (output / NET_WRAPPER).is_file():
         raise ValueError("--net needs a build made by this version; rebuild it with ./sp16 build --rebuild")
     if dev_overlay is not None and not (assets.get("decoupled") is True and assets.get("research")):
@@ -751,6 +778,10 @@ def main():
     launcher.add_argument("--net", metavar="MODE", default="none",
                           help="guest network (Pro DJ Link): " + NET_MODES + ". host and bridged need the socket_vmnet "
                                "daemon; mcast links emulators on this Mac without root. Default: none")
+    launcher.add_argument("--net-ip", metavar="ADDR[/PREFIX]",
+                          help="with --net bridged:IF: a static address on that interface's subnet for the guest "
+                               "(a.b.c.d[/prefix], /24 when the prefix is omitted), added beside the 169.254 link-local "
+                               "alias kept for Pro DJ Link")
     launcher.add_argument("--no-audio-files", action="store_true",
                           help="audio builds: the sink keeps reading and counting the guest's PCM (metrics) but "
                                "writes no WAV into the session folder")
@@ -788,7 +819,7 @@ def main():
             return diagnostics_command(args)
         else:
             launch(args.output, args.ephemeral, args.usb_image, args.firmware, args.dev_overlay, args.no_ui_input,
-                   args.no_audio_files, args.net)
+                   args.no_audio_files, args.net, args.net_ip)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"native emulator failed: {exc}\n")
 

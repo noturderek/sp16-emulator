@@ -37,6 +37,16 @@ for sp16_port in /sys/class/virtio-ports/*; do
    sp16.gdb) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-gdb ;;
   esac
 done
+# Network mode and optional static address (`./sp16 run --net MODE [--net-ip ADDR]`) travel in the kernel command
+# line, the only host -> guest-init channel. The mode tells a bridged run (real LAN subnet) from host/mcast.
+sp16_net_mode=
+sp16_net_ip=
+for sp16_token in $(cat /proc/cmdline); do
+  case "$sp16_token" in
+   sp16.net=*) sp16_net_mode=${sp16_token#sp16.net=} ;;
+   sp16.netip=*) sp16_net_ip=${sp16_token#sp16.netip=} ;;
+  esac
+done
 # Network (./sp16 run --net): QEMU adds a virtio-net device only then. The app's Pro DJ Link sockets live on eth0, so bring
 # it up when the device exists (virtio device id 1); without one the guest has lo only, as before.
 sp16_have_nic=
@@ -53,12 +63,28 @@ if [ -n "$sp16_have_nic" ]; then
     ip link set eth0 up
     # The unit's rc.local gives eth0 an address before the app starts (ifconfig from fw_printenv ipaddr); the app crashes
     # (SIGSEGV) on an eth0 that has none. So: a link-local address from the MAC, 169.254.A.B with A and B from its last
-    # two bytes and kept off .0 and .255. The MAC is random per start (net/qemu-net.sh), so instances differ.
+    # two bytes and kept off .0 and .255. The MAC is random per start (net/qemu-net.sh), so instances differ. This alias
+    # stays even on a bridged run: Pro DJ Link peers self-assign 169.254, and the unit's own Pro DJ Link socket lives there.
     sp16_mac=$(cat /sys/class/net/eth0/address)
     sp16_b5=$(echo "$sp16_mac" | cut -d: -f5); sp16_b6=$(echo "$sp16_mac" | cut -d: -f6)
     sp16_ip="169.254.$((0x$sp16_b5 % 254 + 1)).$((0x$sp16_b6 % 254 + 1))"
     ip addr add "$sp16_ip/16" broadcast 169.254.255.255 dev eth0
-    echo "SP16_NET eth0 $sp16_mac $sp16_ip"
+    # Bridged mode: the guest sits on the real LAN, so besides the link-local alias it needs a reachable address on the
+    # interface's subnet. --net-ip gives it directly (native.py validates and normalises it to a.b.c.d/prefix); without
+    # one, DHCP is tried when a client is present (the base guest ships none yet, so the run stays on the alias).
+    case "$sp16_net_mode" in
+     bridged:*)
+      if [ -n "$sp16_net_ip" ]; then
+        ip addr add "$sp16_net_ip" dev eth0 || echo "SP16_NET bad --net-ip $sp16_net_ip"
+        echo "SP16_NET eth0 $sp16_mac $sp16_ip + $sp16_net_ip (bridged $sp16_net_mode)"
+      elif command -v udhcpc >/dev/null 2>&1; then
+        udhcpc -i eth0 -q || :
+        echo "SP16_NET eth0 $sp16_mac $sp16_ip (bridged $sp16_net_mode, DHCP)"
+      else
+        echo "SP16_NET eth0 $sp16_mac $sp16_ip (bridged $sp16_net_mode, no DHCP client; add --net-ip for a real-subnet address)"
+      fi ;;
+     *) echo "SP16_NET eth0 $sp16_mac $sp16_ip" ;;
+    esac
   else
     sp16_have_nic=
     echo "SP16_NET no eth0 (virtio_net module missing from this guest image? rebuild with the current Dockerfile)"
