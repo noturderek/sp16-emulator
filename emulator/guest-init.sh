@@ -21,6 +21,8 @@ mount -t sysfs sysfs /sys
 mount -t tmpfs -o mode=700 tmpfs /tmp
 ip link set lo up
 modprobe virtio_mmio || :
+# The USB stick sits on a PCIe root port as virtio-blk-pci so it can be hot-swapped (virtio-mmio cannot hot-plug).
+modprobe virtio_pci || :
 modprobe virtio_console
 # Name the virtio ports by their QEMU names: with a block device present the serial controller is no longer
 # virtio0, so /dev/vport0p1 (hard-coded in the bridge) must be a link to whichever node is "sp16.ui".
