@@ -22,10 +22,39 @@ import time
 
 MAGIC = b"Qspt1WmJOL"
 PORT_KEEPALIVE, PORT_BEAT, PORT_STATUS = 50000, 50001, 50002
+NAME_LENGTH = 20
+NAME_OFFSET_KEEPALIVE, NAME_OFFSET = 0x0c, 0x0b
 
 
 def name_field(name):
-    return name.encode("ascii")[:20].ljust(20, b"\0")
+    return name.encode("ascii")[:NAME_LENGTH].ljust(NAME_LENGTH, b"\0")
+
+
+def name_offset(payload, port=None):
+    """Where the 20-byte device name starts in a Pro DJ Link payload (the magic is 10 bytes, the type byte 0x0a).
+
+    Port-50000 packets (the 54-byte keep-alive, the join stages and the other 50000 types) carry one reserved zero
+    byte at 0x0b, so their name starts at 0x0c; the port-50001/50002 packets (beat 0x28, status 0x0a) put the name
+    at 0x0b. A payload whose port is not one of the three is placed by shape: a 54-byte type-0x06 keep-alive has the
+    50000 layout, anything else the 0x0b one.
+    """
+    if len(payload) < NAME_OFFSET:
+        raise ValueError(f"a Pro DJ Link payload carries a type byte at {NAME_OFFSET:#04x}, not {len(payload)} bytes")
+    if port == PORT_KEEPALIVE:
+        return NAME_OFFSET_KEEPALIVE
+    if port in (PORT_BEAT, PORT_STATUS):
+        return NAME_OFFSET
+    if len(payload) == 54 and payload[0x0a] == 0x06:
+        return NAME_OFFSET_KEEPALIVE
+    return NAME_OFFSET
+
+
+def packet_name(payload, port=None):
+    """The device name of a Pro DJ Link payload, read at its packet family's offset (see name_offset)."""
+    offset = name_offset(payload, port)
+    if len(payload) < offset + NAME_LENGTH:
+        raise ValueError(f"a {len(payload)}-byte payload has no {NAME_LENGTH}-byte name at {offset:#04x}")
+    return payload[offset:offset + NAME_LENGTH].split(b"\0")[0].decode("ascii", "replace")
 
 
 def keepalive(name, player, mac, ip):

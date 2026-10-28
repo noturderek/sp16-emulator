@@ -19,7 +19,8 @@ class NetEnvironmentTests(unittest.TestCase):
 
     def test_mcast_needs_no_daemon(self):
         self.assertEqual(native.net_environment("mcast"),
-                         {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": "230.0.0.1:34567", "SP16_NET_MODE": "mcast"})
+                         {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": "230.0.0.1:34567", "SP16_NET_MODE": "mcast",
+                          "SP16_PYTHON": sys.executable})
         self.assertEqual(native.net_environment("mcast:40000")["SP16_NET_TARGET"], "230.0.0.1:40000")
 
     def test_refused_modes(self):
@@ -75,17 +76,26 @@ class WrapperTests(unittest.TestCase):
     def test_without_net_the_arguments_are_unchanged(self):
         self.assertEqual(self.run_wrapper(), (0, ["-m", "1"]))
 
-    def test_mcast_adds_a_nic_with_its_own_mac(self):
+    def test_mcast_uses_the_relay_stream_backend(self):
         macs = set()
         for _ in range(3):
-            code, args = self.run_wrapper(SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:1234")
+            code, args = self.run_wrapper(SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:1234",
+                                          SP16_NET_NO_RELAY="1", SP16_NET_SOCKET="/tmp/sp16-test.sock")
             self.assertEqual(code, 0)
             self.assertEqual(args[:3], ["-m", "1", "-netdev"])
-            self.assertEqual(args[3], "socket,id=sp16net,mcast=230.0.0.1:1234")
+            self.assertEqual(args[3], "stream,id=sp16net,server=off,addr.type=unix,addr.path=/tmp/sp16-test.sock")
             device = args[5]
             self.assertTrue(device.startswith("virtio-net-device,netdev=sp16net,mac=52:54:00:"), device)
             macs.add(device.rsplit("=", 1)[1])
         self.assertEqual(len(macs), 3)
+
+    def test_mcast_relay_socket_defaults_under_tmp(self):
+        import re
+        code, args = self.run_wrapper(SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:34567",
+                                      SP16_NET_NO_RELAY="1")
+        self.assertEqual(code, 0)
+        self.assertRegex(args[3], r"^stream,id=sp16net,server=off,addr.type=unix,addr.path="
+                                 r".*sp16r-\d+\.sock$")
 
     def test_unix_uses_the_stream_backend(self):
         _, args = self.run_wrapper(SP16_NET_KIND="unix", SP16_NET_TARGET="/x/socket_vmnet")
@@ -152,6 +162,31 @@ class FakeMasterTests(unittest.TestCase):
         self.assertEqual(packet[0x89] & 0x78, 0x78)
         self.assertEqual(struct.unpack(">H", packet[0x92:0x94])[0], 12800)
         self.assertEqual((struct.unpack(">I", packet[0xa0:0xa4])[0], packet[0xa6]), (7, 2))
+
+    def test_packet_name_reads_each_family_at_its_own_offset(self):
+        mac, ip = bytes.fromhex("020000000007"), bytes([169, 254, 7, 7])
+        self.assertEqual(self.master.packet_name(self.master.keepalive("TORAIZ", 2, mac, ip), 50000), "TORAIZ")
+        self.assertEqual(self.master.packet_name(self.master.beat_packet("CDJ-3000", 1, 128.0, 0.0, 1, 100), 50001),
+                         "CDJ-3000")
+        self.assertEqual(self.master.packet_name(self.master.status_packet("CDJ-3000", 1, 128.0, 0.0, 1, 1), 50002),
+                         "CDJ-3000")
+        # A join-stage hello on 50000 carries the same reserved byte before the name.
+        hello = b"Qspt1WmJOL\x0a\x00" + b"CDJ-3000".ljust(20, b"\0") + b"\x01\x02\x00\x25\x01"
+        self.assertEqual(self.master.packet_name(hello, 50000), "CDJ-3000")
+
+    def test_name_offset_falls_back_to_shape_without_a_known_port(self):
+        keepalive = self.master.keepalive("TORAIZ", 2, bytes(6), bytes(4))
+        beat = self.master.beat_packet("CDJ-3000", 1, 128.0, 0.0, 1, 100)
+        self.assertEqual(self.master.name_offset(keepalive, 50000), 0x0c)
+        self.assertEqual(self.master.name_offset(beat, 50001), 0x0b)
+        self.assertEqual(self.master.name_offset(beat, 50002), 0x0b)
+        self.assertEqual(self.master.name_offset(keepalive), 0x0c)   # 54-byte type 0x06: the 50000 layout
+        self.assertEqual(self.master.name_offset(beat), 0x0b)
+
+    def test_packet_name_refuses_a_payload_too_short_for_the_field(self):
+        for payload in (b"Qspt1WmJOL\x06", b"Qspt1WmJOL\x06\x00" + b"TORAIZ"):
+            with self.assertRaises(ValueError, msg=payload):
+                self.master.packet_name(payload, 50000)
 
 
 if __name__ == "__main__":

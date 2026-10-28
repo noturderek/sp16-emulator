@@ -35,6 +35,7 @@ __pycache__/
 PIONEER DJ SAMPLER/
 
 # Local tooling and interrupted downloads (`firmware download --to` inside the repository leaves *.part files).
+.pi/
 .envrc
 .direnv/
 .venv/
