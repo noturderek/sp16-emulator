@@ -179,10 +179,14 @@ class Session:
         self.call(op="panelshot", name=name)
         return self.dir / name
 
-    def usb(self, action):
+    def usb(self, action, path=None):
         """Virtual USB stick: "eject" (guest flushes and unmounts, then the app sees it removed; replies usb-busy
-        and leaves the stick mounted if something still holds it) or "attach" (remount and announce again)."""
-        return self.call(op="usb", action=action)
+        and leaves the stick mounted if something still holds it) or "attach" (remount and announce again; with a
+        `path`, hot-swap to a different image while QEMU runs)."""
+        command = {"op": "usb", "action": action}
+        if path is not None:
+            command["path"] = path
+        return self.call(**command)
 
     def pressure(self, pad, raw):
         """Hold a pad's raw pressure word (0..1023) until it is set to 0: the AD value the factory test's pad
@@ -314,7 +318,8 @@ def run_command(session, command, a):
     elif command == "panelshot":
         result = {"path": str(session.panelshot(a[0]))}
     elif command == "usb":
-        result = session.usb(a[0] if a else "eject")
+        action = a[0] if a else "eject"
+        result = session.usb(action, a[1] if len(a) > 1 else None)
     elif command == "adc":
         result = session.adc()
     elif command == "pressure":

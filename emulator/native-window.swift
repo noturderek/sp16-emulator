@@ -49,6 +49,8 @@ var uiInputDisabled = false
 /// `--no-audio-files`: an audio build's sink still reads every PCM packet from the guest and keeps its counters (the
 /// guest's audio path and timing stay those of a file build) but opens no WAV. For unattended runs that read no audio.
 var audioFilesDisabled = false
+/// True when this launch attached a virtual USB stick (`--usb-image`): the QMP socket and the hot-plug path exist.
+var usbImageAttached = false
 
 /// Host <-> guest message kinds; see protocol.py for the authoritative description.
 enum Kind {
@@ -60,6 +62,102 @@ enum Kind {
 /// Host power state machine (QRT1001 p15): BOOT (boot overlay) → RUN at the first LCD frame, OFF (dark panel, WAKE UP
 /// lit) when the firmware's standby flag (TX byte 0x67 bit 0) latches, and back to BOOT when it clears.
 enum PowerState { case boot, run, off, fault }
+
+/// Minimal synchronous QMP (QEMU Machine Protocol) client over a unix socket, used only to hot-swap the virtual USB
+/// stick's backing image while QEMU runs. One connection per swap; QMP messages are newline-delimited JSON, and a
+/// command's reply is the first `return` or `error` object (events are skipped).
+enum QMP {
+    static func connect(_ socketPath: String) throws -> Int32 {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw DataImageError.io("cannot open the QMP socket") }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(socketPath.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
+            close(fd); throw DataImageError.io("QMP socket path too long")
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { raw in for (i, b) in bytes.enumerated() { raw[i] = b } }
+        let rc = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        guard rc == 0 else { close(fd); throw DataImageError.io("cannot connect to the QMP socket (errno \(errno))") }
+        return fd
+    }
+
+    /// One newline-delimited JSON message, or nil on EOF.
+    static func readLine(_ fd: Int32) -> String? {
+        var buffer = Data()
+        var byte = [UInt8](repeating: 0, count: 1)
+        while buffer.count < 1 << 20 {
+            let n = read(fd, &byte, 1)
+            if n <= 0 { return nil }
+            if byte[0] == 10 { return String(decoding: buffer, as: UTF8.self) }
+            buffer.append(byte[0])
+        }
+        return nil
+    }
+
+    static func object(_ line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj
+    }
+
+    /// Send one command and return its `return`/`error` reply; throws on a QMP error.
+    @discardableResult
+    static func command(_ fd: Int32, _ execute: String, _ arguments: [String: Any]) throws -> [String: Any] {
+        var payload: [String: Any] = ["execute": execute]
+        if !arguments.isEmpty { payload["arguments"] = arguments }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            throw DataImageError.io("cannot encode QMP command \(execute)")
+        }
+        var line = data; line.append(10)
+        let written = line.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
+        guard written == line.count else { throw DataImageError.io("QMP write failed for \(execute)") }
+        while true {
+            guard let text = readLine(fd) else { throw DataImageError.io("QMP closed during \(execute)") }
+            guard let obj = object(text) else { continue }
+            if let error = obj["error"] as? [String: Any] {
+                let desc = (error["desc"] as? String) ?? "unknown error"
+                throw DataImageError.io("\(execute): \(desc)")
+            }
+            if obj["return"] != nil { return obj }
+        }
+    }
+
+    /// Wait for the `DEVICE_DELETED` event for `id` (a `device_del` only frees its block nodes once the guest acks).
+    static func waitDeviceDeleted(_ fd: Int32, id: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let remaining = Int32(max(1, deadline.timeIntervalSinceNow * 1000))
+            guard poll(&poller, 1, remaining) > 0 else { return false }
+            guard let text = readLine(fd), let obj = object(text) else { continue }
+            if obj["event"] as? String == "DEVICE_DELETED",
+               let data = obj["data"] as? [String: Any], data["device"] as? String == id { return true }
+        }
+        return false
+    }
+
+    /// Swap the virtual USB stick's backing image for `imagePath` in one QMP session: unplug the device (waiting for
+    /// the guest's acknowledgement), drop the old block nodes, add the new file and format nodes, plug the new device.
+    static func swapUSB(socketPath: String, imagePath: String) throws {
+        let fd = try connect(socketPath)
+        defer { close(fd) }
+        _ = readLine(fd)                       // the QMP greeting
+        try command(fd, "qmp_capabilities", [:])
+        try command(fd, "device_del", ["id": "sp16usb-dev"])
+        guard waitDeviceDeleted(fd, id: "sp16usb-dev", timeout: 10) else {
+            throw DataImageError.io("the USB device did not unplug in time")
+        }
+        try command(fd, "blockdev-del", ["node-name": "sp16usb"])
+        try command(fd, "blockdev-del", ["node-name": "sp16usb-file"])
+        try command(fd, "blockdev-add", ["driver": "file", "filename": imagePath, "node-name": "sp16usb-file"])
+        try command(fd, "blockdev-add", ["driver": "raw", "file": "sp16usb-file", "node-name": "sp16usb"])
+        try command(fd, "device_add", ["driver": "virtio-blk-pci", "drive": "sp16usb", "serial": "sp16usb",
+                                       "id": "sp16usb-dev", "bus": "sp16usb-port"])
+    }
+}
 
 /// Fixed-size sample window for latency percentiles.
 struct Samples {
@@ -306,6 +404,15 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             outputMenu.addItem(item)
         }
         outputItem.submenu = outputMenu
+        let usbItem = NSMenuItem(); menu.addItem(usbItem)
+        let usbMenu = NSMenu(title: "USB")
+        let attachImage = NSMenuItem(title: "Attach USB Image…", action: #selector(attachUSBImageChosen(_:)), keyEquivalent: "")
+        attachImage.target = self
+        usbMenu.addItem(attachImage)
+        let eject = NSMenuItem(title: "Eject USB Stick", action: #selector(ejectUSBChosen(_:)), keyEquivalent: "")
+        eject.target = self
+        usbMenu.addItem(eject)
+        usbItem.submenu = usbMenu
         let inputItem = NSMenuItem(); menu.addItem(inputItem)
         let inputMenu = NSMenu(title: "Input")
         let release = NSMenuItem(title: "Release All Holds", action: #selector(releaseAllHolds), keyEquivalent: ".")
@@ -324,6 +431,52 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard let name = sender.representedObject as? String, let jack = AudioSink.OutputJack(rawValue: name) else { return }
         audioSink?.monitor = jack
         AppLog.log("output monitor: \(jack.rawValue)")
+    }
+
+    // MARK: USB stick
+
+    /// Pick a raw image and hot-attach it while QEMU runs (the QMP path swaps the virtio-blk backing).
+    @objc func attachUSBImageChosen(_ sender: NSMenuItem) {
+        let chooser = NSOpenPanel()
+        chooser.message = "Choose a raw USB stick image to hot-attach"
+        chooser.canChooseFiles = true
+        chooser.canChooseDirectories = false
+        chooser.allowsMultipleSelection = false
+        guard chooser.runModal() == .OK, let url = chooser.url else { return }
+        let path = url.path
+        panel.setStatus("Attaching \(path)…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let reply = self.hotAttachUSB(path: path)
+            DispatchQueue.main.async { self.noteUSBReply(reply) }
+        }
+    }
+
+    @objc func ejectUSBChosen(_ sender: NSMenuItem) {
+        guard config.data != nil, usbImageAttached else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let result = DataImage.requestControl(socketPath: self.config.socket + ".ctl", message: "usb-eject",
+                                                  until: ["usb-ejected", "usb-busy"], timeout: 30)
+            let reply = result == "usb-ejected"
+                ? "{\"ok\":true,\"result\":\"usb-ejected\"}"
+                : "{\"error\":\"usb-eject: " + (result ?? "no reply") + "\"}"
+            DispatchQueue.main.async { self.noteUSBReply(reply) }
+        }
+    }
+
+    /// Show a hot-attach/eject reply: the status line on success, an alert on failure. Main thread only.
+    func noteUSBReply(_ reply: String) {
+        guard let data = reply.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let error = obj["error"] as? String {
+            let alert = NSAlert()
+            alert.messageText = "USB"
+            alert.informativeText = error
+            alert.runModal()
+        } else if let result = obj["result"] as? String {
+            panel.setStatus("USB: \(result)")
+        }
     }
 
     // MARK: Power on with keys held
@@ -440,6 +593,8 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         case #selector(monitorChosen(_:)):
             item.state = (audioSink?.monitor.rawValue == item.representedObject as? String) ? .on : .off
             return audioSink != nil
+        case #selector(attachUSBImageChosen(_:)), #selector(ejectUSBChosen(_:)):
+            return config.data != nil && usbImageAttached
         default: break
         }
         return true
@@ -632,6 +787,35 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             powerState = screenSeen ? .run : .boot
             AppLog.log("panel: fault cleared")
         }
+    }
+
+    /// Hot-attach a different virtual USB stick image while QEMU runs: eject the current stick, swap the virtio-blk
+    /// backing via QMP, then ask the guest to mount and announce the new one. Runs on any thread; returns a JSON reply.
+    func hotAttachUSB(path: String) -> String {
+        guard usbImageAttached else {
+            return "{\"error\":\"this session has no virtual USB stick (launch with --usb-image)\"}"
+        }
+        do { try DataImage.validateUSBImage(path) }
+        catch { return "{\"error\":\"\(error)\"}" }
+        // Eject first so the guest unmounts and announces the removal (a raw device_del would leave a stale mount).
+        if let result = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-eject",
+                                                 until: ["usb-ejected", "usb-busy"], timeout: 30) {
+            if result == "usb-busy" { return "{\"error\":\"usb stick is busy; eject it first\"}" }
+        }
+        do { try QMP.swapUSB(socketPath: config.socket + ".qmp", imagePath: path) }
+        catch {
+            AppLog.log("usb hot attach: QMP swap failed: \(error)")
+            return "{\"error\":\"QMP swap failed: \(error)\"}"
+        }
+        guard let result = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-attach",
+                                                    until: ["usb-attached", "usb-error"], timeout: 30) else {
+            return "{\"error\":\"usb attach got no reply from the guest\"}"
+        }
+        if result == "usb-attached" {
+            AppLog.log("usb hot attach: \(path) attached")
+            return "{\"ok\":true,\"result\":\"usb-attached\"}"
+        }
+        return "{\"error\":\"the guest could not mount \(path) (unsupported media?)\"}"
     }
 
     func writeTxLog(_ frame: Data) {
@@ -946,9 +1130,13 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             guard let name = command["name"] as? String, snapshot(named: name) else { return "{\"error\":\"snapshot failed\"}" }
             return "{\"ok\":true}"
         case "usb":
-            // Virtual USB stick: "eject" (flush, unmount, announce removal) or "attach" (remount and announce again).
+            // Virtual USB stick: "eject" (flush, unmount, announce removal), "attach" (remount and announce again), or
+            // "attach" with a path (hot-swap to a different image while QEMU runs).
             guard config.data != nil, let action = command["action"] as? String, ["eject", "attach"].contains(action) else {
                 return "{\"error\":\"usb needs action eject|attach and a persistent build\"}"
+            }
+            if action == "attach", let path = command["path"] as? String {
+                return hotAttachUSB(path: path)
             }
             let tokens = action == "eject" ? ["usb-ejected", "usb-busy"] : ["usb-attached", "usb-error"]
             guard let result = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-" + action,
@@ -1115,9 +1303,15 @@ func attachData(_ config: Configuration, ephemeral: Bool, usbImage: String? = ni
         var extra: [String] = []
         if let usb = usbImage {
             try DataImage.validateUSBImage(usb)
-            // Virtual USB stick: a second virtio disk told apart by its serial; the guest formats it only if blank.
-            extra = ["-drive", "file=\(usb),format=raw,if=none,id=sp16usb",
-                     "-device", "virtio-blk-device,drive=sp16usb,serial=sp16usb"]
+            usbImageAttached = true
+            // Virtual USB stick, on a PCIe root port so its backing image can be hot-swapped while QEMU runs
+            // (virtio-mmio does not hot-plug). The guest recognises it by serial `sp16usb`; QMP over the session
+            // socket drives the swap (`ctl usb attach PATH`).
+            extra = ["-device", "pcie-root-port,id=sp16usb-port,chassis=1",
+                     "-blockdev", "driver=file,filename=\(usb),node-name=sp16usb-file",
+                     "-blockdev", "driver=raw,file=sp16usb-file,node-name=sp16usb",
+                     "-device", "virtio-blk-pci,drive=sp16usb,serial=sp16usb,id=sp16usb-dev,bus=sp16usb-port",
+                     "-qmp", "unix:\(config.socket).qmp,server=on,wait=off"]
         }
         return Configuration(qemu: config.qemu, arguments: config.arguments.map { $0.replacingOccurrences(of: "@DATA@", with: image) } + extra,
                              session: config.session, socket: config.socket, variant: config.variant,

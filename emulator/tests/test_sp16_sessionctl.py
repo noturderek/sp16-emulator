@@ -295,6 +295,18 @@ class SessionctlTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("monitor needs MAIN", result.stderr)
 
+    def test_usb_attach_with_a_path_passes_the_path(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        self.assertEqual(session.usb("attach", "/tmp/stick.img"), {"ok": True})
+        self.assertEqual(app.received, [{"op": "usb", "action": "attach", "path": "/tmp/stick.img"}])
+
+    def test_usb_without_a_path_omits_the_path_field(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        self.assertEqual(session.usb("eject"), {"ok": True})
+        self.assertEqual(app.received, [{"op": "usb", "action": "eject"}])
+
 
 if __name__ == "__main__":
     unittest.main()
