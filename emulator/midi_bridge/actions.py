@@ -48,6 +48,7 @@ class Translator:
         self.index = prof.Index(profile)
         self.analog = dict(analog_start or {})          # last value sent per analog control
         self.last = {}                                  # last absolute value per input (for detents)
+        self.carry = {}                                 # input name -> scaled detents not yet sent (absolute -> detent)
         self.held = {}                                  # input name -> control currently pressed
         self.timers = []                                # (due, control, action, value)
         self.strip_until = None
@@ -81,6 +82,9 @@ class Translator:
         for control in list(self.held.values()):
             self.event(control, "release", 0)
         self.held.clear()
+        pending, self.timers = self.timers, []              # a tap still waiting for its release: send it now
+        for _, name, action, value in pending:
+            self.event(name, action, value)
         if self.strip_until is not None:
             self.strip_until = None
             self.event("strip", "release", 0)
@@ -156,7 +160,12 @@ class Translator:
             self.last[name] = message.value
             if last is not None and message.value != last:
                 diff = message.value - last
-                self.event(action.rstrip("+-"), "delta", max(-MAX_DELTA, min(MAX_DELTA, -diff if entry.get("invert") else diff)))
+                # scale applies as it does to the other kinds; the part of a detent a small move leaves over is carried
+                total = self.carry.get(name, 0.0) + (-diff if entry.get("invert") else diff) * entry.get("scale", 1.0)
+                detents = int(total)
+                self.carry[name] = total - detents
+                if detents:
+                    self.event(action.rstrip("+-"), "delta", max(-MAX_DELTA, min(MAX_DELTA, detents)))
         elif kind == "strip":
             centred = spec["type"] == "pitchbend" and abs(message.value - 8192) <= 64
             if centred:

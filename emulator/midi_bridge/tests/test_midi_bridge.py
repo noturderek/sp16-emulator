@@ -222,6 +222,28 @@ class TranslatorTests(unittest.TestCase):
         self.t.release_all()
         self.assertEqual(self.target.calls[-1], ("pad1", "release", 0))
 
+    def test_release_all_sends_a_transport_tap_still_waiting(self):
+        self.t.handle([M("start", None, 0, 0)])
+        self.t.release_all()                                              # well inside the 60 ms tap
+        self.assertEqual(self.target.calls, [("play", "press", 100), ("play", "release", 0)])
+        self.clock.now = 1.0
+        self.t.tick()
+        self.assertEqual(len(self.target.calls), 2)                       # the timer is gone: no second release
+
+    def test_absolute_to_detents_applies_scale(self):
+        t = Translator(self.target, pad_profile(), pad_mapping(cut={"action": "knob2", "scale": 0.5}))
+        t.handle([M("cc", 0, 74, 60)])                                    # baseline
+        t.handle([M("cc", 0, 74, 64)])                                    # +4 -> 2 detents
+        t.handle([M("cc", 0, 74, 65)])                                    # +1 -> half a detent, carried
+        t.handle([M("cc", 0, 74, 66)])                                    # +1 -> the carried half completes one
+        self.assertEqual(self.target.calls, [("knob2", "delta", 2), ("knob2", "delta", 1)])
+
+    def test_absolute_to_detents_scale_and_invert(self):
+        t = Translator(self.target, pad_profile(), pad_mapping(cut={"action": "knob2", "scale": 2, "invert": True}))
+        t.handle([M("cc", 0, 74, 60)])
+        t.handle([M("cc", 0, 74, 63)])
+        self.assertEqual(self.target.calls, [("knob2", "delta", -6)])
+
     def test_failed_call_is_counted_not_raised(self):
         class Broken:
             def event(self, *args):
