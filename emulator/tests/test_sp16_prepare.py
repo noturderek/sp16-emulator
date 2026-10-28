@@ -36,7 +36,12 @@ class PrivatePathTests(unittest.TestCase):
         return path
 
     def test_this_checkouts_own_workspace_is_accepted(self):
-        self.assertEqual(prepare.private_path(prepare.REPO / "build"), prepare.REPO / "build")
+        """The checkout's own build/ is accepted, whatever its current mode: the test sets up the owner-only
+        precondition itself (another test under umask 022 can have created build/ as 0755)."""
+        build = prepare.REPO / "build"
+        build.mkdir(exist_ok=True)
+        os.chmod(build, 0o700)
+        self.assertEqual(prepare.private_path(build), build)
 
     def test_a_sibling_worktrees_library_and_qemu_are_accepted(self):
         """The reported bug: a build in ../sp16-emulator-worktrees/<lane> could not reuse the main checkout's

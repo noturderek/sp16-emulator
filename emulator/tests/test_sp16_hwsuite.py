@@ -26,10 +26,10 @@ def all_pass(ids=None):
 
 class CheckTableTests(unittest.TestCase):
     def test_table_matches_the_spec(self):
-        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 54)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 55)])
         self.assertEqual(list(hwsuite.SMOKE_IDS), SPEC_SMOKE)
         self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "L"], ["HW-44"])
-        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 54)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 55)])
 
     def test_tiers_and_only(self):
         self.assertEqual(hwsuite.select_checks("smoke"), SPEC_SMOKE)
@@ -39,7 +39,7 @@ class CheckTableTests(unittest.TestCase):
         self.assertEqual(hwsuite.select_checks("smoke", ["HW-02", "HW-05"]), ["HW-05"])
         # Extras stay out of full and core, and run by tier or by name.
         self.assertNotIn("HW-47", hwsuite.select_checks("full"))
-        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 54)])
+        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 55)])
         self.assertEqual(hwsuite.select_checks("full", ["HW-47", "HW-05"]), ["HW-05", "HW-47"])
         with self.assertRaises(ValueError):
             hwsuite.select_checks("full", ["HW-99"])
@@ -521,6 +521,58 @@ class TestmodePageTests(unittest.TestCase):
         result, _ = self.run_hw53(self.GOOD_WALKS, start={pad: 242 if pad != 7 else 300 for pad in range(1, 17)})
         self.assertEqual(result["status"], "FAIL")
         self.assertIn("synthetic default", result["reason"])
+
+    def hw54_runner(self, tmp):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        runner = hwsuite.Runner(json.loads(profile_path.read_text()), profile_path, tmp, None, tmp, tmp, "extra",
+                                ["HW-54"], testmode_build=tmp)
+        runner.session = FakeSession()
+        return runner
+
+    def test_hw54_passes_when_the_loopback_reads_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw54_runner(tmp)
+            with mock.patch.object(hwsuite.Runner, "testmode_page_is", return_value=hwsuite.sub("stepped to page 8", True)), \
+                    mock.patch.object(hwsuite, "wait_settled"), \
+                    mock.patch.object(hwsuite, "wait_midi_check", return_value=(True, "MIDI CHECK : OK")), \
+                    mock.patch.object(hwsuite.Runner, "shots_into"):
+                result = runner.hw54()
+        self.assertEqual((result["status"], len(result["subresults"])), ("PASS", 2))
+        self.assertEqual(runner.session.calls, [("tap", 115, 112)])
+
+    def test_hw54_fails_when_the_page_never_reads_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw54_runner(tmp)
+            with mock.patch.object(hwsuite.Runner, "testmode_page_is", return_value=hwsuite.sub("stepped to page 8", True)), \
+                    mock.patch.object(hwsuite, "wait_settled"), \
+                    mock.patch.object(hwsuite, "wait_midi_check", return_value=(False, "MIDI CHECK : ---")), \
+                    mock.patch.object(hwsuite.Runner, "shots_into"):
+                result = runner.hw54()
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("MIDI CHECK OK", result["reason"])
+        self.assertIn("MIDI CHECK : ---", result["reason"])
+
+    def test_hw54_fails_when_page_8_never_shows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw54_runner(tmp)
+            with mock.patch.object(hwsuite.Runner, "testmode_page_is", return_value=hwsuite.sub("stepped to page 8", False, "the page never showed")):
+                result = runner.hw54()
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(runner.session.calls, [])
+
+    def test_wait_midi_check_reads_ok_and_reports_the_last_text_on_timeout(self):
+        session = FakeSession()
+        with mock.patch.object(hwsuite, "ocr", side_effect=["MIDI CHECK : ---", "MIDI CHECK : OK"]), \
+                mock.patch.object(hwsuite.time, "sleep"):
+            ok, text = hwsuite.wait_midi_check(session, timeout=30)
+        self.assertTrue(ok)
+        self.assertIn("OK", text)
+        with mock.patch.object(hwsuite, "ocr", return_value="MIDI CHECK : ---"), \
+                mock.patch.object(hwsuite.time, "sleep"), \
+                mock.patch.object(hwsuite.time, "monotonic", side_effect=[0.0, 0.0, 31.0]):
+            ok, text = hwsuite.wait_midi_check(session, timeout=30)
+        self.assertFalse(ok)
+        self.assertIn("---", text)
 
     def test_the_page_4_status_cell_names_the_control_it_counted(self):
         """The status cell prints the control the page counted (`PAD 1 : 3`); the reader must name that control and no

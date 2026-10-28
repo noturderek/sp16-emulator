@@ -93,6 +93,7 @@ def decode_rx(frame, check_crc=True):
     touch strip is not in this frame: it has its own CDC channel and its own decoder, decode_strip().
 
     A wrong length, header or CRC-16 means the frame is not an RX frame, never a frame with unknown content.
+    A frame whose pot words are outside 0..1023 is likewise not one (it would carry an unencodable analog level).
     Counters stay unsigned 16-bit, the way the model wraps them; signed_detents() reads a delta out of one.
     """
     if len(frame) != panel_map.FRAME_BYTES or frame[0] != RX_HEADER:
@@ -105,6 +106,8 @@ def decode_rx(frame, check_crc=True):
     pads = [{"pressure": word(panel_map.PAD_A_OFFSET + 2 * index),
              "contact": word(panel_map.PAD_B_OFFSET + 2 * index)} for index in range(16)]
     analog_words = {name: word(offset) for name, (offset, _) in panel_map.ANALOG_WORDS.items()}
+    if any(raw > panel_map.ANALOG_FULL_SCALE for raw in analog_words.values()):
+        return None
     analog = {name: analog_level(analog_words[name], inverted)
               for name, (_, inverted) in panel_map.ANALOG_WORDS.items()}
     return {"buttons": buttons, "counters": counters, "pads": pads, "analog_words": analog_words, "analog": analog}
@@ -181,8 +184,13 @@ class PanelModel:
     # cadence for two windows after any input change so the last window closes quickly.
     SELECTOR_WINDOW_FRAMES = panel_map.SELECTOR_WINDOW_FRAMES
     HOT_FRAMES = 16
+    # LCD touch (RX words 0x2c/0x2e): hold an idle->point jump for this many frames before a move applies, and never
+    # move the raw point more than TOUCH_STEP_MAX ADC units between consecutive frames (a teleport breaks the
+    # firmware's stable history and reads as a release).
+    TOUCH_HOLD_FRAMES = panel_map.LCD_TOUCH_HOLD_FRAMES
+    TOUCH_STEP_MAX = panel_map.LCD_TOUCH_STEP_MAX
 
-    def __init__(self, bits=None, counters=None, pad_curve=panel_map.PAD_CURVE):
+    def __init__(self, bits=None, counters=None, pad_curve=panel_map.PAD_CURVE, touch_calibration=None):
         self.lock = threading.Lock()
         self.bits = dict(panel_map.BUTTON_BITS if bits is None else bits)
         self.counters = dict(panel_map.COUNTERS if counters is None else counters)
@@ -205,6 +213,13 @@ class PanelModel:
         # Host-side analog state for the shim's board model; an absent name was never moved (neutral).
         self.host_analog = {}
         self.analog_changed = False
+        # LCD touch: the raw point currently in the frame, whether a finger is down, how many frames remain in the
+        # initial hold, and the pending bounded-step drag target (raw coordinates; (0, 0) is the out-of-bounds idle).
+        self.touch_calibration = touch_calibration if touch_calibration is not None else panel_map.LCD_TOUCH_CALIBRATION
+        self.touch_raw = (0, 0)
+        self.touch_contact = False
+        self.touch_hold = 0
+        self.touch_target = None
 
     def _set_bit(self, bit, on):
         byte, mask = bit[0], 1 << bit[1]
@@ -324,6 +339,75 @@ class PanelModel:
         self.cdc_changed = True
         return INPUT_OK
 
+    def _set_touch_words(self, raw_x, raw_y):
+        struct.pack_into(">H", self.raw, panel_map.LCD_TOUCH_X_OFFSET, raw_x & 0xffff)
+        struct.pack_into(">H", self.raw, panel_map.LCD_TOUCH_Y_OFFSET, raw_y & 0xffff)
+
+    def lcd_touch(self, screen_x, screen_y, action):
+        """Host LCD touch in 800x480 screen coordinates (action "down"/"move"/"up") -> RX touch words.
+
+        Screen coordinates are converted with the loaded calibration and the model keeps the firmware's contact
+        debounce contract: an idle->point jump is held for at least TOUCH_HOLD_FRAMES frames, a drag moves at most
+        TOUCH_STEP_MAX raw units per frame, and a release writes (0, 0), which is outside the contact rectangle
+        under every calibration. The ribbon strip is the separate CDC path.
+        """
+        if action not in ("down", "move", "up"):
+            return INPUT_INVALID
+        width, height = self.touch_calibration["screen"]
+        if not (0 <= screen_x < width and 0 <= screen_y < height):
+            return INPUT_INVALID
+        if action == "up":
+            return self._lcd_touch_raw(0, 0, False)
+        raw_x, raw_y = panel_map.screen_to_touch_raw(screen_x, screen_y, self.touch_calibration)
+        return self._lcd_touch_raw(raw_x, raw_y, True)
+
+    def lcd_touch_raw(self, raw_x, raw_y, contact):
+        """Raw-coordinate injection (0..1023): set the RX touch words directly, bypassing calibration, for research."""
+        if not (0 <= raw_x <= panel_map.ANALOG_FULL_SCALE and 0 <= raw_y <= panel_map.ANALOG_FULL_SCALE):
+            return INPUT_INVALID
+        return self._lcd_touch_raw(int(raw_x), int(raw_y), bool(contact))
+
+    def _lcd_touch_raw(self, raw_x, raw_y, contact):
+        with self.lock:
+            if not contact:
+                self.touch_contact = False
+                self.touch_hold = 0
+                self.touch_target = None
+                self.touch_raw = (0, 0)
+                self._set_touch_words(0, 0)
+                self.changed = True
+                return INPUT_OK
+            if not self.touch_contact:
+                # Idle -> point: show this exact point for at least TOUCH_HOLD_FRAMES frames before any move applies.
+                self.touch_contact = True
+                self.touch_hold = self.TOUCH_HOLD_FRAMES
+                self.touch_target = None
+                self.touch_raw = (raw_x, raw_y)
+                self._set_touch_words(raw_x, raw_y)
+                self.changed = True
+                return INPUT_OK
+            # Already down: a move queues a bounded-step drag toward the new point.
+            self.touch_target = (raw_x, raw_y)
+            self.changed = True
+            return INPUT_OK
+
+    def _step_touch(self):
+        """Advance the touch point by at most one bounded step, after the initial hold has elapsed."""
+        if self.touch_hold > 0:
+            self.touch_hold -= 1
+            return
+        if self.touch_target is None:
+            return
+        target_x, target_y = self.touch_target
+        cur_x, cur_y = self.touch_raw
+        cur_x += max(-self.TOUCH_STEP_MAX, min(self.TOUCH_STEP_MAX, target_x - cur_x))
+        cur_y += max(-self.TOUCH_STEP_MAX, min(self.TOUCH_STEP_MAX, target_y - cur_y))
+        self.touch_raw = (cur_x, cur_y)
+        self._set_touch_words(cur_x, cur_y)
+        self.changed = True
+        if self.touch_raw == self.touch_target:
+            self.touch_target = None
+
     def cdc_bytes(self):
         """E5: b0 = 0x7f - position, byte 1 bit 7 = contact. With no contact the position is
         centred (E10: PITCH mode lights no segment away from centre), not the all-zero value
@@ -366,12 +450,13 @@ class PanelModel:
             # Anything held (buttons, step keys, pads, the touch strip) keeps the fast
             # cadence for as long as it is held, not only for HOT_FRAMES after the last change.
             return bool(self.pending or self.edges or any(self.held.values()) or self.cdc_contact
-                        or self.overrides or self.hot > 0)
+                        or self.touch_contact or self.overrides or self.hot > 0)
 
     def step(self):
         """Advance queued detents by one count each; True when a new frame is due."""
         with self.lock:
             self._drain_edges()
+            self._step_touch()
             if self.cooldown:
                 self.cooldown -= 1
             for offset, remaining in list(self.pending.items()):
@@ -419,6 +504,8 @@ class PanelModel:
         hex and the pads whose pressure word is non-zero."""
         frame = self.frame()
         state = decode_rx(frame)
+        if state is None:  # a research raw pin can make the frame not an RX frame (e.g. an out-of-range pot word)
+            return {"buttons": frame[1:6].hex(), "pads": []}
         return {"buttons": frame[1:6].hex(),
                 "pads": [index + 1 for index, pad in enumerate(state["pads"]) if pad["pressure"]]}
 
@@ -437,6 +524,11 @@ class PanelModel:
             self.overrides.clear()
             self.cdc_override = None
             self.cdc_contact, self.cdc_changed, self.changed = False, True, True
+            self.touch_contact = False
+            self.touch_hold = 0
+            self.touch_target = None
+            self.touch_raw = (0, 0)
+            self._set_touch_words(0, 0)
 
 
 class StartOff:

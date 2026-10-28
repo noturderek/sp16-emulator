@@ -291,6 +291,110 @@ class PanelModelTests(unittest.TestCase):
         self.assertEqual(model.apply(strip, "press", 1001), protocol.INPUT_INVALID)
 
 
+class LcdTouchTests(unittest.TestCase):
+    """LCD touch reaches the firmware as RX words 0x2c/0x2e, with the firmware's contact debounce contract."""
+
+    def word(self, frame, offset):
+        return struct.unpack_from(">H", frame, offset)[0]
+
+    def test_screen_to_raw_matches_the_documented_centre(self):
+        self.assertEqual(panel_map.screen_to_touch_raw(400, 240), (506, 493))
+
+    def test_down_writes_big_endian_words_and_preserves_frame_and_crc(self):
+        model = panel.PanelModel()
+        before = model.frame()
+        self.assertEqual(model.lcd_touch(400, 240, "down"), protocol.INPUT_OK)
+        frame = model.frame()
+        self.assertEqual((self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                          self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET)), (506, 493))
+        self.assertEqual(frame[0], 1)
+        self.assertEqual(frame[1:6], before[1:6])              # buttons and held state untouched
+        self.assertEqual(struct.unpack_from("<H", frame, 124)[0], panel.crc16(frame[:124]))
+        self.assertNotEqual(frame, before)
+
+    def test_a_down_is_held_for_at_least_five_frames(self):
+        model = panel.PanelModel()
+        model.lcd_touch(400, 240, "down")
+        words = []
+        for _ in range(6):
+            model.step()
+            frame = model.frame()
+            words.append((self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                          self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET)))
+        self.assertEqual(words, [(506, 493)] * 6)
+
+    def test_a_drag_moves_at_most_32_raw_units_per_frame(self):
+        model = panel.PanelModel()
+        model.lcd_touch(400, 240, "down")
+        model.lcd_touch(700, 400, "move")      # a far jump: bounded into 32-unit steps
+        previous = (506, 493)
+        reached = False
+        for _ in range(40):
+            model.step()
+            frame = model.frame()
+            point = (self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                     self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET))
+            self.assertLessEqual(abs(point[0] - previous[0]), panel_map.LCD_TOUCH_STEP_MAX)
+            self.assertLessEqual(abs(point[1] - previous[1]), panel_map.LCD_TOUCH_STEP_MAX)
+            previous = point
+            if point == (144, 801):
+                reached = True
+                break
+        self.assertTrue(reached)
+
+    def test_release_writes_out_of_bounds_zero(self):
+        model = panel.PanelModel()
+        model.lcd_touch(400, 240, "down")
+        model.lcd_touch(400, 240, "up")
+        frame = model.frame()
+        self.assertEqual((self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                          self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET)), (0, 0))
+        self.assertFalse(model.touch_contact)
+
+    def test_a_non_default_calibration_changes_the_mapping(self):
+        calibration = dict(panel_map.LCD_TOUCH_CALIBRATION)
+        calibration["raw_x"], calibration["raw_y"] = (1023, 0), (0, 1023)
+        model = panel.PanelModel(touch_calibration=calibration)
+        model.lcd_touch(400, 240, "down")
+        frame = model.frame()
+        raw = (self.word(frame, panel_map.LCD_TOUCH_X_OFFSET), self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET))
+        self.assertEqual(raw, (512, 533))
+        self.assertNotEqual(raw, panel_map.screen_to_touch_raw(400, 240))
+
+    def test_raw_injection_bypasses_calibration_and_is_range_checked(self):
+        model = panel.PanelModel()
+        self.assertEqual(model.lcd_touch_raw(500, 400, True), protocol.INPUT_OK)
+        frame = model.frame()
+        self.assertEqual((self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                          self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET)), (500, 400))
+        for bad in ((1024, 0), (0, 1024), (-1, 0), (0, -1)):
+            with self.subTest(bad=bad):
+                self.assertEqual(model.lcd_touch_raw(*bad, True), protocol.INPUT_INVALID)
+
+    def test_invalid_actions_and_coordinates_are_rejected(self):
+        model = panel.PanelModel()
+        for x, y, action in ((400, 240, "click"), (800, 240, "down"), (400, 480, "down"), (-1, 0, "down")):
+            with self.subTest(x=x, y=y, action=action):
+                self.assertEqual(model.lcd_touch(x, y, action), protocol.INPUT_INVALID)
+
+    def test_touch_keeps_the_fast_cadence_while_held_and_release_all_clears_it(self):
+        model = panel.PanelModel()
+        model.lcd_touch(400, 240, "down")
+        for _ in range(4 * panel.PanelModel.HOT_FRAMES):
+            model.step()
+        self.assertTrue(model.active())
+        model.release_all()
+        frame = model.frame()
+        self.assertEqual((self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                          self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET)), (0, 0))
+        self.assertFalse(model.touch_contact)
+
+    def test_bridge_routes_touch_through_the_panel_model(self):
+        source = (TOOLS / "guest-bridge.py").read_text()
+        self.assertIn("model.lcd_touch(x, y, action)", source)
+        self.assertNotIn("controls.touch(x, y, action)", source)
+
+
 class StartOffTests(unittest.TestCase):
     def test_start_off_controls_are_buttons_with_a_lamp(self):
         for name in panel_map.START_OFF:
@@ -881,6 +985,55 @@ class BenchModeInputGateTests(unittest.TestCase):
         self.assertIn('uiInputDisabled = arguments.contains("--no-ui-input")', source)
         self.assertIn("panel.uiInputEnabled = !uiInputDisabled", source)
         self.assertIn("if !uiInputDisabled { NSApp.activate(ignoringOtherApps: true) }", source)
+
+
+# Exercises the two independent dark-panel overlays (standby via setPanelDark, fault via setFault) in every order and
+# reads back the combined flags, so a fault during standby and standby during a fault each survive the other.
+OVERLAY_HARNESS = r"""import AppKit
+
+let panel = PanelView(layoutURL: URL(fileURLWithPath: CommandLine.arguments[1]))
+func flags() -> String { "\(panel.overlayFlags.standby ? 1 : 0)\(panel.overlayFlags.fault ? 1 : 0)" }
+var results: [String: String] = [:]
+func run(_ name: String, _ body: () -> Void) {
+    panel.setPanelDark(false)
+    panel.setFault(false)
+    body()
+    results[name] = flags()
+}
+run("standby_then_fault") { panel.setPanelDark(true); panel.setFault(true) }
+run("fault_then_standby") { panel.setFault(true); panel.setPanelDark(true) }
+run("fault_only") { panel.setFault(true) }
+run("standby_only") { panel.setPanelDark(true) }
+run("fault_clear_keeps_standby") { panel.setPanelDark(true); panel.setFault(true); panel.setFault(false) }
+run("standby_clear_keeps_fault") { panel.setFault(true); panel.setPanelDark(true); panel.setPanelDark(false) }
+run("both_clear") { panel.setFault(true); panel.setPanelDark(true); panel.setPanelDark(false); panel.setFault(false) }
+print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+"""
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"), "macOS swiftc required")
+class OverlayOrderTests(unittest.TestCase):
+    """Standby and fault are independent overlays: any order of setting/clearing ends in the same drawn state."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as work:
+            main = Path(work) / "main.swift"
+            main.write_text(OVERLAY_HARNESS)
+            binary = Path(work) / "harness"
+            subprocess.run(["swiftc", main, TOOLS / "panel-view.swift", "-o", binary], check=True, capture_output=True)
+            output = subprocess.run([binary, TOOLS / "panel-layout.json"], check=True, capture_output=True, text=True,
+                                    timeout=60).stdout
+        cls.report = json.loads(output)
+
+    def test_every_fault_standby_order_ends_in_the_same_drawn_state(self):
+        self.assertEqual(self.report["standby_then_fault"], "11")
+        self.assertEqual(self.report["fault_then_standby"], "11")   # the same combined state, either order
+        self.assertEqual(self.report["fault_only"], "01")
+        self.assertEqual(self.report["standby_only"], "10")
+        self.assertEqual(self.report["fault_clear_keeps_standby"], "10")   # clearing one leaves the other
+        self.assertEqual(self.report["standby_clear_keeps_fault"], "01")
+        self.assertEqual(self.report["both_clear"], "00")
 
 
 if __name__ == "__main__":
