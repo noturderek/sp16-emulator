@@ -33,6 +33,14 @@ run sp16_stub_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
 expect 'backlight level=0'
 expect 'backlight level=255'
 run sp16_network_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE -E SP16_NET_GLINK=1 /tmp/run/t up; $PRE -E SP16_NET_GLINK=0 /tmp/run/t down; $PRE /tmp/run/t off; $PRE /tmp/run/t arp; $PRE -E SP16_NET_ARP=1 /tmp/run/t arp"
+run sp16_network_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE -E SP16_NET_DIAG=1 /tmp/run/t diag"
+expect 'SP16_NET_DIAG bind fd=.* port=50002 result=0 errno=0'
+expect 'SP16_NET_DIAG setsockopt fd=.* option=SO_REUSEADDR result=0 errno=0'
+expect 'SP16_NET_DIAG setsockopt fd=.* option=SO_BROADCAST result=0 errno=0'
+expect 'SP16_NET_DIAG sendto fd=.* port=50000 bytes=4 result=4 errno=0'
+expect 'SP16_NET_DIAG ioctl request=0x8915 result=0 errno=0 address_nonzero=1'
+expect 'SP16_NET_DIAG ioctl request=0x891b result=0 errno=0 mask_nonzero=1'
+expect 'SP16_NET_DIAG close fd=.* port=50002 result=0 errno=0'
 run sp16_din_queue_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/t; /tmp/run/t"
 run sp16_usb_route_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/t; /tmp/run/t"
 run sp16_din_ioctl_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
