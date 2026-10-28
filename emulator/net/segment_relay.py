@@ -22,11 +22,13 @@ The relay exits (and unlinks its socket) when QEMU disconnects, or after `--idle
 Stdlib only.
 """
 import argparse
+import errno
 import os
 import select
 import socket
 import struct
 import sys
+import time
 
 
 def parse_target(target):
@@ -76,6 +78,26 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
     own = mac_key(own_mac)
     print(f"segment-relay: {sock_path} -> {group}:{port} mac {own or '-'}", file=log, flush=True)
     qemu = None
+    transient = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ECONNREFUSED, errno.EHOSTDOWN, errno.ENETDOWN}
+    warned = set()
+    stats = {"to_segment": 0, "to_guest": 0, "recv_err": 0, "send_err": 0, "last": time.monotonic()}
+
+    def note(kind, err):
+        # A UDP socket on macOS surfaces an asynchronous ICMP error (e.g. "No route to host" after a multicast
+        # send on a link with no forwarder) on the next recvfrom; log it once and keep relaying rather than die.
+        stats["recv_err" if kind == "recv" else "send_err"] += 1
+        key = (kind, err.errno)
+        if key not in warned:
+            warned.add(key)
+            print(f"segment-relay: {kind} {err} (continuing)", file=log, flush=True)
+
+    def heartbeat():
+        now = time.monotonic()
+        if now - stats["last"] >= 30.0:
+            stats["last"] = now
+            print(f"segment-relay: to_segment={stats['to_segment']} to_guest={stats['to_guest']} "
+                  f"recv_err={stats['recv_err']} send_err={stats['send_err']}", file=log, flush=True)
+
     try:
         try:
             qemu, _ = listener.accept()
@@ -92,10 +114,16 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
                         frame, _ = seg.recvfrom(65535)
                     except (BlockingIOError, InterruptedError):
                         continue
+                    except OSError as err:
+                        if err.errno in transient:
+                            note("recv", err)
+                            continue
+                        raise
                     if not frame or len(frame) < 14:
                         continue
                     if own and frame[6:12].hex() == own:
                         continue  # our own send echoed back: never hand it to our guest
+                    stats["to_guest"] += 1
                     qemu.sendall(struct.pack(">I", len(frame)) + frame)
                 else:
                     try:
@@ -111,7 +139,15 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
                             break
                         frame = pending[4:4 + length]
                         pending = pending[4 + length:]
-                        seg.sendto(frame, (group, port))
+                        try:
+                            seg.sendto(frame, (group, port))
+                        except OSError as err:
+                            if err.errno in transient:
+                                note("send", err)
+                                continue
+                            raise
+                        stats["to_segment"] += 1
+            heartbeat()
     finally:
         if qemu is not None:
             qemu.close()
