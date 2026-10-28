@@ -520,6 +520,30 @@ fi
         echo 'SP16_DEV_ERROR developer overlay not applied; starting the firmware unchanged' > /dev/console
       fi
     fi
+    # The firmware's apl_start is not run, but the one line it carries after a `# SP16_APL_HOOK` marker is: the unit's
+    # apl_start runs such a line just before it starts the app (a mod loaded from /root/data), so it runs here the same
+    # way, after the overlay, in the same chroot, under the firmware's own busybox sh. Bounded to 10 s so a bad mod can
+    # never keep the app from starting; its output and exit status go to the console as SP16_APL_HOOK lines.
+    sp16_hook=$(python3 /opt/sp16/guest-firmware.py apl-hook "/tmp/sp16-root$sp16_app_dir/apl_start" 2>/dev/console) || sp16_hook=
+    if [ -n "$sp16_hook" ]; then
+      echo "SP16_APL_HOOK run: $sp16_hook" > /dev/console
+      # A mod's script starts child programs (cp, rm, sleep): qemu-user passes those to the guest kernel, which cannot run
+      # ARM code, so each fails with "Exec format error" unless a binfmt_misc handler hands ARM ELF files to
+      # qemu-arm-static (flag F: the interpreter is opened now, so it works inside the chroot). Registered once, here,
+      # because only a hook runs child programs; /proc is mounted in the chroot for the hook only.
+      if ! [ -e /proc/sys/fs/binfmt_misc/sp16-arm ]; then
+        modprobe binfmt_misc 2>/dev/null || :
+        grep -q ' binfmt_misc ' /proc/mounts || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || :
+        printf '%s' ':sp16-arm:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-arm-static:F' \
+          > /proc/sys/fs/binfmt_misc/register 2>/dev/null || echo 'SP16_APL_HOOK binfmt_misc unavailable: child programs will not run' > /dev/console
+      fi
+      mkdir -p /tmp/sp16-root/proc
+      mount -t proc proc /tmp/sp16-root/proc 2>/dev/null || :
+      (timeout 10 env SP16_APP_CWD=$sp16_app_cwd python3 /opt/sp16/enter.py /tmp/sp16-root /qemu-arm-static -cpu $sp16_cpu \
+         -E LD_LIBRARY_PATH=$sp16_ldpath /bin/busybox sh -c "$sp16_hook" 2>&1; echo "rc=$?") \
+        | sed -u 's/^/SP16_APL_HOOK /' > /dev/console
+      umount /tmp/sp16-root/proc 2>/dev/null || :
+    fi
     rm -f /tmp/sp16-root/dev/sp16-panel-input /tmp/sp16-root/dev/sp16-cdc-input /tmp/sp16-root/dev/sp16-usb1 \
       /tmp/sp16-root/dev/sp16-usbctn1
     SP16_APP_CWD=$sp16_app_cwd python3 /opt/sp16/enter.py /tmp/sp16-root /qemu-arm-static $sp16_trace_args -cpu $sp16_cpu \
