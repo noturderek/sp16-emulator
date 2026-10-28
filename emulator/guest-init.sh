@@ -36,6 +36,7 @@ for sp16_port in /sys/class/virtio-ports/*; do
    sp16.ui) [ -e /dev/vport0p1 ] || ln -s "/dev/${sp16_port##*/}" /dev/vport0p1 ;;
    sp16.ctl) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-ctl ;;
    sp16.pcm) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-pcm ;;
+   sp16.din) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-din ;;
    sp16.gdb) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-gdb ;;
   esac
 done
@@ -161,6 +162,29 @@ if [ "$sp16_devlayer" = 1 ]; then
 fi
 : > /tmp/sp16-root/dev/null
 : > /tmp/sp16-root/dev/full
+# Publish the DIN sequencer client before the app probes its ALSA endpoints. The card-presence probe is a
+# synthetic proc file; the actual event transport is the guest kernel sequencer.
+if modprobe snd_seq; then
+  mkdir -p /tmp/sp16-root/dev/snd /tmp/sp16-root/proc/asound/snddinmidi
+  : > /tmp/sp16-root/proc/asound/snddinmidi/midi0
+  python3 - <<'PYDEV'
+import glob, os, stat
+for source in glob.glob('/dev/snd/*'):
+    mode = os.stat(source).st_mode
+    if stat.S_ISCHR(mode):
+        os.mknod('/tmp/sp16-root/dev/snd/' + os.path.basename(source), 0o600 | stat.S_IFCHR, os.stat(source).st_rdev)
+PYDEV
+  /opt/sp16/din-seq-bridge > /dev/console 2>&1 &
+  echo 'SP16_DIN sequencer=started' > /dev/console
+else
+  echo 'SP16_DIN sequencer=missing' > /dev/console
+fi
+# The normal ALSA snddinmidi card is shimmed over this full-duplex UART port; the factory-test nodes stay separate.
+if [ -e /dev/sp16-din ]; then
+  python3 -c 'import os, stat; os.mknod("/tmp/sp16-root/dev/sp16-din", 0o600 | stat.S_IFCHR, os.stat("/dev/sp16-din").st_rdev)'
+else
+  echo 'SP16_DIN port=missing' > /dev/console
+fi
 # Audio transport (native.py build --audio file): give the chroot the sp16.pcm port as a character node so the
 # stub's forwarder thread can stream the OEM's playback frames to the host file sink. Off unless asked for.
 sp16_audio_env=
@@ -173,7 +197,7 @@ case " $(cat /proc/cmdline) " in
     echo 'SP16_AUDIO port=missing' > /dev/console
   fi ;;
 esac
-printf 'pcm.null { type null }\n' > /tmp/sp16-root/etc/sp16-alsa.conf
+printf 'pcm.null { type null }\nseq.default { type hw }\n' > /tmp/sp16-root/etc/sp16-alsa.conf
 # Persistent eMMC (fullpanel builds only: native.py adds sp16.data=1 with a virtio block device). This is our
 # trusted init, not the OEM: it formats the card once (only when it has no filesystem), repairs an unclean shutdown
 # with fsck.vfat -a, and mounts it at the chroot's /mnt/emmc before the app starts. The OEM's own mkfs/mount stay

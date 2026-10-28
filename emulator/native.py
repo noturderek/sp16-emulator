@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 
 from prepare import private_path
@@ -28,7 +29,7 @@ QEMU_ARCHIVE_SHA256 = "a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689
 APP_NAME = "SP16 Emulator.app"
 BASE_GUEST_FILES = ("Dockerfile.native-base", "hardware_stub.c", "guest-init.sh", "guest-bridge.py", "pack-guest.sh",
                     "protocol.py", "panel.py", "panel_map.py", "input.py", "enter.py", "profiles.py", "recipes.py",
-                    "prepare.py", "guest-firmware.py", "profiles/sp16-1.60.json",
+                    "prepare.py", "guest-firmware.py", "midi/seq-bridge.c", "profiles/sp16-1.60.json",
                     "profiles/products/sp16.json")
 SWIFT_SOURCES = ("native-window.swift", "panel-view.swift", "data-image.swift", "audio-sink.swift",
                 "audio-output.swift", "firmware-library.swift", "firmware-window.swift", "app-diagnostics.swift")
@@ -247,6 +248,9 @@ def arguments(qemu, guest, socket, trace=None, data=False, audio=None, firmware=
     # Audio transport: a dedicated virtio-serial port carrying playback frames to the host file sink.
     pcm = ["-chardev", f"socket,id=sp16pcm,path={socket}.pcm,server=on,wait=off",
            "-device", "virtserialport,chardev=sp16pcm,name=sp16.pcm"] if audio else []
+    # Full-duplex DIN MIDI UART, separate from the panel and factory-test loopback.
+    din = ["-chardev", f"socket,id=sp16din,path={socket}.midi,server=on,wait=off",
+           "-device", "virtserialport,chardev=sp16din,name=sp16.din"]
     # Research gdb bridge (--trace gdb): a dedicated virtio-serial port so the guest can tunnel the qemu-user
     # gdbstub (127.0.0.1:1234 in the guest) out to the host, since the guest has no NIC beyond lo. The host end
     # is the unix socket {socket}.gdb; the guest-init forwarder bridges the vport to the in-guest stub, and a tiny
@@ -273,7 +277,7 @@ def arguments(qemu, guest, socket, trace=None, data=False, audio=None, firmware=
                        + (f" sp16.app={app_arg}" if app_arg else ""),
             "-device", "virtio-serial-device",
             "-chardev", f"socket,id=sp16,path={socket},server=on,wait=off",
-            "-device", "virtserialport,chardev=sp16,name=sp16.ui", *fw, *persistent, *pcm, *gdb]
+            "-device", "virtserialport,chardev=sp16,name=sp16.ui", *fw, *persistent, *pcm, *din, *gdb]
 
 
 def shipped_profile(profile):
@@ -635,8 +639,18 @@ def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overla
         + (["--dev-overlay", dev_overlay_path(dev_overlay)] if dev_overlay else []) \
         + (["--no-ui-input"] if no_ui_input else []) + (["--no-audio-files"] if no_audio_files else [])
     env_args = [arg for key, value in net_env.items() for arg in ("--env", f"{key}={value}")]
+    midi_since = time.time()
     run(["open", "-n", *(["-g"] if no_ui_input else []), *env_args, assets["app_bundle"],
          *(["--args", *app_args] if app_args else [])])
+    # The app owns QEMU's lifetime; this bridge joins its DIN socket and exits when that socket closes.
+    # Keep it separate from the panel bridge's virtio port.
+    if output.is_dir():
+        with (output / "din-midi.log").open("a") as midi_log:
+            subprocess.Popen([sys.executable, "-m", "midi.din", "--wait-for-session", str(output),
+                              "--since", str(midi_since), "--build-dir", str(output.parent),
+                              "--name", f"SP-16 DIN [{output.name}]"],
+                             cwd=TOOLS, stdin=subprocess.DEVNULL, stdout=midi_log, stderr=subprocess.STDOUT,
+                             start_new_session=True, close_fds=True)
     print(json.dumps({"status": "native_app_opened", "app": assets["app_bundle"], **({"net": net} if net_env else {}),
                       "diagnostics": str(output / "sessions"), "runtime_requires_docker": False}))
 

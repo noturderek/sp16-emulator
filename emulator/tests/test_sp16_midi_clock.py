@@ -60,6 +60,14 @@ class ClockDLLTests(unittest.TestCase):
 
 
 class ClockGeneratorTests(unittest.TestCase):
+    def test_pulses_until_matches_the_120_bpm_sample_grid(self):
+        gen = clock.ClockGenerator(bpm=120.0, sample_rate=44100.0)
+        offsets = []
+        gen.pulses_until(22050, offsets.append)
+        self.assertEqual(len(offsets), 24)
+        self.assertEqual(offsets[0], 918)
+        self.assertEqual(offsets[-1], 22049)
+
     def test_emits_24_pulses_per_beat_at_sample_accuracy(self):
         gen = clock.ClockGenerator(bpm=120.0, sample_rate=44100.0)
         # One beat = 0.5 s = 22050 samples; pulses land every 22050/24 = 918.75 samples, so the integer grid

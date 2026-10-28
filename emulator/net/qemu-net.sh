@@ -20,23 +20,27 @@ if [ -n "${SP16_NET_KIND:-}" ]; then
 fi
 if [ -n "${SP16_NET_MODE:-}" ]; then
   # Append `sp16.net=<mode> [sp16.netip=<addr>]` to the -append argument's value. The arguments come from the build's
-  # default-config.json (native.py arguments()); none of them contains a quote or backslash, so shell-quoting each and
-  # re-splitting with eval keeps the spaces of the -append value intact.
+  # default-config.json (native.py arguments()). Rotate the original argv to the end, replacing the value after
+  # -append without shell re-evaluation; QEMU arguments may contain literal dollar signs or backticks.
   net_token="sp16.net=${SP16_NET_MODE}"
   [ -n "${SP16_NET_IP:-}" ] && net_token="$net_token sp16.netip=${SP16_NET_IP}"
-  rebuilt=
-  want_next=0
-  for arg do
+  remaining=$#
+  found_append=0
+  while [ "$remaining" -gt 0 ]; do
+    arg=$1
+    shift
+    remaining=$((remaining - 1))
     if [ "$arg" = "-append" ]; then
-      rebuilt="$rebuilt -append"
-      want_next=1
-    elif [ "$want_next" = 1 ]; then
-      rebuilt="$rebuilt \"$arg $net_token\""
-      want_next=0
+      [ "$remaining" -gt 0 ] || { echo 'qemu-net: -append needs a value' >&2; exit 2; }
+      value=$1
+      shift
+      remaining=$((remaining - 1))
+      set -- "$@" -append "$value $net_token"
+      found_append=1
     else
-      rebuilt="$rebuilt \"$arg\""
+      set -- "$@" "$arg"
     fi
   done
-  eval "set -- $rebuilt"
+  [ "$found_append" = 1 ] || { echo 'qemu-net: SP16_NET_MODE requires -append' >&2; exit 2; }
 fi
 exec "$real" "$@"

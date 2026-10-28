@@ -11,6 +11,7 @@
 #include <net/if_arp.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -295,6 +296,120 @@ static ssize_t midi_write(struct state *s,const void *buffer,size_t count) {
     if (n>0 && (midi_bytes[s->media]+=(unsigned long)n)==(unsigned long)n)
         fprintf(stderr,"[sp16-ui-stub] midi loopback %s first bytes=%ld\n",s->media==2?"/dev/din_midi":"/dev/ttymxc1",(long)n);
     return n;
+}
+
+/* The rawmidi UART backend complements the native guest sequencer client. Each app uses one ALSA API.
+ * The one full-duplex virtio port is the UART wire: reads are DIN IN, writes are DIN OUT. An absolute monotonic
+ * deadline is kept across calls so a 31,250 baud UART consumes one 10-bit byte every 320 us. Each byte takes the
+ * lock separately, allowing a real-time write from another thread to use the next wire slot. */
+typedef struct _snd_rawmidi snd_rawmidi_t;
+#define RAWMIDI_MAGIC 0x534d4944u
+#define MIDI_BYTE_NS 320000ULL
+struct fake_rawmidi { uint32_t magic; int fd, input; };
+static volatile int rawmidi_wire_lock;
+static uint64_t rawmidi_next_ns;
+static int rawmidi_fd=-1;
+static int rawmidi_is_fake(const snd_rawmidi_t *handle) {
+    return handle && ((const struct fake_rawmidi *)handle)->magic==RAWMIDI_MAGIC;
+}
+static int rawmidi_open_port(void) {
+    if (rawmidi_fd>=0) return rawmidi_fd;
+    const char *path=getenv("SP16_DIN_PORT");
+    if (!path) path="/dev/sp16-din";
+    int fd=original_open(path,O_RDWR|O_CLOEXEC);
+    if (fd>=0) rawmidi_fd=fd;
+    return fd;
+}
+int snd_rawmidi_open(snd_rawmidi_t **input,snd_rawmidi_t **output,const char *name,int mode) {
+    int (*real)(snd_rawmidi_t **,snd_rawmidi_t **,const char *,int)=dlsym(RTLD_NEXT,"snd_rawmidi_open");
+    if (!name || !strstr(name,"snddinmidi"))
+        return real?real(input,output,name,mode):-ENOSYS;
+    if ((!input && !output) || (input && output && input==output)) return -EINVAL;
+    int port=rawmidi_open_port();
+    if (port<0) return -errno;
+    struct fake_rawmidi *in=NULL,*out=NULL;
+    if (input) { in=calloc(1,sizeof(*in)); if (!in) return -ENOMEM; }
+    if (output) { out=calloc(1,sizeof(*out)); if (!out) { free(in); return -ENOMEM; } }
+    if (in) { in->magic=RAWMIDI_MAGIC; in->fd=port; in->input=1; *input=(snd_rawmidi_t *)in; }
+    if (out) { out->magic=RAWMIDI_MAGIC; out->fd=port; *output=(snd_rawmidi_t *)out; }
+    fprintf(stderr,"[sp16-ui-stub] rawmidi %s -> %s input=%d output=%d\n",name,
+            getenv("SP16_DIN_PORT")?getenv("SP16_DIN_PORT"):"/dev/sp16-din",!!input,!!output);
+    return 0;
+}
+int snd_rawmidi_close(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_close");
+    if (!rawmidi_is_fake(handle)) return real?real(handle):-ENOSYS;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    fake->magic=0; free(fake);
+    /* The port remains open for the other direction and future rawmidi opens in this app process. */
+    return 0;
+}
+int snd_rawmidi_nonblock(snd_rawmidi_t *handle,int nonblock) {
+    int (*real)(snd_rawmidi_t *,int)=dlsym(RTLD_NEXT,"snd_rawmidi_nonblock");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,nonblock):-ENOSYS;
+    int flags=fcntl(((struct fake_rawmidi *)handle)->fd,F_GETFL);
+    return flags<0?-errno:fcntl(((struct fake_rawmidi *)handle)->fd,F_SETFL,nonblock?flags|O_NONBLOCK:flags&~O_NONBLOCK)<0?-errno:0;
+}
+ssize_t snd_rawmidi_read(snd_rawmidi_t *handle,void *buffer,size_t count) {
+    ssize_t (*real)(snd_rawmidi_t *,void *,size_t)=dlsym(RTLD_NEXT,"snd_rawmidi_read");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,buffer,count):-ENOSYS;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    if (!fake->input) return -EBADF;
+    ssize_t n=original_read(fake->fd,buffer,count);
+    if (n>0 && gpio_ready && __atomic_load_n(&gpio_level[5],__ATOMIC_ACQUIRE)==1) {
+        /* MIDI_PASS is the hardware THRU gate. Echo incoming bytes to the host, not back to the app. */
+        const uint8_t *bytes=buffer;
+        for (ssize_t i=0;i<n;i++) original_write(fake->fd,bytes+i,1);
+    }
+    return n<0?-errno:n;
+}
+ssize_t snd_rawmidi_write(snd_rawmidi_t *handle,const void *buffer,size_t count) {
+    ssize_t (*real)(snd_rawmidi_t *,const void *,size_t)=dlsym(RTLD_NEXT,"snd_rawmidi_write");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,buffer,count):-ENOSYS;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    if (fake->input) return -EBADF;
+    const uint8_t *bytes=buffer;
+    for (size_t i=0;i<count;i++) {
+        while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
+        uint64_t now=mono_ns();
+        uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
+        struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
+        int sleep_result;
+        do { sleep_result=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); }
+        while (sleep_result==EINTR);
+        ssize_t wrote=sleep_result? -1 : original_write(fake->fd,bytes+i,1);
+        rawmidi_next_ns=target;
+        __sync_lock_release(&rawmidi_wire_lock);
+        if (wrote!=1) return i?(ssize_t)i:-(sleep_result?sleep_result:errno);
+    }
+    return (ssize_t)count;
+}
+int snd_rawmidi_drain(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_drain");
+    return rawmidi_is_fake(handle)?0:real?real(handle):-ENOSYS;
+}
+int snd_rawmidi_drop(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_drop");
+    return rawmidi_is_fake(handle)?0:real?real(handle):-ENOSYS;
+}
+int snd_rawmidi_poll_descriptors_count(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_poll_descriptors_count");
+    return rawmidi_is_fake(handle)?1:real?real(handle):-ENOSYS;
+}
+int snd_rawmidi_poll_descriptors(snd_rawmidi_t *handle,struct pollfd *fds,unsigned int space) {
+    int (*real)(snd_rawmidi_t *,struct pollfd *,unsigned int)=dlsym(RTLD_NEXT,"snd_rawmidi_poll_descriptors");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,fds,space):-ENOSYS;
+    if (!fds || !space) return -EINVAL;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    fds[0]=(struct pollfd){ .fd=fake->fd,.events=fake->input?POLLIN:POLLOUT };
+    return 1;
+}
+int snd_rawmidi_poll_descriptors_revents(snd_rawmidi_t *handle,struct pollfd *fds,unsigned int count,unsigned short *revents) {
+    int (*real)(snd_rawmidi_t *,struct pollfd *,unsigned int,unsigned short *)=dlsym(RTLD_NEXT,"snd_rawmidi_poll_descriptors_revents");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,fds,count,revents):-ENOSYS;
+    if (!fds || !count || !revents) return -EINVAL;
+    *revents=(unsigned short)fds[0].revents;
+    return 0;
 }
 
 /* Driver coverage (hardware suite HW-45, docs/architecture.md M5): a device node the shim does not serve is reported once
@@ -663,7 +778,8 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
                                       s->name,access,access_label(access),result);
     return result;
 }
-/* The AK4452 codec driver of the SP-16 kernel declares S16_LE, S24_LE and S20_3LE only (its DAI stream tables); the
+/* The AK4458 master codec advertises S16_LE only. The AK4452 codec driver declares S16_LE, S24_LE and S20_3LE
+ * (its DAI stream tables); the
  * null plugin also takes FLOAT_LE, which the app's format search tries first, so without a restriction the board
  * streams run a sample path the unit never runs. The shim therefore refuses the formats the codec lacks by default, so
  * the app settles on S24_LE as on the unit. S20_3LE (three packed bytes) is refused too: the board model's sample
@@ -671,8 +787,10 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
  * buffers untouched. SP16_PCM_ANY_FORMAT=1 (research) restores the null plugin's answer. */
 static int codec_refuses(const struct pcm_state *s,int format) {
     const char *any=getenv("SP16_PCM_ANY_FORMAT");
-    if (!s || (any && !strcmp(any,"1")) || strncmp(s->name,"hw:ak4452audio,",15)) return 0;
-    return format!=2 && format!=6;
+    if (!s || (any && !strcmp(any,"1"))) return 0;
+    if (!strcmp(s->name,"hw:ak4458audio,0")) return format!=2;
+    if (!strncmp(s->name,"hw:ak4452audio,",15)) return format!=2 && format!=6;
+    return 0;
 }
 /* The codec master clock is 1024 x 44.1 kHz and has no other setting (service manual clock tree), so every board PCM
  * accepts 44100 Hz only. set_rate refuses anything else as a driver restricted to one rate would; set_rate_near

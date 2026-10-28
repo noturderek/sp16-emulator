@@ -105,11 +105,12 @@ class Port:
     """A running helper: `get` yields received Messages, `send` writes one. `args` are the helper's arguments after
     its program name ("run --in NAME --out NAME" or "virtual NAME")."""
 
-    def __init__(self, args, build_dir=None, on_raw=None):
+    def __init__(self, args, build_dir=None, on_raw=None, queue_messages=True):
         self.process = subprocess.Popen([str(helper_binary(build_dir)), *args], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         self.messages = queue.Queue()
         self.on_raw = on_raw
+        self.queue_messages = queue_messages
         self.ready = threading.Event()
         threading.Thread(target=self._read, daemon=True).start()
         if not self.ready.wait(10):
@@ -131,7 +132,7 @@ class Port:
                 if self.on_raw:
                     self.on_raw(data)
                 message = parse(data)
-                if message is not None:
+                if message is not None and self.queue_messages:
                     self.messages.put(message)
 
     def get(self, timeout=None):
