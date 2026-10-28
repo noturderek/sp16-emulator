@@ -34,6 +34,7 @@ expect 'backlight level=0'
 expect 'backlight level=255'
 run sp16_network_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE -E SP16_NET_GLINK=1 /tmp/run/t up; $PRE -E SP16_NET_GLINK=0 /tmp/run/t down; $PRE /tmp/run/t off; $PRE /tmp/run/t arp; $PRE -E SP16_NET_ARP=1 /tmp/run/t arp"
 run sp16_din_queue_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/t; /tmp/run/t"
+run sp16_usb_route_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/t; /tmp/run/t"
 run sp16_din_ioctl_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
 run sp16_din_contract "$CC /tmp/test.c /opt/sp16/libsp16-ui.so -o /tmp/run/t; $PRE /tmp/run/t"
 expect 'rawmidi hw:snddinmidi,0 ->'

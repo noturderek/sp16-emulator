@@ -81,6 +81,17 @@ static int usb_flush(struct bytes *queue,int fd) {
     }
     return 0;
 }
+static int open_usb(const char *path) {
+    int fd=open(path,O_RDWR|O_NONBLOCK|O_CLOEXEC);
+    if (fd<0) fprintf(stderr,"SP16_USB_MIDI disabled reason=open-failed errno=%d\n",errno);
+    return fd;
+}
+static void disable_usb(int *fd,struct bytes *queue,const char *reason) {
+    fprintf(stderr,"SP16_USB_MIDI disabled reason=%s\n",reason);
+    close(*fd);
+    *fd=-1;
+    *queue=(struct bytes){0};
+}
 static int proxy_listener(void) {
     int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
     if (fd<0) return -1;
@@ -163,6 +174,29 @@ static void send_proxy_event(struct proxy_client clients[MAX_PROXY_CLIENTS],cons
             errno!=EAGAIN) { close(clients[i].fd); clients[i].fd=-1; }
     }
 }
+static void service_usb(int *fd,struct bytes *queue,snd_midi_event_t *encoder,
+                        struct proxy_client clients[MAX_PROXY_CLIENTS],short revents) {
+    if (*fd<0) return;
+    if (revents&(POLLERR|POLLNVAL|POLLHUP)) {
+        disable_usb(fd,queue,"poll-fault");
+        return;
+    }
+    if (revents&POLLIN) {
+        uint8_t buffer[4096];
+        ssize_t n=read(*fd,buffer,sizeof buffer);
+        if (n==0 || (n<0 && errno!=EAGAIN && errno!=EINTR)) {
+            disable_usb(fd,queue,"read-failed");
+            return;
+        }
+        for (ssize_t i=0;i<n;i++) {
+            snd_seq_event_t event;
+            snd_seq_ev_clear(&event);
+            if (snd_midi_event_encode_byte(encoder,buffer[i],&event)==1)
+                send_proxy_event(clients,&event,129,0,2);
+        }
+    }
+    if (usb_flush(queue,*fd)<0) disable_usb(fd,queue,"write-failed");
+}
 static int control_listener(void) {
     int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
     if (fd<0) return -1;
@@ -215,10 +249,11 @@ int main(void) {
     snd_midi_event_no_status(decoder,1);
     int serial=open("/dev/sp16-din",O_RDWR|O_NONBLOCK|O_CLOEXEC);
     if (serial<0) { perror("SP16_DIN virtio"); return 1; }
-    int usb=open("/dev/sp16-usb-midi",O_RDWR|O_NONBLOCK|O_CLOEXEC);
-    if (usb<0) { perror("SP16_USB_MIDI virtio"); return 1; }
+    struct bytes usb_output={0};
+    int usb=open_usb("/dev/sp16-usb-midi");
     snd_midi_event_t *usb_encoder=NULL;
-    if (snd_midi_event_new(4096,&usb_encoder)<0) return 1;
+    if (usb>=0 && snd_midi_event_new(4096,&usb_encoder)<0)
+        disable_usb(&usb,&usb_output,"encoder-failed");
     int control=control_listener();
     if (control<0) { perror("SP16_DIN control"); return 1; }
     int proxy=proxy_listener();
@@ -236,7 +271,6 @@ int main(void) {
     int controls[MAX_CONTROL_CLIENTS];
     for (int i=0;i<MAX_CONTROL_CLIENTS;i++) controls[i]=-1;
     struct wire wire={0};
-    struct bytes usb_output={0};
     unsigned long received=0,sent=0;
     fprintf(stderr,"SP16_DIN forwarder=ready client=%d port=%d\n",snd_seq_client_id(seq),port);
     for (;;) {
@@ -244,6 +278,7 @@ int main(void) {
         if ((wire.normal.size || wire.realtime.size) && !wire.next) wire.next=now+BYTE_NS;
         uint64_t wait=wire.next ? (wire.next>now ? wire.next-now : 0) : 100000000ULL;
         struct timespec timeout={.tv_sec=0,.tv_nsec=(long)wait};
+        pollfds[count+3].fd=usb;
         pollfds[count+3].events=POLLIN|(usb_output.size?POLLOUT:0);
         for (int i=0;i<MAX_PROXY_CLIENTS;i++)
             pollfds[count+4+i]=(struct pollfd){.fd=clients[i].fd,.events=POLLIN};
@@ -259,18 +294,7 @@ int main(void) {
         for (int i=0;i<MAX_PROXY_CLIENTS;i++)
             if (clients[i].fd>=0 && (pollfds[count+4+i].revents&(POLLIN|POLLHUP|POLLERR)))
                 proxy_input(&clients[i],&wire,&usb_output,decoder,usb);
-        if (pollfds[count+3].revents&POLLIN) {
-            uint8_t buffer[4096];
-            ssize_t n=read(usb,buffer,sizeof buffer);
-            for (ssize_t i=0;i<n;i++) {
-                snd_seq_event_t event;
-                snd_seq_ev_clear(&event);
-                if (snd_midi_event_encode_byte(usb_encoder,buffer[i],&event)==1)
-                    send_proxy_event(clients,&event,129,0,2);
-            }
-        }
-        if (pollfds[count+3].revents&(POLLERR|POLLNVAL)) break;
-        if (usb_flush(&usb_output,usb)<0) break;
+        service_usb(&usb,&usb_output,usb_encoder,clients,pollfds[count+3].revents);
         if (pollfds[count].revents&POLLIN) {
             uint8_t buffer[4096];
             ssize_t n=read(serial,buffer,sizeof buffer);
@@ -304,7 +328,7 @@ int main(void) {
     }
     fprintf(stderr,"SP16_DIN closed input=%lu output=%lu dropped=%u\n",received,sent,wire.dropped);
     close(serial);
-    close(usb);
+    if (usb>=0) close(usb);
     close(control);
     close(proxy);
     unlink(DIN_CONTROL_PATH);
@@ -312,7 +336,8 @@ int main(void) {
     for (int i=0;i<MAX_PROXY_CLIENTS;i++) if (clients[i].fd>=0) close(clients[i].fd);
     for (int i=0;i<MAX_CONTROL_CLIENTS;i++) if (controls[i]>=0) close(controls[i]);
     snd_midi_event_free(encoder); snd_midi_event_free(decoder);
-    snd_midi_event_free(usb_encoder); snd_seq_close(seq);
+    if (usb_encoder) snd_midi_event_free(usb_encoder);
+    snd_seq_close(seq);
     return 1;
 }
 #endif
