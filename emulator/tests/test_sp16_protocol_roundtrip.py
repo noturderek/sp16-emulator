@@ -310,6 +310,13 @@ class RawFrameFixtureTests(unittest.TestCase):
         self.assertIsNone(panel.decode_rx(good[:-1]))        # not a full frame
         self.assertIsNone(panel.decode_rx(b"\x02" + good[1:]))  # a TX header
 
+    def test_rx_decoder_rejects_an_out_of_range_pot_word(self):
+        """A full-length frame with a good header and CRC but a >10-bit pot word is not an RX frame: decode_rx returns
+        None instead of letting analog_level's range check raise ValueError."""
+        self.assertIsNone(panel.decode_rx(rx_frame({0x26: b"\x04\x00"})))    # DRIVE at 1024, one over full scale
+        self.assertIsNotNone(panel.decode_rx(rx_frame({0x26: b"\x03\xff"})))  # DRIVE at 1023 decodes
+        self.assertIsNone(panel.decode_rx(rx_frame({0x2a: b"\xff\xff"})))     # HP CUTOFF far out of range
+
     def test_mutated_button_and_counter_tables_change_the_same_bytes(self):
         """Negative case: the fixtures above go through the production tables. Move PLAY onto STOP's bit or move a
         counter's offset and the same literal bytes decode to a different control, so no fixture can silently keep

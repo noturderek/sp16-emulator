@@ -93,6 +93,7 @@ def decode_rx(frame, check_crc=True):
     touch strip is not in this frame: it has its own CDC channel and its own decoder, decode_strip().
 
     A wrong length, header or CRC-16 means the frame is not an RX frame, never a frame with unknown content.
+    A frame whose pot words are outside 0..1023 is likewise not one (it would carry an unencodable analog level).
     Counters stay unsigned 16-bit, the way the model wraps them; signed_detents() reads a delta out of one.
     """
     if len(frame) != panel_map.FRAME_BYTES or frame[0] != RX_HEADER:
@@ -105,6 +106,8 @@ def decode_rx(frame, check_crc=True):
     pads = [{"pressure": word(panel_map.PAD_A_OFFSET + 2 * index),
              "contact": word(panel_map.PAD_B_OFFSET + 2 * index)} for index in range(16)]
     analog_words = {name: word(offset) for name, (offset, _) in panel_map.ANALOG_WORDS.items()}
+    if any(raw > panel_map.ANALOG_FULL_SCALE for raw in analog_words.values()):
+        return None
     analog = {name: analog_level(analog_words[name], inverted)
               for name, (_, inverted) in panel_map.ANALOG_WORDS.items()}
     return {"buttons": buttons, "counters": counters, "pads": pads, "analog_words": analog_words, "analog": analog}
@@ -501,6 +504,8 @@ class PanelModel:
         hex and the pads whose pressure word is non-zero."""
         frame = self.frame()
         state = decode_rx(frame)
+        if state is None:  # a research raw pin can make the frame not an RX frame (e.g. an out-of-range pot word)
+            return {"buttons": frame[1:6].hex(), "pads": []}
         return {"buttons": frame[1:6].hex(),
                 "pads": [index + 1 for index, pad in enumerate(state["pads"]) if pad["pressure"]]}
 
