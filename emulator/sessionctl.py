@@ -241,6 +241,10 @@ class Session:
             flag = self.tx_standby(0.5)
         return {"before": before, "standby": bool(flag), "seconds": round(time.monotonic() - started, 1)}
 
+    def fault(self, on):
+        """Force the power-fault display (QRT1001 p24): dark panel, WAKE UP blinking red; off restores."""
+        return self.call(op="fault", on=on)
+
     def metrics(self):
         return self.call(op="metrics")
 
@@ -263,7 +267,8 @@ def main():
     parser.add_argument("--runtime", required=True, help="session runtime.json")
     parser.add_argument("command", choices=["event", "press", "turn", "touch", "raw", "clear",
                                             "snapshot", "metrics", "txlog", "period", "panelshot", "resize", "adc", "usb",
-                                            "app-restart", "firmware", "power", "standby", "pressure", "calibrate"])
+                                            "app-restart", "firmware", "power", "standby", "pressure", "calibrate",
+                                            "fault"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=None,
                         help=f"seconds to wait for each reply (default SP16_CONTROL_TIMEOUT or {DEFAULT_TIMEOUT:g})")
@@ -324,6 +329,8 @@ def run_command(session, command, a):
         if a[:1] != ["yes"]:
             raise RuntimeError(f"standby needs the argument yes: {STANDBY_WARNING}")
         result = session.standby()
+    elif command == "fault":
+        result = session.fault(a[:1] != ["off"])
     elif command == "app-restart":
         result = session.app_restart()
     elif command == "firmware":

@@ -247,6 +247,7 @@ struct PanelRenderState {
     var lcdBrightness: CGFloat = 1      // the firmware's LCD backlight level, 0...1 (1 = full, as before)
     var bloom = false                   // additive glow around lit keys, buttons and LEDs (View > Lamp Glow; off by default)
     var panelDark = false               // standby/fault: black LCD, every lamp off except WAKE UP
+    var fault = false                   // power fault: dark panel, WAKE UP blinking red
 
     func look(_ id: UInt8) -> LampLook {
         guard feedbackLive else { return .unknown }
@@ -990,7 +991,14 @@ final class PanelRenderer {
 
     /// Effective lamp look: in the dark state every lamp is off except WAKE UP, regardless of firmware feedback.
     private func look(_ c: PanelLayout.Control, _ st: PanelRenderState) -> LampLook {
-        if st.panelDark { return c.name == PanelRenderer.wakeUpName ? .lit(PanelRenderer.wakeUpColor) : .off }
+        if st.panelDark || st.fault {
+            guard c.name == PanelRenderer.wakeUpName else { return .off }
+            if st.fault {
+                // QRT1001 p24: a fault blinks the WAKE UP LED red (about 1 Hz) and everything else is dark.
+                return Int(ProcessInfo.processInfo.systemUptime * 2) % 2 == 0 ? .lit(PanelRenderer.wakeUpColor) : .off
+            }
+            return .lit(PanelRenderer.wakeUpColor)
+        }
         return st.look(c.id)
     }
 
@@ -999,7 +1007,7 @@ final class PanelRenderer {
         for c in layout.controls where c.frame.insetBy(dx: -PanelRenderer.dirtyReach, dy: -PanelRenderer.dirtyReach).intersects(dirty) {
             drawControlDynamic(ctx, c, state, s)
         }
-        if state.bloom && state.feedbackLive && !state.panelDark { drawBloom(ctx, state: state, dirty: dirty) }
+        if state.bloom && state.feedbackLive && !state.panelDark && !state.fault { drawBloom(ctx, state: state, dirty: dirty) }
         if state.debugOverlay { drawDebug(ctx) }
     }
 
@@ -1048,7 +1056,7 @@ final class PanelRenderer {
         ctx.clip(to: r)
         ctx.setFillColor(hexColor(0))
         ctx.fill(r)
-        if state.panelDark {
+        if state.panelDark || state.fault {
             // Standby/fault: the glass is dark; no firmware image and no boot overlay.
             ctx.restoreGState()
             return
@@ -1702,6 +1710,32 @@ final class PanelView: NSView, NSViewToolTipOwner {
         state.panelDark = dark
         if dark { state.lcdImage = nil }
         needsDisplay = true
+    }
+
+    /// Force the power-fault display (QRT1001 p24): dark panel with the WAKE UP LED blinking red; off restores the live
+    /// screen. The firmware keeps running behind the veil, so the LCD image is not cleared.
+    func setFault(_ on: Bool) {
+        guard on != state.fault else { return }
+        state.fault = on
+        if on { startFaultClock() } else { stopFaultClock() }
+        needsDisplay = true
+    }
+
+    private var faultClock: Timer?
+
+    /// Repaints the WAKE UP lamp a few times a second while the fault state is on, so the blink is smooth.
+    private func startFaultClock() {
+        guard faultClock == nil,
+              let id = panelLayout?.controls.first(where: { $0.name == PanelRenderer.wakeUpName })?.id else { return }
+        faultClock = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self else { return }
+            guard self.state.fault else { timer.invalidate(); self.faultClock = nil; return }
+            self.invalidate([id])
+        }
+    }
+
+    private func stopFaultClock() {
+        faultClock?.invalidate(); faultClock = nil
     }
 
     var heldControls: Set<UInt8> { state.held }

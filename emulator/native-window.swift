@@ -59,7 +59,7 @@ enum Kind {
 
 /// Host power state machine (QRT1001 p15): BOOT (boot overlay) → RUN at the first LCD frame, OFF (dark panel, WAKE UP
 /// lit) when the firmware's standby flag (TX byte 0x67 bit 0) latches, and back to BOOT when it clears.
-enum PowerState { case boot, run, off }
+enum PowerState { case boot, run, off, fault }
 
 /// Fixed-size sample window for latency percentiles.
 struct Samples {
@@ -597,6 +597,23 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
     }
 
+    /// Force or clear the power-fault display (QRT1001 p24). Main thread only; the firmware keeps running behind the
+    /// veil, so clearing returns to the state the panel was already in.
+    func setFault(_ on: Bool) {
+        if on {
+            guard powerState != .fault else { return }
+            powerState = .fault
+            panel.releaseAll()
+            panel.setFault(true)
+            AppLog.log("panel: fault — dark with WAKE UP blinking red")
+        } else {
+            guard powerState == .fault else { return }
+            panel.setFault(false)
+            powerState = screenSeen ? .run : .boot
+            AppLog.log("panel: fault cleared")
+        }
+    }
+
     func writeTxLog(_ frame: Data) {
         guard config.research == true else { return }
         lock.lock(); defer { lock.unlock() }
@@ -879,6 +896,11 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             var note = ""
             DispatchQueue.main.sync { note = self.powerOn(mode) }
             return "{\"ok\":true,\"note\":\"\(note)\"}"
+        case "fault":
+            // Power fault (QRT1001 p24): FAULT_DET low -> dark panel, WAKE UP blinking red; off restores.
+            guard let on = command["on"] as? Bool else { return "{\"error\":\"fault needs on true|false\"}" }
+            DispatchQueue.main.sync { self.setFault(on) }
+            return "{\"ok\":true}"
         case "view":
             // View toggles for screenshots: rear on|off, glow on|off.
             guard let name = command["name"] as? String, ["rear", "glow", "skin"].contains(name),
