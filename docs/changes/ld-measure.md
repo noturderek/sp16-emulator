@@ -96,7 +96,10 @@ python3 emulator/probes/ak4458_transport.py run --build ld-measure-tap
 It steps the factory test to page 11 (AUDIO TEST), sets the shim's input tone to slot 700 (about -18 dBFS, under the
 limiter, knobs left neutral), selects each mode in turn and prints one row per transport word. Run folder:
 `build/ld-measure-tap/ak4458-transport/20261028-101625` (the table is that folder's `ak4458-transport.json`). Each
-mode's capture is 176 400 frames, all usable, taken wholly inside the mode.
+mode's capture is 176 400 frames, all usable, taken wholly inside the mode. Page 11 was really showing before every
+mode tap: each read the run's page guard made (`hw-settle-0019` to `0074` in session `native-10a77c3f`) OCRs as page
+11, so the modes were selected on the AUDIO TEST page (**O**), even though the guard itself was dead until it learned
+to read the verdict's status.
 
 Stimulus, as measured in the capture rather than assumed: the words MODE1 drives read a dominant frequency of
 **1000.01 Hz** with **0.9995** of their energy inside 1 kHz ± 150 Hz.
@@ -325,6 +328,7 @@ Checks are run from the repository root. "Quick set" is the brief's list of 14 m
 | 2. Transport words | `2fefd66` | `probes/ak4458_transport.py`, `tests/test_sp16_ak4458_transport.py`, `docs/changes/ld-measure.md` | `test_sp16_ak4458_transport`: Ran 16, OK; `ak4458_transport.py run --build ld-measure-tap` over four modes, 176400 of 176400 frames usable in each; quick set, OK |
 | 3. Residual stall | `339893d` | `timing_probe.py`, `tests/test_sp16_timing_probe.py`, `docs/changes/ld-measure.md` | `test_sp16_timing_probe`: Ran 22, OK (four new); two 60 s probe runs, 21.9 ms / 0 stalls on a quiet host and 46.9 ms / 3 stalls beside another emulator, hop `bridge-to-app`; quick set plus both new modules, Ran 483, OK |
 | 4. Filter send | this commit | `probes/filter_send.py`, `tests/test_sp16_filter_send.py`, `docs/changes/ld-measure.md` | `test_sp16_filter_send`: Ran 8, OK; two live runs, send stream 0.0 peak and 0 nonzero frames with ACTIVE on and off; **parked** (section 4) |
+| 5. Page guard fix | this commit | `probes/ak4458_transport.py`, `tests/test_sp16_ak4458_transport.py`, `docs/changes/ld-measure.md` | `test_sp16_ak4458_transport`: Ran 20, OK (four new); quick set, Ran 445, OK |
 
 Side effects: builds made, all under the git-ignored `build/`: `build/ld-measure` (research, `--audio file`) and
 `build/ld-measure-tap` (research, `--audio file`, `--trace pcmtap`, `--app-arg testmode`). Sessions started and stopped

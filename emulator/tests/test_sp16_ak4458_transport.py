@@ -11,10 +11,13 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(TOOLS / "probes"))
 
+import hwsuite  # noqa: E402
 import ak4458_transport as transport  # noqa: E402
 
 RATE = 44100
@@ -177,6 +180,49 @@ class TableTest(unittest.TestCase):
         for word in range(16):
             self.assertIn(f"{word:4d}", text)
         self.assertEqual(len(result["pairs"]), 8)
+
+
+class PageGuardTest(unittest.TestCase):
+    """`testmode_page_is` returns a verdict dict, which is truthy whether it passed or not: the guard must read the
+    verdict's status, or the probe taps mode coordinates and labels captures on a page that never showed."""
+
+    def setUp(self):
+        self.taps = []
+        self.session = mock.Mock()
+        self.session.tap.side_effect = lambda *point: self.taps.append(point)
+
+    def runner(self, *statuses):
+        verdicts = [hwsuite.sub(f"stepped to page {transport.AUDIO_TEST_PAGE} (AUDIO TEST)", status == "PASS",
+                                "" if status == "PASS" else "the page never showed") for status in statuses]
+        self.assertEqual([v["status"] for v in verdicts], list(statuses))
+        return mock.Mock(testmode_page_is=mock.Mock(side_effect=verdicts))
+
+    def test_it_stops_when_the_page_never_showed(self):
+        with self.assertRaises(SystemExit) as caught:
+            transport.set_mode(self.session, self.runner("FAIL"), "MODE1")
+        self.assertIn(f"not on test page {transport.AUDIO_TEST_PAGE}", str(caught.exception))
+        self.assertEqual(self.taps, [])
+
+    def test_it_stops_when_the_page_left_after_the_mode_tap(self):
+        with mock.patch.object(transport.time, "sleep"):
+            with self.assertRaises(SystemExit) as caught:
+                transport.set_mode(self.session, self.runner("PASS", "FAIL"), "MODE1")
+        self.assertIn(f"left test page {transport.AUDIO_TEST_PAGE}", str(caught.exception))
+        self.assertEqual(self.taps, [transport.MODE_BUTTONS["MODE1"]])
+
+    def test_none_taps_nothing_but_still_needs_the_page(self):
+        runner = self.runner("FAIL")
+        with self.assertRaises(SystemExit):
+            transport.set_mode(self.session, runner, "none")
+        self.assertEqual(self.taps, [])
+        self.assertEqual(runner.testmode_page_is.call_count, 1)
+
+    def test_a_page_that_shows_twice_taps_that_modes_coordinates(self):
+        runner = self.runner("PASS", "PASS")
+        with mock.patch.object(transport.time, "sleep"):
+            transport.set_mode(self.session, runner, "MODE3")
+        self.assertEqual(self.taps, [transport.MODE_BUTTONS["MODE3"]])
+        self.assertEqual(runner.testmode_page_is.call_count, 2)
 
 
 class ArgumentTest(unittest.TestCase):

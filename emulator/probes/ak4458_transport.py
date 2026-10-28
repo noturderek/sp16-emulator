@@ -305,14 +305,23 @@ def render(result):
 
 # ----------------------------------------------------------------------------------------------- the live run
 
+def on_audio_test_page(runner):
+    """Whether the session is showing the AUDIO TEST page now.
+
+    `Runner.testmode_page_is` returns a verdict dict (hwsuite.sub), which is truthy whether it passed or not, so the
+    guard has to read the verdict's status - the test hwsuite's own callers make - or it never fires and the probe taps
+    mode coordinates and labels captures on a page that never showed."""
+    return runner.testmode_page_is(AUDIO_TEST_PAGE, "AUDIO TEST")["status"] == "PASS"
+
+
 def set_mode(session, runner, mode):
     """Settle on the AUDIO TEST page and select a mode; `none` leaves the page untouched, which is its OFF state."""
-    if not runner.testmode_page_is(AUDIO_TEST_PAGE, "AUDIO TEST"):
+    if not on_audio_test_page(runner):
         raise SystemExit(f"the session is not on test page {AUDIO_TEST_PAGE}")
     if mode != "none":
         session.tap(*MODE_BUTTONS[mode])
         time.sleep(1.0)
-    if not runner.testmode_page_is(AUDIO_TEST_PAGE, "AUDIO TEST"):
+    if not on_audio_test_page(runner):
         raise SystemExit(f"the session left test page {AUDIO_TEST_PAGE} after selecting {mode}")
 
 
