@@ -124,6 +124,28 @@ class VersionDataTests(unittest.TestCase):
             self.assertNotIn("EP085_Main_R\"", code, name)
             self.assertNotIn("LIVESAMPLER(", code, name)
 
+    def test_boot_read_limits_match_the_units_read_lengths(self):
+        """max_boot_read_bytes is the length the unit's initramfs reads per layer; the stock 1.60 archives are exactly
+        that long, and only rootfs2.tar.gz and pdj.tar.gz are enforced (owner request of 2026-10-27)."""
+        update = profiles.product()["update"]
+        self.assertEqual({layer["file"]: layer["max_boot_read_bytes"] for layer in update["tar_layers"]},
+                         {"rootfs1.tar.gz": 3970596, "rootfs2.tar.gz": 2422834, "rootfs3.tar.gz": 3268503,
+                          "rootfs4.tar.gz": 1871918, "pdj.tar.gz": 4561658})
+        self.assertEqual([layer["file"] for layer in update["tar_layers"] if layer["enforce_boot_read"]],
+                         ["rootfs2.tar.gz", "pdj.tar.gz"])
+        with tempfile.TemporaryDirectory() as folder:
+            shutil.copytree(TOOLS / "profiles/products", Path(folder) / "products")
+            path = Path(folder) / "products/sp16.json"
+            for bad in ({"max_boot_read_bytes": 0}, {"max_boot_read_bytes": -1}, {"max_boot_read_bytes": "2422834"},
+                        {"max_boot_read_bytes": True}, {"max_boot_read_bytes": None, "enforce_boot_read": True},
+                        {"enforce_boot_read": "yes"}):
+                with self.subTest(bad=bad):
+                    descriptor = json.loads((TOOLS / "profiles/products/sp16.json").read_text())
+                    descriptor["update"]["tar_layers"][0].update(bad)
+                    path.write_text(json.dumps(descriptor))
+                    with self.assertRaises(ValueError):
+                        profiles.product(directory=folder)
+
     def test_product_descriptor_and_profile_choice(self):
         product = profiles.product()
         self.assertEqual(product["reference_profile"], "sp16-1.60")

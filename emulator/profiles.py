@@ -171,6 +171,18 @@ def verified_for_app(app_sha256, directory=None):
     return profile if profile and profile["status"] == "verified" else None
 
 
+def _boot_read_ok(layer):
+    """A tar layer's boot read limit: max_boot_read_bytes is the length the unit's initramfs reads (a positive byte
+    count, or absent when the length is not known), and enforce_boot_read may only be set for a layer that has one."""
+    limit = layer.get("max_boot_read_bytes")
+    enforce = layer.get("enforce_boot_read", False)
+    if not isinstance(enforce, bool):
+        return False
+    if limit is None:
+        return not enforce
+    return isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
+
+
 def product(name=PRODUCT, directory=None):
     """The product descriptor (layout, application candidates, reference profile)."""
     if not isinstance(name, str) or not ID_PATTERN.fullmatch(name):
@@ -183,6 +195,7 @@ def product(name=PRODUCT, directory=None):
           and all(guest_path(layer.get("root")) and re.fullmatch(r"[A-Za-z0-9._-]+", str(layer.get("file")))
                   for layer in update.get("tar_layers", []) + update.get("squashfs_layers", []))
           and update.get("tar_layers") and all(guest_path(p) for p in data.get("app_candidates") or [None])
+          and all(_boot_read_ok(layer) for layer in update.get("tar_layers", []))
           and all(guest_path(p) for p in data.get("loader_candidates") or [None])
           and all(guest_path(p) for p in update.get("mount_points", []))
           and ID_PATTERN.fullmatch(str(data.get("reference_profile"))))

@@ -60,7 +60,27 @@ def destination(root, parts):
     return path
 
 
-def unpack_layer(archive, root, prefix=()):
+def check_boot_read(archive, limit, name=None):
+    """Refuse an archive longer than the length the unit's initramfs reads from flash at boot, and return its size.
+
+    The initramfs reads a fixed length per layer (product descriptor: max_boot_read_bytes), so anything past it is
+    silently dropped on the unit: a layer that boots in the emulator but would be truncated there is worse than a
+    refusal. A `limit` of None means the length is not known for that layer and nothing is checked."""
+    size = Path(archive).stat().st_size
+    if limit is None:
+        return size
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError(f"boot read limit {limit!r} for {name or Path(archive).name} is not a positive byte count")
+    if size > limit:
+        label = name or Path(archive).name
+        over = size - limit
+        raise ValueError(f"{label} is {size} bytes; the unit reads at most {limit} bytes of it at boot, so cut "
+                         f"{over} byte{'' if over == 1 else 's'}")
+    return size
+
+
+def unpack_layer(archive, root, prefix=(), boot_read_limit=None):
+    check_boot_read(archive, boot_read_limit)
     skipped = 0
     with tarfile.open(archive, "r:gz") as source:
         for member in source:
@@ -124,7 +144,8 @@ def assemble(images, root, extractor, layout):
     images = Path(images)
     skipped = 0
     for layer in layout["tar_layers"]:
-        skipped += unpack_layer(images / layer["file"], root, tuple(PurePosixPath(layer["root"]).parts[1:]))
+        limit = layer.get("max_boot_read_bytes") if layer.get("enforce_boot_read") else None
+        skipped += unpack_layer(images / layer["file"], root, tuple(PurePosixPath(layer["root"]).parts[1:]), limit)
     for layer in layout.get("squashfs_layers", []):
         mount = PurePosixPath(layer["root"]).relative_to("/")
         directory(root, tuple(mount.parts))

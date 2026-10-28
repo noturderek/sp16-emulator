@@ -7,20 +7,71 @@
     "stock_marker": "LIVESAMPLER",
     "images_dir": "images",
     "tar_layers": [
-      {"file": "rootfs1.tar.gz", "root": "/"},
-      {"file": "rootfs2.tar.gz", "root": "/"},
-      {"file": "rootfs3.tar.gz", "root": "/"},
-      {"file": "rootfs4.tar.gz", "root": "/"},
-      {"file": "pdj.tar.gz", "root": "/root"}
+      {
+        "file": "rootfs1.tar.gz",
+        "root": "/",
+        "max_boot_read_bytes": 3970596,
+        "enforce_boot_read": false
+      },
+      {
+        "file": "rootfs2.tar.gz",
+        "root": "/",
+        "max_boot_read_bytes": 2422834,
+        "enforce_boot_read": true
+      },
+      {
+        "file": "rootfs3.tar.gz",
+        "root": "/",
+        "max_boot_read_bytes": 3268503,
+        "enforce_boot_read": false
+      },
+      {
+        "file": "rootfs4.tar.gz",
+        "root": "/",
+        "max_boot_read_bytes": 1871918,
+        "enforce_boot_read": false
+      },
+      {
+        "file": "pdj.tar.gz",
+        "root": "/root",
+        "max_boot_read_bytes": 4561658,
+        "enforce_boot_read": true
+      }
     ],
     "squashfs_layers": [
-      {"file": "lib.sfs", "root": "/usr/lib"},
-      {"file": "bin.sfs", "root": "/usr/bin"},
-      {"file": "share.sfs", "root": "/usr/share"}
+      {
+        "file": "lib.sfs",
+        "root": "/usr/lib"
+      },
+      {
+        "file": "bin.sfs",
+        "root": "/usr/bin"
+      },
+      {
+        "file": "share.sfs",
+        "root": "/usr/share"
+      }
     ],
-    "revision_files": ["release.txt", "app.rev", "subucom1.rev", "subucom2.rev"],
-    "mount_points": ["/dev", "/proc", "/sys", "/tmp", "/root/data", "/mnt/emmc"]
+    "revision_files": [
+      "release.txt",
+      "app.rev",
+      "subucom1.rev",
+      "subucom2.rev"
+    ],
+    "mount_points": [
+      "/dev",
+      "/proc",
+      "/sys",
+      "/tmp",
+      "/root/data",
+      "/mnt/emmc"
+    ],
+    "boot_read_note": "max_boot_read_bytes is the length the unit's initramfs reads for that layer (rootfs2 from mtd5 offset 0x0800000, pdj from mtd6 offset 0). The stock 1.60 archives are exactly that long; enforce_boot_read refuses a longer one at import and at repack, because the unit would read only the first bytes."
   },
-  "app_candidates": ["/root/pdj/EP085_Main_R"],
-  "loader_candidates": ["/lib/ld-linux.so.3"]
+  "app_candidates": [
+    "/root/pdj/EP085_Main_R"
+  ],
+  "loader_candidates": [
+    "/lib/ld-linux.so.3"
+  ]
 }

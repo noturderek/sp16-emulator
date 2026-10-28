@@ -512,6 +512,14 @@ def read_request(fd):
     return json.loads(buffer.split(b"\n", 1)[0])
 
 
+def check_repacked_layer(path, layer):
+    """A repacked tar layer against the length the unit's initramfs reads at boot (prepare.check_boot_read), naming
+    the layer. Returns its size; refuses it when the layer is enforced and longer than the limit."""
+    import prepare
+    limit = layer.get("max_boot_read_bytes") if layer.get("enforce_boot_read") else None
+    return prepare.check_boot_read(path, limit, layer.get("file") or Path(path).name)
+
+
 def package_update(params):
     """Repacked update (D3, emulator only): base update + recipes -> deterministic ISO -> encrypted onto the output disk.
     The host appends the SP16MODLAB- trailer and CRC; this never produces a stock LIVESAMPLER marker."""
@@ -558,6 +566,7 @@ def package_update(params):
             before = sha256_file(source)
             target = Path(PKG_ROOT) / name
             rewrite_tar_gz(source, target, replacements, layer_prefix(descriptors[name]))
+            check_repacked_layer(target, descriptors[name])
             os.replace(target, source)
             layers[name] = {"base_sha256": before, "sha256": sha256_file(source)}
         manifest = {"schema": 1, "kind": "sp16-mod-update", "id": mod_id,
