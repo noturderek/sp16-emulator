@@ -22,6 +22,16 @@ int main(void) {
     uint8_t full[CAPACITY]; memset(full,1,sizeof full);
     enqueue(&wire,full,CAPACITY); enqueue(&wire,note,3);
     assert(wire.dropped==3 && wire.normal.size==CAPACITY);
+    assert(din_request(&wire,DIN_CAPACITY_REQUEST)==0);
+    assert(din_request(&wire,0)==-ENOSPC);
+    assert(transmit(&wire,fds[1],2000000)==0);
+    assert(transmit(&wire,fds[1],2320000)==1);
+    assert(din_request(&wire,DIN_CAPACITY_REQUEST)==1);
+    assert(din_request(&wire,0)==0);
+    assert(din_request(&wire,DIN_CAPACITY_REQUEST)==0);
+    assert(din_request(&wire,6)==-EINVAL);
+    assert(din_request(&wire,0xf20102ff)==-ENOSPC);
+    assert(din_request(&wire,0xf28102ff)==-EINVAL);
     close(fds[0]); close(fds[1]);
     puts("UART slots 320/640/960/1280 us; realtime priority; bounded queue: PASS");
     return 0;
