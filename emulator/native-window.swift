@@ -241,6 +241,10 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// Held for the life of the app: App Nap must not throttle a build without an audio sink (audio builds already
     /// take their own assertions). User-initiated tier, but idle system sleep stays allowed for a silent app.
     var panelActivity: NSObjectProtocol?
+    /// The research TX log (`tx-frames.jsonl`): the line is formatted and written on this serial queue, never on the
+    /// bridge reader thread, so a slow disk cannot stall panel-frame reception (pt-i44.78). Only this queue touches
+    /// `txLog`; `started` and `config` are immutable, so the timestamp needs no lock.
+    let txLogQueue = DispatchQueue(label: "sp16.native.txlog")
     var txLog: FileHandle?
     var lastCapture = 0.0
     let started = ProcessInfo.processInfo.systemUptime
@@ -873,16 +877,23 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         return "{\"error\":\"the guest could not mount \(path) (unsupported media?)\"}"
     }
 
+    /// Append one panel frame to the research TX log. The caller is the bridge reader thread: the timestamp is taken
+    /// here, before any lock and before the hop to `txLogQueue`, so `t` is when the frame arrived rather than when the
+    /// write finished; formatting and the disk write happen on `txLogQueue`. One reader thread and one serial queue keep
+    /// the lines in arrival order.
     func writeTxLog(_ frame: Data) {
         guard config.research == true else { return }
-        lock.lock(); defer { lock.unlock() }
-        if txLog == nil {
-            let path = config.session + "/tx-frames.jsonl"
-            FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
-            txLog = try? FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        let stamp = ProcessInfo.processInfo.systemUptime - started
+        let hex = frame.map { String(format: "%02x", $0) }.joined()
+        txLogQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.txLog == nil {
+                let path = self.config.session + "/tx-frames.jsonl"
+                FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
+                self.txLog = try? FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            }
+            self.txLog?.write(Data("{\"t\":\(stamp),\"hex\":\"\(hex)\"}\n".utf8))
         }
-        let line = "{\"t\":\(ProcessInfo.processInfo.systemUptime - started),\"hex\":\"\(frame.map { String(format: "%02x", $0) }.joined())\"}\n"
-        txLog?.write(Data(line.utf8))
     }
 
     // MARK: Display
@@ -1329,6 +1340,12 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         if let held = panelActivity { ProcessInfo.processInfo.endActivity(held); panelActivity = nil }
         audioSink?.stop()
         audioSink?.output?.stop()
+        // Flush the frames still queued for the TX log and close its handle: the session directory is left in place for
+        // diagnostics, and a half-written tail would be read as a truncated line by timing_probe.py.
+        txLogQueue.sync {
+            try? txLog?.close()
+            txLog = nil
+        }
         // Only the launcher-created IPC directory; diagnostic session files persist.
         let parent = URL(fileURLWithPath: config.socket).deletingLastPathComponent()
         if parent.path.hasPrefix("/tmp/sp16-") { try? FileManager.default.removeItem(at: parent) }
