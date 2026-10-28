@@ -24,10 +24,10 @@ def all_pass(ids=None):
 
 class CheckTableTests(unittest.TestCase):
     def test_table_matches_the_spec(self):
-        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 52)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 53)])
         self.assertEqual(list(hwsuite.SMOKE_IDS), SPEC_SMOKE)
         self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "L"], ["HW-44"])
-        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 52)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 53)])
 
     def test_tiers_and_only(self):
         self.assertEqual(hwsuite.select_checks("smoke"), SPEC_SMOKE)
@@ -37,7 +37,7 @@ class CheckTableTests(unittest.TestCase):
         self.assertEqual(hwsuite.select_checks("smoke", ["HW-02", "HW-05"]), ["HW-05"])
         # Extras stay out of full and core, and run by tier or by name.
         self.assertNotIn("HW-47", hwsuite.select_checks("full"))
-        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 52)])
+        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 53)])
         self.assertEqual(hwsuite.select_checks("full", ["HW-47", "HW-05"]), ["HW-05", "HW-47"])
         with self.assertRaises(ValueError):
             hwsuite.select_checks("full", ["HW-99"])
@@ -419,6 +419,100 @@ class TestmodePageTests(unittest.TestCase):
             runner = hwsuite.Runner(profile, profile_path, build, None, tmp, tmp, "extra", ["HW-47"])
             with self.assertRaises(hwsuite.EnvError):
                 runner.run()
+
+
+class ShotRegressionTests(unittest.TestCase):
+    """Runner.shot: the suite's own references, masks given as fractions, a heat map for a change."""
+
+    def setUp(self):
+        from PIL import Image
+        self.Image = Image
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())
+        import shotdiff
+        self.shotdiff = shotdiff
+        self.make = lambda mode: hwsuite.Runner(
+            self.profile, TOOLS / "profiles" / "sp16-1.60.json", root, None, root, root, "extra", ["HW-52"],
+            shots=shotdiff.ShotStore(root / "refs", root / "out", mode))
+        self.root = root
+
+    def shot(self, runner, name, image, masks=(), check="HW-52"):
+        runner.current_check = check
+        return runner.shot(name, image, masks)
+
+    def record(self, name, image, masks=(), status="PASS"):
+        """A recording run whose check ended `status`: the reference exists afterwards only if it passed."""
+        runner = self.make("record")
+        self.shot(runner, name, image, masks)
+        runner.finish_shots([hwsuite.verdict("HW-52", status, "x" if status != "PASS" else "")])
+        return runner
+
+    def test_off_means_no_result(self):
+        runner = hwsuite.Runner(self.profile, TOOLS / "profiles" / "sp16-1.60.json", self.root, None, self.root, self.root)
+        self.assertIsNone(runner.shot("home-lcd", self.Image.new("RGB", (10, 10))))
+
+    def test_a_reference_comes_only_from_a_check_that_passed(self):
+        image = self.Image.new("RGB", (200, 100), (30, 30, 30))
+        self.record("home-lcd", image, status="FAIL")
+        self.assertFalse((self.root / "refs" / "home-lcd.png").exists())
+        runner = self.record("home-lcd", image)
+        self.assertEqual(runner.notes["shots_promoted"], ["home-lcd"])
+        self.assertTrue((self.root / "refs" / "home-lcd.png").exists())
+
+    def test_comparing_without_a_reference_is_blocked_not_recorded(self):
+        result = self.shot(self.make("compare"), "home-lcd", self.Image.new("RGB", (200, 100)))
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("--shots record", result["observed"])
+        self.assertFalse((self.root / "refs").exists())
+
+    def test_a_change_fails_with_a_heat_map(self):
+        image = self.Image.new("RGB", (200, 100), (30, 30, 30))
+        self.record("home-lcd", image)
+        runner = self.make("compare")
+        self.assertEqual(self.shot(runner, "home-lcd", image)["status"], "PASS")
+        changed = image.copy()
+        changed.paste((255, 0, 0), (10, 10, 50, 30))
+        result = self.shot(runner, "home-lcd", changed)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("800 of 20000 pixels differ", result["observed"])
+        self.assertIn("heat map home-lcd-diff.png", result["observed"])
+        self.assertTrue((self.root / "out" / "home-lcd-diff.png").exists())
+
+    def test_a_mask_in_fractions_keeps_a_moving_region_out(self):
+        image = self.Image.new("RGB", (200, 100), (30, 30, 30))
+        masks = [hwsuite.PANEL_STATUS_MASK]
+        self.record("home-panel", image, masks)
+        changed = image.copy()
+        changed.paste((255, 255, 255), (0, 97, 200, 100))              # the status line counts frames
+        self.assertEqual(self.shot(self.make("compare"), "home-panel", changed, masks)["status"], "PASS")
+        changed.paste((255, 0, 0), (0, 0, 20, 20))
+        self.assertEqual(self.shot(self.make("compare"), "home-panel", changed, masks)["status"], "FAIL")
+
+    def test_the_result_file_and_a_report_carry_the_shots(self):
+        import types
+        image = self.Image.new("RGB", (200, 100), (30, 30, 30))
+        self.record("home-lcd", image)
+        runner = self.make("compare")
+        changed = image.copy()
+        changed.paste((255, 0, 0), (10, 10, 50, 30))
+        verdicts = [hwsuite.from_subresults("HW-52", [self.shot(runner, "home-lcd", changed)])]
+        args = types.SimpleNamespace(tier="extra", json_only=False)
+        runner.run_id, runner.fixture_hashes = "r", {}
+        result, _ = hwsuite.write_result(self.root / "result", runner, verdicts, "start", args, b"{}")
+        self.assertEqual(result["shots"]["entries"][0]["status"], "diff")
+        self.assertEqual(result["summary"]["counts"]["FAIL"], 1)
+        report = (self.root / "result" / "shots-report.md").read_text()
+        self.assertIn("| home-lcd | diff | 800 |", report)
+        self.assertTrue((self.root / "out" / "home-lcd-diff.png").exists())
+
+    def test_hw52_without_shots_is_n_a_with_a_precondition(self):
+        runner = hwsuite.Runner(self.profile, TOOLS / "profiles" / "sp16-1.60.json", self.root, None, self.root, self.root,
+                                "extra", ["HW-52"])
+        result = runner.hw52()
+        self.assertEqual(result["status"], "N/A")
+        self.assertTrue(result["reason"].startswith("precondition:"))
 
 
 class MarkVerifiedTests(unittest.TestCase):

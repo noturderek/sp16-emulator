@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-51 checks (HW-01..HW-51; HW-47..HW-51 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
+52 checks (HW-01..HW-52; HW-47..HW-52 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
@@ -140,12 +140,14 @@ CHECKS = [
     Check("HW-49", "Factory test", "Page 4: every button counts once (48 with a lamp, MODE and SHIFT: 50 of 50)", "X"),
     Check("HW-50", "Factory test", "Page 5: MASTER, DSF DRIVE and DSF HIGHPASS span 0-1023 and the strip 0-127", "X"),
     Check("HW-51", "Factory test", "Page 6: the six encoders and the push encoder count and report their state", "X"),
+    Check("HW-52", "Screenshots", "The settled home screen and the panel match the suite's own earlier captures", "X",
+          ["home.title_regex"], ["HW-01"]),
 ]
 TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51")
-EXTRA_IDS = ("HW-47",) + TESTMODE_IDS
+EXTRA_IDS = ("HW-47",) + TESTMODE_IDS + ("HW-52",)
 CHECK_BY_ID = {check.id: check for check in CHECKS}
 SMOKE_IDS = tuple(c.id for c in CHECKS if c.tier == "S")
-assert len(CHECKS) == 51 and len(SMOKE_IDS) == 16
+assert len(CHECKS) == 52 and len(SMOKE_IDS) == 16
 
 
 def checks_hash():
@@ -885,6 +887,14 @@ class Session:
         from PIL import Image
         return Image.open(self.snapshot(tag)).convert("RGB")
 
+    def panelshot(self, tag="panel"):
+        """The whole host panel view (buttons, lamps, knobs and the LCD) as it is drawn now."""
+        from PIL import Image
+        self.shots += 1
+        name = f"hw-{tag}-{self.shots:04d}"[:60] + ".png"
+        self.call(op="panelshot", name=name)
+        return Image.open(self.dir / name).convert("RGB")
+
     # --- TX lamps
     def txlog(self, on=True):
         return self.call(op="txlog", on=1 if on else 0)
@@ -1207,6 +1217,14 @@ TESTMODE_GAUGE_X, TESTMODE_OK_X = (502, 657), (662, 800)
 TESTMODE_ENCODER_ROWS = {"selector": 80, "selector_state": 116, **{f"knob{n}": 188 + 36 * (n - 1) for n in range(1, 7)}}
 
 
+# Regions that move on their own, as fractions (x0, y0, x1, y1) of the capture, left out of every comparison. The panel
+# view's bottom status line counts frames and acknowledgement times; the home LCD and panel are measured idle (two
+# captures of one session through shotdiff.compare) and add what is seen to move.
+PANEL_STATUS_MASK = (0.0, 0.955, 1.0, 1.0)
+HOME_LCD_MASKS = ()
+HOME_PANEL_MASKS = ()
+
+
 def testmode_counter(image, row, total):
     """n of `LABEL(n/total)` in a page 4 row, or None."""
     match = re.search(r"\((\d+)\s*/\s*%d\)" % total, ocr(image, row, psm=7, scale=3))
@@ -1425,12 +1443,14 @@ class Runner:
     stick and uncalibrated-control sessions the spec's section 5.4 describes."""
 
     def __init__(self, profile, profile_path, build, firmware_id, out, fixtures, tier="full", only=None,
-                 control_build=None, runtime=None, testmode_build=None, testmode_skip=()):
+                 control_build=None, runtime=None, testmode_build=None, testmode_skip=(), shots=None):
         self.p, self.profile_path = profile, Path(profile_path)
         self.build = Path(build) if build else None
         self.control_build = Path(control_build) if control_build else None
         self.testmode_build = Path(testmode_build) if testmode_build else None
         self.testmode_skip = tuple(testmode_skip)   # controls HW-49 leaves unpressed: its negative control
+        self.shots = shots                          # a shotdiff.ShotStore when --shots is on
+        self.current_check = None                   # the check whose method is running (owner of its captures)
         self.firmware_id = firmware_id
         self.out, self.fixtures = Path(out), Path(fixtures)
         self.tier, self.only = tier, only
@@ -3572,6 +3592,57 @@ class Runner:
                 stop(self.build, self.pid)
         return from_subresults("HW-47", subs, {"flag_seen": first is not None})
 
+    # ------------------------------------------------------------------ screenshot regression (--shots)
+    def shot(self, name, image, masks=()):
+        """Record or compare one capture against the suite's own reference (None when --shots is off). `masks` are
+        (x0, y0, x1, y1) fractions of the capture that move on their own. The result is a sub-result: a changed capture
+        fails, with its heat map written next to the report."""
+        if self.shots is None:
+            return None
+        import shotdiff
+        entry = self.shots.check(name, image, [shotdiff.Region(*mask) for mask in masks], self.current_check)
+        if entry["status"] == "recorded":
+            return sub(f"screenshot {name}", True, "staged as a reference if this check passes")
+        if entry["status"] == "missing":
+            return sub(f"screenshot {name}", False, entry["note"], blocked=True)
+        if entry["status"] == "size":
+            return sub(f"screenshot {name}", False, entry["note"])
+        return sub(f"screenshot {name}", entry["status"] == "match",
+                   f"{entry['changed']} of {entry['compared']} pixels differ ({entry['fraction']:.3%}), box {entry['bbox']}"
+                   + (f", heat map {Path(entry['heat_map']).name}" if entry.get("heat_map") else ""))
+
+    def shots_into(self, subs, name, image, masks=()):
+        result = self.shot(name, image, masks)
+        if result:
+            subs.append(result)
+
+    def panel_shot_into(self, subs, name, extra_masks=()):
+        """The whole panel view now (lamps, knobs, LCD), without its status line, against the reference `name`."""
+        if self.shots is not None:
+            self.shots_into(subs, name, self.session.panelshot("shot"), (PANEL_STATUS_MASK,) + tuple(extra_masks))
+
+    def hw52(self):
+        """The settled home screen, as the LCD and as the whole panel, in a fresh session of the main build."""
+        if self.shots is None:
+            return verdict("HW-52", "N/A", "precondition: no --shots (record or compare)")
+        stick = self.out / "hw-stick-shots.img"
+        payload, total = stick_image(fixture_wavs(), self.p["usb"]["sample_dir"])
+        write_sparse(stick, payload, total)
+        subs = []
+        try:
+            self.relaunch(stick, ephemeral=True)
+            time.sleep(2.0)
+            wait_settled(self.session, 3.0, 60)
+            self.shots_into(subs, "home-lcd", self.session.image("shot"), HOME_LCD_MASKS)
+            self.panel_shot_into(subs, "home-panel", HOME_PANEL_MASKS)
+        except (SessionLost, RuntimeError, OSError) as error:
+            subs.append(sub("the home screen was captured", False, f"{type(error).__name__}: {error}", blocked=True))
+        finally:
+            if self.session:
+                self.session.close()
+                stop(self.build, self.pid)
+        return from_subresults("HW-52", subs)
+
     # ------------------------------------------------------------------ HW-48..HW-51 factory test pages
     def testmode_checks(self):
         """HW-48..51 in one session of the testmode build (the main session is already stopped)."""
@@ -3623,12 +3694,15 @@ class Runner:
             image = s.image("page1")
             import numpy as np
             subs.append(sub("the LCD is white", testmode_page_of(image) == 1, f"darkest {np.asarray(image.convert('L')).min()}"))
+            self.shots_into(subs, "testmode-page1-lcd", image)
             for key, name, colour in (("track", "red", (full, 0, 0)), ("mute", "green", (0, full, 0)),
                                       ("slice", "blue", (0, 0, full)), ("scale", "white", (full, full, full))):
                 s.press(key, 0.4)
                 ok, lamps = self.lamps_until(lambda d: all(v == colour for v in d["rgb"].values()))
                 odd = sorted({v for v in lamps["rgb"].values() if v != colour})
                 subs.append(sub(f"{key.upper()} turns all 32 pad and step lamps {name}", ok, f"others {odd[:3]}"))
+                time.sleep(1.0)
+                self.panel_shot_into(subs, f"testmode-page1-{name}-panel")
             ok, lamps = self.lamps_until(lambda d: all(on for on, _ in d["mono"].values()))
             off = [ch for ch, (on, _) in lamps["mono"].items() if not on]
             subs.append(sub("every single-colour lamp channel is on", ok, f"dark channels {off}"))
@@ -3639,6 +3713,7 @@ class Runner:
             ok, lamps = self.lamps_until(lambda d: not any(any(v) for v in d["rgb"].values()) and not any(on for on, _ in d["mono"].values()))
             lit = [ch for ch, v in lamps["rgb"].items() if any(v)] + [f"m{ch}" for ch, (on, _) in lamps["mono"].items() if on]
             subs.append(sub("every lamp is off", ok, f"lit {lit[:8]}"))
+            self.panel_shot_into(subs, "testmode-page2-panel")
         return from_subresults("HW-48", subs)
 
     def hw49(self):
@@ -3681,6 +3756,9 @@ class Runner:
         subs.append(sub("LED-BUTTON reaches 48 of 48", led == 48, f"read {led}"))
         subs.append(sub("RESULT reaches 50 of 50", testmode_counter(image, TESTMODE_RESULT_ROW, 50) == 50,
                         f"read {testmode_counter(image, TESTMODE_RESULT_ROW, 50)}"))
+        self.shots_into(subs, "testmode-page4-lcd", image)
+        if not skip:
+            self.panel_shot_into(subs, "testmode-page4-panel")
         for label, row in (("LED-BUTTON", TESTMODE_LED_ROW), ("RESULT", TESTMODE_RESULT_ROW)):
             text = norm(ocr(image, row, psm=7, scale=3))
             subs.append(sub(f"{label} shows OK", re.search(r"\bOK\b", text) is not None, text))
@@ -3717,6 +3795,8 @@ class Runner:
             subs.append(sub(f"{label}: 1000 reads the top of 0-{full_scale}", reads[1000][0] >= 0.98, str(reads[1000][0])))
             subs.append(sub(f"{label}: the middle reads about half", abs(reads[500][0] - 0.5) <= 0.03, str(reads[500][0])))
             subs.append(sub(f"{label}: OK shows after both limits", reads[1000][1], f"after the top limit: {reads[1000][1]}"))
+        wait_settled(s, 1.5, 30)
+        self.shots_into(subs, "testmode-page5-lcd", s.image("p5"))
         s.event("strip", "release", 0)
         return from_subresults("HW-50", subs)
 
@@ -3752,6 +3832,8 @@ class Runner:
         s.event("selector", "release", 0)
         off = read("selector_state", "OFF")
         subs.append(sub("PUSH ENCODER STATUS is ON while pushed and OFF after", (on, off) == ("ON", "OFF"), f"{on}, {off}"))
+        wait_settled(s, 1.5, 30)
+        self.shots_into(subs, "testmode-page6-lcd", s.image("p6"))
         return from_subresults("HW-51", subs)
 
     # ------------------------------------------------------------------ HW-42, HW-44, HW-45, HW-24
@@ -3972,6 +4054,7 @@ class Runner:
             return
         t0 = time.monotonic()
         load = load_averages()
+        self.current_check = hw_id
         try:
             result = fn()
         except SessionLost as error:
@@ -4001,6 +4084,13 @@ class Runner:
             self.notes["project_reset"] = f"failed: {error}"
         except SessionLost as error:
             self.lost = str(error)
+
+    def finish_shots(self, verdicts):
+        """Record mode: the staged captures of checks that passed become the references."""
+        if self.shots is None or self.shots.mode != "record":
+            return
+        passed = {v["id"] for v in verdicts if v["status"] == "PASS"}
+        self.notes["shots_promoted"] = self.shots.promote({e["name"] for e in self.shots.entries if e["check"] in passed})
 
     def finish_multiphase(self):
         for hw in list(self.partial):
@@ -4078,6 +4168,8 @@ class Runner:
             self.record("HW-39", self.hw39)
         if not self.lost and self.need("HW-47"):
             self.record("HW-47", self.hw47)
+        if not self.lost and self.need("HW-52"):
+            self.record("HW-52", self.hw52)
         if not self.lost and any(self.need(hw) for hw in TESTMODE_IDS):
             self.testmode_checks()
         if "HW-24" in self.partial or self.need("HW-24"):
@@ -4098,7 +4190,9 @@ class Runner:
             if hw_id not in self.verdicts:
                 reason = f"session lost: {self.lost}" if self.lost else "not reached"
                 self.verdicts[hw_id] = verdict(hw_id, "BLOCKED", reason)
-        return [self.verdicts[hw] for hw in self.selected]
+        verdicts = [self.verdicts[hw] for hw in self.selected]
+        self.finish_shots(verdicts)
+        return verdicts
 
 
 # ------------------------------------------------------------------------------------------------- result files
@@ -4124,6 +4218,10 @@ def write_result(out, runner, verdicts, started, args, profile_bytes):
         "verdicts": verdicts,
         "summary": summarize(verdicts, args.tier, runner.only),
     }
+    if runner.shots is not None:
+        result["shots"] = {"mode": runner.shots.mode, "folder": str(runner.shots.folder), "entries": runner.shots.entries,
+                           "promoted": runner.notes.get("shots_promoted", [])}
+        (out / "shots-report.md").write_text(runner.shots.render_report())
     text = json.dumps(result, indent=1, default=str, sort_keys=False)
     (out / "hwsuite-result.json").write_text(text)
     os.chmod(out / "hwsuite-result.json", 0o600)
@@ -4182,6 +4280,16 @@ def main(argv=None):
                                                  "(HW-48..HW-51, extra tier)")
     parser.add_argument("--testmode-skip", default="", help="comma-separated controls HW-49 leaves unpressed: the "
                                                             "negative control, which must make that check fail")
+    parser.add_argument("--shots", choices=("record", "compare"), help="screenshot regression: record this run's LCD and "
+                                                                       "panel captures as the references, or compare "
+                                                                       "them with the references (a missing one is "
+                                                                       "recorded)")
+    parser.add_argument("--shots-dir", help="folder of reference captures (default private/hwsuite-shots/<firmware "
+                                            "version>, git-ignored: the captures show the firmware's screen)")
+    parser.add_argument("--shots-tolerance", type=int, default=None, help="largest per-channel difference that still "
+                                                                          "counts as equal (default 8)")
+    parser.add_argument("--shots-share", type=float, default=None, help="share of compared pixels allowed to differ "
+                                                                        "(default 0)")
     parser.add_argument("--fixtures", help="fixture directory (default <out>/fixtures)")
     parser.add_argument("--out", help="output directory (default <build>/hwsuite/<run id>)")
     parser.add_argument("--tier", choices=list(TIERS), default="full")
@@ -4229,9 +4337,16 @@ def main(argv=None):
         out = Path(args.out) if args.out else build / "hwsuite" / run_id
         out.mkdir(mode=0o700, parents=True, exist_ok=True)
         fixtures = Path(args.fixtures) if args.fixtures else out / "fixtures"
+        shots = None
+        if args.shots:
+            import shotdiff
+            folder = Path(args.shots_dir) if args.shots_dir else TOOLS.parent / "private" / "hwsuite-shots" / profile["firmware"]["version"]
+            shots = shotdiff.ShotStore(folder, out / "shots", args.shots,
+                                       shotdiff.DEFAULT_TOLERANCE if args.shots_tolerance is None else args.shots_tolerance,
+                                       shotdiff.DEFAULT_MAX_FRACTION if args.shots_share is None else args.shots_share)
         runner = Runner(profile, args.profile, build, args.firmware, out, fixtures, args.tier, only,
                         args.control_build, args.runtime, args.testmode_build,
-                        [x.strip() for x in args.testmode_skip.split(",") if x.strip()])
+                        [x.strip() for x in args.testmode_skip.split(",") if x.strip()], shots)
         runner.run_id = run_id
         runner.fixture_hashes = make_fixtures(fixtures, (profile.get("usb") or {}).get("sample_dir")
                                               or "PIONEER DJ SAMPLER/Samples")
