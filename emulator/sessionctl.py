@@ -339,7 +339,9 @@ def run_command(session, command, a):
             raise RuntimeError(f"standby needs the argument yes: {STANDBY_WARNING}")
         result = session.standby()
     elif command == "fault":
-        result = session.fault(a[:1] != ["off"])
+        if a != ["on"] and a != ["off"]:
+            raise RuntimeError("fault needs on|off")
+        result = session.fault(a[0] == "on")
     elif command == "monitor":
         if not a or a[0] not in ("MAIN", "PHONES", "OUT3-4", "OUT5-6", "OUT7-8"):
             raise RuntimeError("monitor needs MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8")

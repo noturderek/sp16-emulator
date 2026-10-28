@@ -1533,6 +1533,9 @@ final class PanelView: NSView, NSViewToolTipOwner {
         } catch {
             loadError = "\(error)"
         }
+        // A fault set while the layout was not loaded yet would have left the blink clock nil: start it now that the
+        // layout (and the WAKE UP control it names) is available. A no-op when no fault is on or the load failed.
+        startFaultClock()
         addSubview(toolbar)
         startBootClock()
         toolbar.latch.target = self; toolbar.latch.action = #selector(toolbarLatchChanged(_:))
@@ -1725,7 +1728,7 @@ final class PanelView: NSView, NSViewToolTipOwner {
 
     /// Repaints the WAKE UP lamp a few times a second while the fault state is on, so the blink is smooth.
     private func startFaultClock() {
-        guard faultClock == nil,
+        guard faultClock == nil, state.fault,
               let id = panelLayout?.controls.first(where: { $0.name == PanelRenderer.wakeUpName })?.id else { return }
         faultClock = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
             guard let self else { return }

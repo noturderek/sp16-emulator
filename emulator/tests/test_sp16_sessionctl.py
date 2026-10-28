@@ -276,11 +276,15 @@ class SessionctlTests(unittest.TestCase):
         self.assertEqual(session.fault(False), {"ok": True})
         self.assertEqual(app.received, [{"op": "fault", "on": True}, {"op": "fault", "on": False}])
 
-    def test_fault_on_the_command_line_defaults_to_on_and_accepts_off(self):
+    def test_fault_on_the_command_line_accepts_only_on_and_off(self):
         session = mock.Mock()
-        sessionctl.run_command(session, "fault", [])
+        sessionctl.run_command(session, "fault", ["on"])
         sessionctl.run_command(session, "fault", ["off"])
         self.assertEqual([c.args for c in session.fault.call_args_list], [(True,), (False,)])
+        for bad in ([], ["OF"], ["yes"], ["on", "off"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeError):
+                    sessionctl.run_command(session, "fault", bad)
 
     def test_monitor_sends_the_jack_name(self):
         app = self.app("answer")
