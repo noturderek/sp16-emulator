@@ -86,8 +86,9 @@ static void tx_capture(const struct spi_message *m) {
     struct sockaddr_un address={ .sun_family=AF_UNIX };
     strcpy(address.sun_path,path);
     if (sendto(tx_fd,out,8+m->bytes,MSG_DONTWAIT,(struct sockaddr *)&address,sizeof(address))<0) {
-        if (++tx_dropped==(tx_dropped&-tx_dropped))
-            fprintf(stderr,"[sp16-ui-stub] panel TX frames dropped=%lu errno=%d\n",tx_dropped,errno);
+        unsigned long dropped=++tx_dropped; /* logged at powers of two */
+        if (dropped==(dropped&-dropped))
+            fprintf(stderr,"[sp16-ui-stub] panel TX frames dropped=%lu errno=%d\n",dropped,errno);
     } else tx_sent++;
 }
 

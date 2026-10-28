@@ -108,7 +108,16 @@ final class AudioSink {
         self.writeFiles = writeFiles; self.output = output
     }
 
+    /// Held while the sink runs. A session in the background (bench mode starts the app with `open -g`) is otherwise
+    /// subject to App Nap, which delays every thread of the app, the panel port reader as well as this one, by tens to
+    /// hundreds of milliseconds: panel frames reached the host in bursts after gaps of up to 200 ms, and up to about one
+    /// audio packet in a hundred arrived more than 20 ms late. With the assertion held, a 60 s window had 0 or 1 panel-frame
+    /// gaps above 40 ms instead of 4 to 58. (The speaker output already takes one of its own; file-only builds had none.)
+    private var activity: NSObjectProtocol?
+
     func start() {
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
+                                                         reason: "SP16 audio and panel transport")
         // Receipt latency is measured here, so the reader must not wait behind other host work.
         let thread = Thread { [weak self] in self?.run() }
         thread.qualityOfService = .userInteractive
@@ -117,6 +126,7 @@ final class AudioSink {
 
     func stop() {
         lock.lock(); stopping = true; lock.unlock()
+        if let held = activity { ProcessInfo.processInfo.endActivity(held); activity = nil }
     }
 
     static func nowNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
