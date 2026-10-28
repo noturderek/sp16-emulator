@@ -463,6 +463,29 @@ class TestmodePageTests(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertIn("synthetic default", result["reason"])
 
+    def test_testmode_skip_names_must_be_controls_hw49_presses(self):
+        self.assertEqual(hwsuite.check_testmode_skip([]), ())
+        self.assertEqual(hwsuite.check_testmode_skip(["bar4", "pad16", "shift"]), ("bar4", "pad16", "shift"))
+        for name in hwsuite.TESTMODE_CONTROLS:
+            self.assertEqual(hwsuite.check_testmode_skip([name]), (name,))
+        with self.assertRaises(ValueError) as caught:
+            hwsuite.check_testmode_skip(["bar4", "bar44", "PLAY", "nothing-like-a-control"])
+        message = str(caught.exception)
+        self.assertIn("'bar44' (did you mean 'bar4'?)", message)
+        self.assertIn("'PLAY' (did you mean 'play'?)", message)          # a capital letter is a typo too
+        self.assertIn("'nothing-like-a-control'", message)
+        self.assertEqual(message.count("did you mean"), 2)               # 'bar4' is a control, so it is not named
+        self.assertIn("pad1..pad16, step1..step16, track", message)
+
+    def test_the_runner_refuses_an_unknown_control_to_skip(self):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        profile = json.loads(profile_path.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                hwsuite.Runner(profile, profile_path, tmp, None, tmp, tmp, "extra", ["HW-49"], testmode_skip=["bar44"])
+            runner = hwsuite.Runner(profile, profile_path, tmp, None, tmp, tmp, "extra", ["HW-49"], testmode_skip=["bar4"])
+        self.assertEqual(runner.testmode_skip, ("bar4",))
+
     def test_extras_without_a_testmode_build_are_n_a_with_a_precondition(self):
         profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())
         with tempfile.TemporaryDirectory() as tmp:
@@ -785,6 +808,17 @@ class CliTests(unittest.TestCase):
         with mock.patch("sys.stderr"):   # accepted, so it goes on to the next usage error: no profile or build
             code = hwsuite.main(["--shots", "compare", "--shots-tolerance", "254", "--shots-share", "0.5"])
         self.assertEqual(code, hwsuite.EXIT_ENV)
+
+    def test_an_unknown_control_to_skip_is_rejected_by_the_parser(self):
+        code, message = self.rejected("--testmode-skip", "bar4,bar44")
+        self.assertEqual(code, 2)
+        self.assertIn("argument --testmode-skip: unknown control to skip: 'bar44' (did you mean 'bar4'?)", message)
+
+    def test_the_skipped_controls_are_split_and_trimmed_by_the_parser(self):
+        self.assertEqual(hwsuite.testmode_skip_arg(" bar4 , pad3,,"), ["bar4", "pad3"])
+        self.assertEqual(hwsuite.testmode_skip_arg(""), [])
+        with mock.patch("sys.stderr"):   # accepted, so it goes on to the next usage error: no profile or build
+            self.assertEqual(hwsuite.main(["--testmode-skip", "bar4,pad3"]), hwsuite.EXIT_ENV)
 
     def test_usage_errors_exit_3(self):
         with mock.patch("sys.stderr"):

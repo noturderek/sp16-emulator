@@ -1209,6 +1209,23 @@ TESTMODE_LED_BUTTONS = ([f"pad{n}" for n in range(1, 17)] + [f"step{n}" for n in
                         ["track", "mute", "slice", "scale", "rec", "stop", "play", "hold", "scene", "pattern",
                          "bar1", "bar2", "bar3", "bar4", "active", "usb_stop"])
 TESTMODE_PLAIN_BUTTONS = ["mode", "shift"]
+TESTMODE_CONTROLS = tuple(TESTMODE_LED_BUTTONS + TESTMODE_PLAIN_BUTTONS)
+
+
+def check_testmode_skip(names):
+    """The controls HW-49 is told to leave unpressed (`--testmode-skip`) must be controls it presses: a misspelt name
+    would skip nothing, and the check would pass while reporting that control as skipped. Returns them as a tuple."""
+    names = tuple(names)
+    unknown = [name for name in names if name not in TESTMODE_CONTROLS]
+    if unknown:
+        import difflib
+        hint = "; ".join(f"{name!r}" + (f" (did you mean {close[0]!r}?)" if close else "")
+                         for name in unknown for close in [difflib.get_close_matches(name.lower(), TESTMODE_CONTROLS, n=1)])
+        raise ValueError(f"unknown control to skip: {hint}. The controls are pad1..pad16, step1..step16, "
+                         + ", ".join(TESTMODE_CONTROLS[32:]))
+    return names
+
+
 TESTMODE_LED_ROW, TESTMODE_RESULT_ROW = (400, 62, 800, 100), (400, 170, 800, 206)
 # Page 5 (AD test): gauge rows (a bar that fills left to right, its value inside it) and a red OK once both limits
 # were reached; the box is the gauge, the OK sits right of it.
@@ -1482,7 +1499,7 @@ class Runner:
         self.build = Path(build) if build else None
         self.control_build = Path(control_build) if control_build else None
         self.testmode_build = Path(testmode_build) if testmode_build else None
-        self.testmode_skip = tuple(testmode_skip)   # controls HW-49 leaves unpressed: its negative control
+        self.testmode_skip = check_testmode_skip(testmode_skip)   # controls HW-49 leaves unpressed: its negative control
         self.shots = shots                          # a shotdiff.ShotStore when --shots is on
         self.current_check = None                   # the check whose method is running (owner of its captures)
         self.firmware_id = firmware_id
@@ -4409,6 +4426,14 @@ def shots_share_arg(text):
         raise argparse.ArgumentTypeError(f"{text!r} is not a number from 0 up to, but not including, 1") from None
 
 
+def testmode_skip_arg(text):
+    """argparse type of --testmode-skip: comma-separated control names HW-49 presses, else a usage error."""
+    try:
+        return list(check_testmode_skip(x.strip() for x in text.split(",") if x.strip()))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--runtime", help="runtime.json of a running research session (--audio file) to use as the "
@@ -4420,8 +4445,9 @@ def main(argv=None):
     parser.add_argument("--testmode-build", help="build made with --app-arg testmode, for the factory test page checks "
                                                  "(HW-48..HW-51 and HW-53, extra tier); its firmware must be the "
                                                  "profile's, or the run is refused")
-    parser.add_argument("--testmode-skip", default="", help="comma-separated controls HW-49 leaves unpressed: the "
-                                                            "negative control, which must make that check fail")
+    parser.add_argument("--testmode-skip", type=testmode_skip_arg, default=[],
+                        help="comma-separated controls HW-49 leaves unpressed (pad1..pad16, step1..step16, track, mode, "
+                             "...): the negative control, which must make that check fail")
     parser.add_argument("--shots", choices=("record", "compare"), help="screenshot regression: record stages this run's "
                                                                        "LCD and panel captures and keeps those of checks "
                                                                        "that passed as the references; compare checks "
@@ -4489,8 +4515,7 @@ def main(argv=None):
                                        shotdiff.DEFAULT_TOLERANCE if args.shots_tolerance is None else args.shots_tolerance,
                                        shotdiff.DEFAULT_MAX_FRACTION if args.shots_share is None else args.shots_share)
         runner = Runner(profile, args.profile, build, args.firmware, out, fixtures, args.tier, only,
-                        args.control_build, args.runtime, args.testmode_build,
-                        [x.strip() for x in args.testmode_skip.split(",") if x.strip()], shots)
+                        args.control_build, args.runtime, args.testmode_build, args.testmode_skip, shots)
         runner.run_id = run_id
         runner.fixture_hashes = make_fixtures(fixtures, (profile.get("usb") or {}).get("sample_dir")
                                               or "PIONEER DJ SAMPLER/Samples")
