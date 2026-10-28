@@ -1,3 +1,18 @@
+---
+title: Audio input injection and the output jack map
+description: How to play a WAV into the emulated input jack, which master channel feeds which output jack, and the API an output monitor needs.
+type: reference
+status: active
+created: 2026-10-27
+tags: [sp16, emulator, audio]
+author:
+  harness: claude-code
+  agent: emu-l2-audio-timing
+  model: claude-sonnet-5-5
+  thinking: max
+  tokens: unknown
+---
+
 # Audio input injection and the output jack map
 
 What reaches which jack, how to feed audio into the input, and the API an output monitor needs. Grades: **O**
