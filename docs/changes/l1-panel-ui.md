@@ -1,3 +1,18 @@
+---
+title: "Lane L1: panel UI"
+description: "What lane L1 changed in the SP-16 emulator panel and app windows, how to use it, measurements and cross-lane requests."
+type: report
+status: active
+created: 2026-10-27
+tags: [sp16, emulator, panel, lane-l1]
+author:
+  harness: claude-code
+  agent: emu-l1-panel-ui
+  model: claude-sonnet-5-5
+  thinking: unknown
+  tokens: unknown
+---
+
 # Lane L1: panel UI
 
 Files owned: `emulator/panel-view.swift`, `emulator/panel-layout.json`, `emulator/native-window.swift`,
