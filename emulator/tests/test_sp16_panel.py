@@ -987,5 +987,54 @@ class BenchModeInputGateTests(unittest.TestCase):
         self.assertIn("if !uiInputDisabled { NSApp.activate(ignoringOtherApps: true) }", source)
 
 
+# Exercises the two independent dark-panel overlays (standby via setPanelDark, fault via setFault) in every order and
+# reads back the combined flags, so a fault during standby and standby during a fault each survive the other.
+OVERLAY_HARNESS = r"""import AppKit
+
+let panel = PanelView(layoutURL: URL(fileURLWithPath: CommandLine.arguments[1]))
+func flags() -> String { "\(panel.overlayFlags.standby ? 1 : 0)\(panel.overlayFlags.fault ? 1 : 0)" }
+var results: [String: String] = [:]
+func run(_ name: String, _ body: () -> Void) {
+    panel.setPanelDark(false)
+    panel.setFault(false)
+    body()
+    results[name] = flags()
+}
+run("standby_then_fault") { panel.setPanelDark(true); panel.setFault(true) }
+run("fault_then_standby") { panel.setFault(true); panel.setPanelDark(true) }
+run("fault_only") { panel.setFault(true) }
+run("standby_only") { panel.setPanelDark(true) }
+run("fault_clear_keeps_standby") { panel.setPanelDark(true); panel.setFault(true); panel.setFault(false) }
+run("standby_clear_keeps_fault") { panel.setFault(true); panel.setPanelDark(true); panel.setPanelDark(false) }
+run("both_clear") { panel.setFault(true); panel.setPanelDark(true); panel.setPanelDark(false); panel.setFault(false) }
+print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+"""
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"), "macOS swiftc required")
+class OverlayOrderTests(unittest.TestCase):
+    """Standby and fault are independent overlays: any order of setting/clearing ends in the same drawn state."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as work:
+            main = Path(work) / "main.swift"
+            main.write_text(OVERLAY_HARNESS)
+            binary = Path(work) / "harness"
+            subprocess.run(["swiftc", main, TOOLS / "panel-view.swift", "-o", binary], check=True, capture_output=True)
+            output = subprocess.run([binary, TOOLS / "panel-layout.json"], check=True, capture_output=True, text=True,
+                                    timeout=60).stdout
+        cls.report = json.loads(output)
+
+    def test_every_fault_standby_order_ends_in_the_same_drawn_state(self):
+        self.assertEqual(self.report["standby_then_fault"], "11")
+        self.assertEqual(self.report["fault_then_standby"], "11")   # the same combined state, either order
+        self.assertEqual(self.report["fault_only"], "01")
+        self.assertEqual(self.report["standby_only"], "10")
+        self.assertEqual(self.report["fault_clear_keeps_standby"], "10")   # clearing one leaves the other
+        self.assertEqual(self.report["standby_clear_keeps_fault"], "01")
+        self.assertEqual(self.report["both_clear"], "00")
+
+
 if __name__ == "__main__":
     unittest.main()

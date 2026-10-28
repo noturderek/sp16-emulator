@@ -1724,6 +1724,10 @@ final class PanelView: NSView, NSViewToolTipOwner {
         needsDisplay = true
     }
 
+    /// The two independent dark-panel overlay flags: standby (panelDark) and fault. Drawing combines them, so the order
+    /// they are set never changes the drawn state; exposed for the fault/standby order tests.
+    var overlayFlags: (standby: Bool, fault: Bool) { (state.panelDark, state.fault) }
+
     private var faultClock: Timer?
 
     /// Repaints the WAKE UP lamp a few times a second while the fault state is on, so the blink is smooth.

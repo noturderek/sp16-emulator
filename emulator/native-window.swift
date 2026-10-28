@@ -51,6 +51,9 @@ var uiInputDisabled = false
 var audioFilesDisabled = false
 /// True when this launch attached a virtual USB stick (`--usb-image`): the QMP socket and the hot-plug path exist.
 var usbImageAttached = false
+/// The backing image of the currently attached virtual USB stick, so a failed hot-swap can re-attach it. Set at launch
+/// and updated on every successful swap.
+var currentUSBImagePath: String?
 
 /// Host <-> guest message kinds; see protocol.py for the authoritative description.
 enum Kind {
@@ -141,6 +144,14 @@ enum QMP {
         return false
     }
 
+    /// Add the file/raw block nodes for `imagePath` and plug the virtio-blk device back onto its root port.
+    static func addUSB(_ fd: Int32, imagePath: String) throws {
+        try command(fd, "blockdev-add", ["driver": "file", "filename": imagePath, "node-name": "sp16usb-file"])
+        try command(fd, "blockdev-add", ["driver": "raw", "file": "sp16usb-file", "node-name": "sp16usb"])
+        try command(fd, "device_add", ["driver": "virtio-blk-pci", "drive": "sp16usb", "serial": "sp16usb",
+                                       "id": "sp16usb-dev", "bus": "sp16usb-port"])
+    }
+
     /// Swap the virtual USB stick's backing image for `imagePath` in one QMP session: unplug the device (waiting for
     /// the guest's acknowledgement), drop the old block nodes, add the new file and format nodes, plug the new device.
     static func swapUSB(socketPath: String, imagePath: String) throws {
@@ -154,10 +165,23 @@ enum QMP {
         }
         try command(fd, "blockdev-del", ["node-name": "sp16usb"])
         try command(fd, "blockdev-del", ["node-name": "sp16usb-file"])
-        try command(fd, "blockdev-add", ["driver": "file", "filename": imagePath, "node-name": "sp16usb-file"])
-        try command(fd, "blockdev-add", ["driver": "raw", "file": "sp16usb-file", "node-name": "sp16usb"])
-        try command(fd, "device_add", ["driver": "virtio-blk-pci", "drive": "sp16usb", "serial": "sp16usb",
-                                       "id": "sp16usb-dev", "bus": "sp16usb-port"])
+        try addUSB(fd, imagePath: imagePath)
+    }
+
+    /// Re-attach the previous stick after a failed swap. The failed swap left the device and block nodes in some
+    /// unknown part-removed state, so remove whatever remains (a missing device or node is not an error) and then add
+    /// the old image back. Throws when even the restore fails, which hotAttachUSB reports as a retryable state.
+    static func restoreUSB(socketPath: String, imagePath: String) throws {
+        let fd = try connect(socketPath)
+        defer { close(fd) }
+        _ = readLine(fd)
+        try command(fd, "qmp_capabilities", [:])
+        if (try? command(fd, "device_del", ["id": "sp16usb-dev"])) != nil {
+            _ = waitDeviceDeleted(fd, id: "sp16usb-dev", timeout: 5)
+        }
+        _ = try? command(fd, "blockdev-del", ["node-name": "sp16usb"])
+        _ = try? command(fd, "blockdev-del", ["node-name": "sp16usb-file"])
+        try addUSB(fd, imagePath: imagePath)
     }
 }
 
@@ -814,11 +838,26 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         if ejectResult == "usb-busy" {
             return "{\"error\":\"usb stick is busy; eject it first\"}"
         }
+        let oldImage = currentUSBImagePath
         do { try QMP.swapUSB(socketPath: config.socket + ".qmp", imagePath: path) }
         catch {
+            // The swap can fail after device_del/blockdev-del, leaving the VM with no USB device. Re-add the old stick
+            // so the session is not left without one; if that too fails, report the retryable state honestly.
             AppLog.log("usb hot attach: QMP swap failed: \(error)")
-            return "{\"error\":\"QMP swap failed: \(error)\"}"
+            var message = "QMP swap failed: \(error)"
+            if let oldImage = oldImage {
+                do {
+                    try QMP.restoreUSB(socketPath: config.socket + ".qmp", imagePath: oldImage)
+                    AppLog.log("usb hot attach: re-attached the previous stick")
+                    message += "; re-attached the previous stick"
+                } catch {
+                    AppLog.log("usb hot attach: could not re-attach the previous stick: \(error)")
+                    message += "; could not re-attach the previous stick either (retry ctl usb attach)"
+                }
+            }
+            return "{\"error\":\"\(message)\"}"
         }
+        currentUSBImagePath = path
         guard let result = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-attach",
                                                     until: ["usb-attached", "usb-error"], timeout: 30) else {
             return "{\"error\":\"usb attach got no reply from the guest\"}"
@@ -1233,7 +1272,8 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         // Bounded exit: the 2026-10-27 hang wedged teardown after a clean guest stop and ignored further SIGTERMs.
         // Whatever blocks (a slow clean stop, a stuck `waitUntilExit`, or a reply the run loop never services), the
         // app must be gone inside the acceptance window (10 s). The clean stop is 5 s and the terminate ladder 3 s,
-        // so 9 s only ever fires on a hang, never on a slow-but-complete quit.
+        // so 9 s fires on a hang; on a very slow host it can also fire while a clean stop is still syncing, cutting
+        // it short rather than letting the app outlive the window.
         DispatchQueue.global().asyncAfter(deadline: .now() + 9) { [weak self] in
             guard let self = self else { return }
             AppLog.log("quit: teardown still running at the 9 s bound; forcing exit")
@@ -1316,6 +1356,7 @@ func attachData(_ config: Configuration, ephemeral: Bool, usbImage: String? = ni
         if let usb = usbImage {
             try DataImage.validateUSBImage(usb)
             usbImageAttached = true
+            currentUSBImagePath = usb
             // Virtual USB stick, on a PCIe root port so its backing image can be hot-swapped while QEMU runs
             // (virtio-mmio does not hot-plug). The guest recognises it by serial `sp16usb`; QMP over the session
             // socket drives the swap (`ctl usb attach PATH`).
