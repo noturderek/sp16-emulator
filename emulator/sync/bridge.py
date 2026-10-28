@@ -56,8 +56,10 @@ class ClockEmitter:
 
     def start(self) -> None:
         """Start the clock thread. A second start while the thread is running is a no-op: a second thread would
-        double the pulse rate (48 instead of 24 PPQN). After `stop()` the emitter can be started again."""
-        if self._thread is not None:
+        double the pulse rate (48 instead of 24 PPQN). After `stop()` the emitter can be started again, and so it
+        can after the worker died on a sink that raised: the guard is liveness, not the presence of a Thread object,
+        which stays behind when the worker exits."""
+        if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
