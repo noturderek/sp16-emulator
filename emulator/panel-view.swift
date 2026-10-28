@@ -242,6 +242,8 @@ struct PanelRenderState {
     var stripTouch: Int?
     var lcdImage: CGImage?
     var debugOverlay = false
+    var bootStage = "Starting the virtual machine"   // shown on the dark LCD until the first firmware frame
+    var bootSeconds = 0
     var bloom = true                    // additive glow around lit keys, buttons and LEDs
 
     func look(_ id: UInt8) -> LampLook {
@@ -1040,10 +1042,24 @@ final class PanelRenderer {
             ctx.draw(image, in: r)
         } else {
             ctx.restoreGState(); ctx.saveGState()
-            drawText("Waiting for OEM LCD frame", at: CGPoint(x: r.midX, y: r.midY), size: max(10, r.width / 40), weight: .regular,
-                     color: hexColor(0x6b6d72))
+            drawBootOverlay(ctx, in: r, stage: state.bootStage, seconds: state.bootSeconds)
         }
         ctx.restoreGState()
+    }
+
+    /// Shown on the dark LCD until the firmware's first frame arrives: what the emulator is doing and for how long, with an
+    /// indeterminate bar, instead of a bare "waiting" line.
+    private func drawBootOverlay(_ ctx: CGContext, in r: CGRect, stage: String, seconds: Int) {
+        let size = max(11, r.width / 34)
+        drawText("SP-16 EMULATOR", at: CGPoint(x: r.midX, y: r.midY - size * 2.6), size: size * 0.8, weight: .semibold, color: hexColor(0x6b6d72),
+                 tracking: 2)
+        drawText(stage + "…", at: CGPoint(x: r.midX, y: r.midY - size * 0.6), size: size, weight: .regular, color: hexColor(0xd7d9dd))
+        let bar = CGRect(x: r.midX - r.width * 0.22, y: r.midY + size * 0.9, width: r.width * 0.44, height: 4)
+        ctx.fill(path: roundedPath(bar, 2), color: hexColor(0x2a2c30))
+        let t = CGFloat(seconds % 3) / 3
+        let seg = CGRect(x: bar.minX + (bar.width * 0.7) * t, y: bar.minY, width: bar.width * 0.3, height: bar.height)
+        ctx.fill(path: roundedPath(seg, 2), color: hexColor(0x4aa3ff))
+        drawText("\(seconds) s", at: CGPoint(x: r.midX, y: r.midY + size * 2.2), size: size * 0.75, weight: .regular, color: hexColor(0x6b6d72))
     }
 
     private func drawControlDynamic(_ ctx: CGContext, _ c: PanelLayout.Control, _ st: PanelRenderState, _ s: CGFloat) {
@@ -1486,6 +1502,7 @@ final class PanelView: NSView, NSViewToolTipOwner {
             loadError = "\(error)"
         }
         addSubview(toolbar)
+        startBootClock()
         toolbar.latch.target = self; toolbar.latch.action = #selector(toolbarLatchChanged(_:))
         toolbar.velocity.target = self; toolbar.velocity.action = #selector(toolbarVelocityChanged(_:))
         toolbar.releaseAll.target = self; toolbar.releaseAll.action = #selector(toolbarReleaseAll(_:))
@@ -1619,6 +1636,25 @@ final class PanelView: NSView, NSViewToolTipOwner {
         state.lamps = lamps
         state.feedbackLive = live
         if liveChanged { needsDisplay = true } else { invalidate(changed) }
+    }
+
+    /// What the guest is doing before the first LCD frame (host-side knowledge only: VM started, bridge connected, ...).
+    func setBootStage(_ stage: String) {
+        guard state.lcdImage == nil, stage != state.bootStage else { return }
+        state.bootStage = stage
+        setNeedsDisplay(lcdFrame)
+    }
+
+    private var bootClock: Timer?
+    private let bootBegan = ProcessInfo.processInfo.systemUptime
+
+    /// One tick a second while there is no LCD image; stops by itself at the first frame, so a running panel has no timer.
+    private func startBootClock() {
+        bootClock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self, self.state.lcdImage == nil else { timer.invalidate(); self?.bootClock = nil; return }
+            self.state.bootSeconds = Int(ProcessInfo.processInfo.systemUptime - self.bootBegan)
+            self.setNeedsDisplay(self.lcdFrame)
+        }
     }
 
     func setStatus(_ text: String) {

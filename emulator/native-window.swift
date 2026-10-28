@@ -175,6 +175,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         AppLog.log("QEMU started pid=\(process.processIdentifier)")
         startQEMUReaper()
         panel.setStatus("Starting native QEMU…")
+        panel.setBootStage("Starting the virtual machine")
         if let audio = config.audio {
             // "file": a WAV per playback stream. "coreaudio": host output only. "both": the two.
             // Optional ":<device UID>" or ":offline:<wav>[:rate[:ppm[:block]]]" follows the mode; no UID = system default.
@@ -458,6 +459,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             Darwin.close(fd); return
         }
         AppLog.log("bridge: connected")
+        DispatchQueue.main.async { [weak self] in self?.panel.setBootStage("Booting the firmware") }
         lock.lock(); socketFD = fd; lock.unlock()
         defer {
             writeQueue.sync {
@@ -560,6 +562,21 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         DispatchQueue.main.async { [weak self] in self?.renderLatest() }
     }
 
+    var screenSeen = false
+
+    /// True when a sample of the 800 x 480 BGRX frame has a non-black pixel (every 97th pixel: cheap, and only run
+    /// until the first real screen).
+    static func hasContent(_ pixels: Data) -> Bool {
+        pixels.withUnsafeBytes { raw in
+            var offset = 0
+            while offset + 3 < raw.count {
+                if raw[offset] | raw[offset + 1] | raw[offset + 2] != 0 { return true }
+                offset += 97 * 4
+            }
+            return false
+        }
+    }
+
     func makeImage(_ pixels: Data) -> CGImage? {
         guard let provider = CGDataProvider(data: pixels as CFData) else { return nil }
         return CGImage(width: 800, height: 480, bitsPerComponent: 8, bitsPerPixel: 32,
@@ -577,6 +594,15 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         visiblePending.removeAll()
         lock.unlock()
         guard let pixels = pixels, let image = makeImage(pixels) else { return }
+        if !screenSeen {
+            // The firmware sends black frames while it boots: keep the boot overlay until a frame has something on it.
+            guard Self.hasContent(pixels) else {
+                panel.setBootStage("Waiting for the firmware's first screen")
+                frameCount += 1
+                return
+            }
+            screenSeen = true
+        }
         panel.setLCD(image)
         frameCount += 1
         updateStatus()
