@@ -98,9 +98,34 @@ cases; new: the helper's three families, its unknown-port fallback and its short
 hand-built 54-byte SP-16 keep-alive plus `fake_master`'s beat and status packets fed to both `segment_watch.describe()`
 and the master's `keepalive_line()`/`frame_name()` in `test_sp16_segment`); `Q` **445/445 OK**; `git diff --check`
 exit 0. Not run: the live `--net mcast` re-capture (the decode is now covered by golden-layout unit tests, and the
-segment path itself was unchanged by this round). Note: `python3 emulator/net/segment_master.py --help` raises
+segment path itself was unchanged by this round). Note: `python3 emulator/net/segment_master.py --help` raised
 `TypeError: must be real number, not dict` from argparse on this branch and on `0d4628a` before it; pre-existing and
-outside this round's two findings, left untouched.
+outside that round's two findings, fixed in fix round 2 below.
+
+### Fix round 2
+
+**`pt-i44.39`, blocking — one commit, `emulator/net/segment_master.py`, new
+`emulator/tests/test_sp16_net_tools_help.py`.** `segment_master.py`'s `--pitch` help text read `2 % fast`; argparse
+runs every help/description/epilog string through `%` formatting with the action's fields as the operand, so the bare
+`%` raised `TypeError: must be real number, not dict` and `python3 emulator/net/segment_master.py --help` exited 1
+instead of printing help. Escaped to `2 %% fast`, which is what `fake_master.py` already did. Every other
+argparse-formatted string under `emulator/net/` (all of `segment.py`, `segment_relay.py`, `segment_watch.py`,
+`fake_master.py`, and the two `diag/` modules, which have no argparse at all) was checked and contains no bare `%`.
+
+The new module guards the whole directory instead of the one string: one case runs
+`python3 <tool> --help` for every `emulator/net/*.py` and requires exit 0 with an empty stderr (a 60 s timeout, so a
+future long-lived server cannot wedge the suite); a second requires the four tools with a `__main__` block
+(`fake_master`, `segment_master`, `segment_relay`, `segment_watch`) to print a `usage:` line; a third parses each file
+with `ast` and re-applies argparse's own `string % params` to every `help=`/`description=`/`epilog=`/`usage=`/`metavar=`
+constant, failing on the exception argparse would raise — so a new bare `%` is caught without running the tool. The
+static case was confirmed against the old text (it raises) and the tool itself was confirmed to exit 1 before the fix
+and 0 after it.
+
+Checks: `python3 -m unittest emulator.tests.test_sp16_net_tools_help` **3/3 OK**;
+`python3 emulator/net/segment_master.py --help` exit **0**; `emulator.tests.test_sp16_segment`,
+`emulator.tests.test_sp16_segment_relay`, `emulator.tests.test_sp16_net` **36/36 OK**; `Q` **445/445 OK**;
+`git diff --check` exit 0. Not run: `./sp16 build`, `./sp16 run` and the live `--net mcast` capture — this round
+touches a help string and a test module only, neither of which the emulator loads, so no build or boot was made.
 
 ## Side effects
 

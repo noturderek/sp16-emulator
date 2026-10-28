@@ -60,7 +60,7 @@ def main(argv=None):
     parser.add_argument("--group", default=GROUP)
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--bpm", type=float, default=128.0)
-    parser.add_argument("--pitch", type=float, default=0.0, help="pitch in percent (+2 = 2 % fast)")
+    parser.add_argument("--pitch", type=float, default=0.0, help="pitch in percent (+2 = 2 %% fast)")
     parser.add_argument("--player", type=int, default=1)
     parser.add_argument("--name", default="CDJ-3000")
     parser.add_argument("--duration", type=float, default=0.0, help="stop after this many seconds")
