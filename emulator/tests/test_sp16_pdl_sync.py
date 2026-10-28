@@ -1,34 +1,23 @@
 """emulator/sync/pdl_sync.py: Pro DJ Link tempo -> MIDI clock and Ableton Link (Carabiner)."""
-import socket
-import struct
 import unittest
 from pathlib import Path
 import sys
 
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
+sys.path.insert(0, str(TOOLS / "net"))
 import sync.pdl_sync as pdl  # noqa: E402
+import fake_master  # noqa: E402
 
 
 def beat_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1):
-    packet = bytearray(96)
-    packet[0:10] = pdl.MAGIC
-    packet[0x0a] = 0x28
-    struct.pack_into(">IHHBHB", packet, 0x54, int(round((1 + pitch_frac) * pdl.PITCH_SCALE)), 0,
-                     int(round(bpm * 100)), beat_in_bar, 0, 1)
-    return bytes(packet)
+    """A master 0x28 beat packet built by the shared packet builder (net/fake_master.py), not by hand."""
+    return fake_master.beat_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, 100)
 
 
 def status_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1, beat_count=0, playing=True):
-    packet = bytearray(212)
-    packet[0:10] = pdl.MAGIC
-    packet[0x0a] = 0x0a
-    packet[0x89] = 0x84 | (0x40 if playing else 0) | 0x20 | 0x10 | 0x08
-    struct.pack_into(">I", packet, 0x8c, int(round((1 + pitch_frac) * pdl.PITCH_SCALE)))
-    struct.pack_into(">H", packet, 0x92, int(round(bpm * 100)))
-    struct.pack_into(">I", packet, 0xa0, beat_count)
-    packet[0xa6] = beat_in_bar
-    return bytes(packet)
+    """A master 0x0a status packet built by the shared packet builder, not by hand."""
+    return fake_master.status_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, beat_count, playing)
 
 
 class TempoTests(unittest.TestCase):
@@ -82,6 +71,13 @@ class CarabinerTests(unittest.TestCase):
         self.assertEqual(pdl.CarabinerLink.force_beat_at_time_message(1.0, 12345678, 4),
                          b"force-beat-at-time 1.000000 12345678 4\n")
 
+    def test_parse_status_reply(self):
+        self.assertEqual(pdl.CarabinerLink.parse_status(b"{:peers 1 :bpm 120.0 :start 5082765300 :beat 3.0}"),
+                         {"peers": 1, "bpm": 120.0, "start": 5082765300, "beat": 3.0})
+
+    def test_parse_status_refuses_an_incomplete_reply(self):
+        self.assertIsNone(pdl.CarabinerLink.parse_status(b"{:peers 1 :bpm 120.0}"))
+
 
 class BridgeTests(unittest.TestCase):
     def test_bridge_retunes_midi_clock_on_tempo_change(self):
@@ -98,14 +94,49 @@ class BridgeTests(unittest.TestCase):
         class FakeLink:
             def __init__(self):
                 self.tempos = []
+                self.forced = []
             def set_tempo(self, bpm):
                 self.tempos.append(bpm)
+            def force_beat_at_time(self, beat, when, quantum):
+                self.forced.append((beat, when, quantum))
         link = FakeLink()
         bridge = pdl.PdlClockBridge(link=link)
         bridge.feed_beat(beat_packet(128.0, 0.02, 1), 0.0)
         bridge.feed_beat(beat_packet(128.0, 0.02, 2), 1.0)
         self.assertEqual(len(link.tempos), 1)  # one tempo, no repeat for the same BPM
         self.assertAlmostEqual(link.tempos[0], 130.56, delta=0.01)
+
+    def test_bridge_forces_phase_on_the_downbeat(self):
+        class FakeLink:
+            def __init__(self):
+                self.forced = []
+            def set_tempo(self, bpm):
+                pass
+            def force_beat_at_time(self, beat, when, quantum):
+                self.forced.append((beat, when, quantum))
+        link = FakeLink()
+        bridge = pdl.PdlClockBridge(link=link, now_micros=lambda: 1_000_000, host_now=lambda: 0.0)
+        bridge.feed_beat(beat_packet(128.0, 0.02, 1), 0.0)  # a downbeat
+        self.assertEqual(len(link.forced), 1)
+        beat, when, quantum = link.forced[0]
+        self.assertEqual(beat, 0.0)          # beat 0 of the next bar
+        self.assertEqual(quantum, 4)
+        self.assertGreater(when, 1_000_000)  # a future Link time, one bar-period ahead
+        self.assertAlmostEqual(when - 1_000_000, 4 * 60 / 130.56 * 1e6, delta=10)
+
+    def test_bridge_does_not_force_on_non_downbeats(self):
+        class FakeLink:
+            def __init__(self):
+                self.forced = []
+            def set_tempo(self, bpm):
+                pass
+            def force_beat_at_time(self, beat, when, quantum):
+                self.forced.append((beat, when, quantum))
+        link = FakeLink()
+        bridge = pdl.PdlClockBridge(link=link)
+        bridge.feed_beat(beat_packet(128.0, 0.02, 2), 0.0)
+        bridge.feed_beat(beat_packet(128.0, 0.02, 3), 0.5)
+        self.assertEqual(link.forced, [])
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ if [ -n "${SP16_NET_KIND:-}" ]; then
          sleep 0.02
          i=$((i + 1))
        done
-       [ -S "$sock" ] || echo "qemu-net: segment relay did not start (socket $sock)" >&2
+       [ -S "$sock" ] || { echo "qemu-net: segment relay did not start (socket $sock)" >&2; exit 2; }
      fi
      ;;
    *) echo "qemu-net: unknown SP16_NET_KIND" >&2; exit 2 ;;

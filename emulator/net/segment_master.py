@@ -13,10 +13,13 @@ The master announces on 169.254.7.7, broadcasts to 169.254.255.255 (the link-loc
 each guest keep-alive it sees so acceptance is observable without root or tcpdump.
 """
 import argparse
+import os
 import signal
 import socket
-import struct
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fake_master
 import segment
@@ -53,6 +56,53 @@ def keepalive_line(seen, parsed):
     """The line printed for one guest keep-alive: its source, its type byte and its decoded name."""
     return (f"guest keep-alive {seen}: {parsed['src_mac']} {parsed['src_ip']} "
             f"type {parsed['payload'][10]:#04x} name {frame_name(parsed)!r}")
+
+
+def keepalive_fields(parsed):
+    """(type byte, device name) of one well-formed guest keep-alive, or None.
+
+    A malformed frame (a short or mis-shapen MAGIC payload, a name that does not fit its packet family) is skipped,
+    never a crash: the master must keep following through a noisy segment.
+    """
+    if parsed.get("dst_port") != fake_master.PORT_KEEPALIVE:
+        return None
+    payload = parsed.get("payload", b"")
+    if len(payload) < 11 or payload[:10] != MAGIC:
+        return None
+    try:
+        name = frame_name(parsed)
+    except (ValueError, IndexError):
+        return None
+    return payload[10], name
+
+
+def drain_frames(seg, mac, seen, max_frames=64):
+    """Read up to `max_frames` queued frames, logging guest keep-alives; returns the new keep-alive count.
+
+    A burst of frames (the guest's ARP and keep-alives arrive together) is drained in one non-blocking pass instead of
+    one frame per beat, and malformed frames are skipped rather than crashing the master.
+    """
+    timeout = seg.gettimeout()
+    seg.settimeout(0.0)
+    try:
+        for _ in range(max_frames):
+            try:
+                frame, _ = seg.recvfrom(65535)
+            except (socket.timeout, OSError):
+                break
+            try:
+                parsed = segment.parse_frame(frame)
+            except KeyError:
+                continue
+            if parsed["src_mac"] == mac:
+                continue  # our own frames echoed back by the segment's multicast loopback
+            if keepalive_fields(parsed):
+                seen += 1
+                if seen <= 12 or seen % 10 == 0:
+                    print(keepalive_line(seen, parsed), flush=True)
+    finally:
+        seg.settimeout(timeout)
+    return seen
 
 
 def main(argv=None):
@@ -120,23 +170,7 @@ def main(argv=None):
             beat_in_bar = beat_in_bar % 4 + 1
             next_beat += beat_s
         # Read frames back: log each guest keep-alive so acceptance is observable here.
-        try:
-            frame, _ = seg.recvfrom(65535)
-        except socket.timeout:
-            frame = None
-        except OSError:
-            frame = None
-        if frame:
-            try:
-                parsed = segment.parse_frame(frame)
-            except KeyError:
-                continue
-            if parsed["src_mac"] == mac:
-                continue  # our own frames echoed back by the segment's multicast loopback
-            if parsed["dst_port"] == fake_master.PORT_KEEPALIVE and parsed["payload"][:10] == MAGIC:
-                seen += 1
-                if seen <= 12 or seen % 10 == 0:
-                    print(keepalive_line(seen, parsed), flush=True)
+        seen = drain_frames(seg, mac, seen)
         time.sleep(max(0.0, min(next_keepalive, next_status, next_beat) - time.monotonic()))
     if log:
         log.close()

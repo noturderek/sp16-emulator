@@ -46,6 +46,8 @@ def parse_frame(frame: bytes) -> dict:
         raise KeyError("not an IPv4 frame")
     dst_mac, src_mac = frame[0:6].hex(":"), frame[6:12].hex(":")
     ihl = (frame[14] & 0x0F) * 4
+    if ihl < 20:
+        raise KeyError("bad IP header length")
     if len(frame) < 14 + ihl + 8:
         raise KeyError("short IP/UDP frame")
     if frame[14 + 9] != 17:
@@ -53,6 +55,10 @@ def parse_frame(frame: bytes) -> dict:
     src_ip = socket.inet_ntoa(frame[14 + 12:14 + 16])
     dst_ip = socket.inet_ntoa(frame[14 + 16:14 + 20])
     src_port, dst_port, udp_length = struct.unpack(">HHH", frame[14 + ihl:14 + ihl + 6])
+    if udp_length < 8:
+        raise KeyError("bad UDP length")
+    if 14 + ihl + udp_length > len(frame):
+        raise KeyError("UDP length overruns the frame")
     payload = frame[14 + ihl + 8:14 + ihl + udp_length]
     return {"src_mac": src_mac, "dst_mac": dst_mac, "src_ip": src_ip, "dst_ip": dst_ip,
             "src_port": src_port, "dst_port": dst_port, "payload": payload}

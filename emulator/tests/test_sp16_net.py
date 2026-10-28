@@ -97,6 +97,21 @@ class WrapperTests(unittest.TestCase):
         self.assertRegex(args[3], r"^stream,id=sp16net,server=off,addr.type=unix,addr.path="
                                  r".*sp16r-\d+\.sock$")
 
+    def test_mcast_relay_failure_stops_qemu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "qemu-net.sh").write_bytes((TOOLS / "net/qemu-net.sh").read_bytes())
+            Path(folder, "qemu-net.sh").chmod(0o700)
+            Path(folder, "qemu-system-aarch64").write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            Path(folder, "qemu-system-aarch64").chmod(0o700)
+            Path(folder, "noop-python").write_text('#!/bin/sh\nexit 0\n')
+            Path(folder, "noop-python").chmod(0o700)
+            done = subprocess.run([folder + "/qemu-net.sh"], capture_output=True, text=True,
+                                  env={"PATH": os.environ["PATH"],
+                                       "SP16_NET_KIND": "mcast", "SP16_NET_TARGET": "230.0.0.1:1234",
+                                       "SP16_PYTHON": folder + "/noop-python"})
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("relay did not start", done.stderr)
+
     def test_unix_uses_the_stream_backend(self):
         _, args = self.run_wrapper(SP16_NET_KIND="unix", SP16_NET_TARGET="/x/socket_vmnet")
         self.assertEqual(args[3], "stream,id=sp16net,server=off,addr.type=unix,addr.path=/x/socket_vmnet")
@@ -112,7 +127,7 @@ class WrapperTests(unittest.TestCase):
     def test_mcast_appends_only_the_mode(self):
         args = ("-m", "1", "-append", "console=ttyAMA0 rdinit=/init")
         code, lines = self.run_wrapper(args, SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:34567",
-                                       SP16_NET_MODE="mcast")
+                                       SP16_NET_NO_RELAY="1", SP16_NET_MODE="mcast")
         self.assertEqual(code, 0)
         at = lines.index("-append")
         self.assertEqual(lines[at + 1], "console=ttyAMA0 rdinit=/init sp16.net=mcast")
