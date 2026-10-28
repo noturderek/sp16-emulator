@@ -76,8 +76,11 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private var centre: Double?
     private var period: Double = 60.0 / (120.0 * 24.0)    // 120 BPM at 24 PPQN
     private var lockEvents = 0
+    /// Damping and loop frequency. `loopHz` is the loop's frequency in Hz (clock.py's `loop_hz`); the gains below
+    /// convert it to rad/s.
     private let zeta = 1.0 / sqrt(2.0), loopHz = 2.0
-    private var intervals: [Double] = []                  // recent inter-clock seconds, for the jitter readout
+    private let jitterWindow = 96
+    private var intervals: [Double] = []                  // recent inter-clock seconds, for the jitter deviation
     private var lastClockTime: Double?
 
     private let tableView = NSTableView()
@@ -335,6 +338,18 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
         if oldOutputPort != 0 { MIDIPortDispose(oldOutputPort) }
     }
 
+    /// One DLL update per clock byte, the same second-order loop as `emulator/midi/clock.py`:
+    ///
+    ///     wn    = 2 * pi * loopHz              natural frequency, rad/s (clock.py: `wn = 2 * pi * loop_hz`)
+    ///     b     = 2 * zeta * wn * t0           phase (proportional) gain
+    ///     c     = (wn * t0) ** 2               period (integral) gain
+    ///     e     = t - (centre + period)        phase error: this arrival against the prediction
+    ///     centre += period + b * e             the loop's output time
+    ///     period += c * e                      the recovered clock period
+    ///
+    /// The gains are normalised to the *nominal* period `t0 = clockPeriodSeconds(nominalBPM)`, not to the recovered
+    /// one, so they stay put while the loop tracks a tempo away from nominal — exactly as clock.py builds them once
+    /// from `nominal_bpm`. `loopHz` is a frequency in Hz and only becomes rad/s through `wn`.
     private func onClockByte(at t: Double) {
         // Runs on the CoreMIDI input thread; takes the state lock so the readout mutation is atomic against
         // `refreshReadout` on the main thread.
@@ -343,12 +358,16 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
         if lastClockTime == nil { centre = t } else {
             lockEvents += 1
             if centre == nil { centre = t } else {
+                let wn = 2.0 * Double.pi * loopHz
+                let t0 = clockPeriodSeconds(nominalBPM)
+                let b = 2.0 * zeta * wn * t0
+                let c = (wn * t0) * (wn * t0)
                 let e = t - (centre! + period)
-                centre! += period + 2 * zeta * loopHz * period * e
-                period += (loopHz * period) * (loopHz * period) * e
+                centre! += period + b * e
+                period += c * e
             }
             intervals.append(abs(t - lastClockTime!))
-            if intervals.count > 96 { intervals.removeFirst() }
+            if intervals.count > jitterWindow { intervals.removeFirst() }
         }
         lastClockTime = t
         DispatchQueue.main.async { [weak self] in self?.refreshReadout() }
@@ -369,9 +388,21 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
         } else {
             bpmLabel.stringValue = String(format: "%.1f", 60.0 / (periodValue * 24.0))
             lockLabel.stringValue = lockValue >= 8 ? "locked" : "unlocked"
-            let jitter = intervalsSnapshot.isEmpty ? 0 : intervalsSnapshot.reduce(0, +) / Double(intervalsSnapshot.count)
-            jitterLabel.stringValue = String(format: "%.0f µs", jitter * 1_000_000)
+            // Jitter is the *deviation* of the clock interval, not its mean: the mean of a 120 BPM stream is 20.8 ms
+            // (one 24th of a beat) however steady or wobbly the clock is, so it reports nothing. This is the sample
+            // standard deviation sqrt(sum((x - mean)^2) / (n - 1)) of the recent intervals: 0 us for a perfectly
+            // steady clock, growing with the wobble around the beat.
+            jitterLabel.stringValue = String(format: "%.0f µs", sampleDeviation(intervalsSnapshot) * 1_000_000)
         }
+    }
+
+    /// The sample standard deviation of `values` (n - 1 denominator, in the same unit as the values); 0 below two
+    /// samples, where a deviation is not defined.
+    private func sampleDeviation(_ values: [Double]) -> Double {
+        guard values.count > 1 else { return 0 }
+        let mean = values.reduce(0, +) / Double(values.count)
+        let squares = values.reduce(0.0) { $0 + ($1 - mean) * ($1 - mean) }
+        return (squares / Double(values.count - 1)).squareRoot()
     }
 
     private func rebuildClockPicker() {
