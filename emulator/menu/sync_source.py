@@ -59,11 +59,46 @@ def set_row(setting, value, value_detents=1):
 SYNC_SOURCE_PDL = set_row("SYNC SOURCE SELECT", "PRO DJ LINK", value_detents=1)
 
 #: MIDI OUT MODE (USB) = OUT (generated USB-B note/CC output; firmware setting id 0x2b -> 0x120).
-USB_OUT = set_row("MIDI OUT MODE (USB)", "OUT", value_detents=0)
+USB_OUT = set_row("MIDI OUT MODE (USB)", "OUT$", value_detents=0)
+
+
+def _usb_note_out_steps():
+    """USB-B note output: MIDI OUT MODE (USB) = OUT and the project's MIDI OUT NOTE/CC = ENABLE, in one UTILITY visit.
+
+    The list has two NOTE/CC rows (MIDI IN at the top, MIDI OUT lower); the recipe reaches the MIDI OUT one by
+    focusing the unique MIDI OUT MODE (USB) row first and then searching upward, so the first NOTE/CC it finds is the
+    MIDI OUT row (project key 0x11000102), not the MIDI IN one.
+    """
+    return [
+        {"settle": 1.0},
+        {"press": "home"},
+        {"expect_title": "HOME"},
+        {"tap": UTILITY_TAP},
+        {"expect_title": "UTILITY"},
+        {"focus_row": "MIDI OUT MODE (USB)", "box": LEFT, "max_detents": 60},
+        {"press": "selector"},
+        {"wait": 0.8},
+        {"focus_row": "OUT$", "box": RIGHT, "max_detents": 6, "detents": 1},
+        {"press": "selector"},
+        {"wait": 0.5},
+        {"focus_row": "NOTE/CC", "box": LEFT, "max_detents": 12, "detents": -1},
+        {"press": "selector"},
+        {"wait": 0.8},
+        {"focus_row": "ENABLE", "box": RIGHT, "max_detents": 6, "detents": 1},
+        {"press": "selector"},
+        {"wait": 0.5},
+        {"press": "home"},
+        {"expect_title": "HOME"},
+    ]
+
+
+#: MIDI OUT MODE (USB) = OUT and MIDI OUT NOTE/CC = ENABLE: firmware-generated USB-B notes on a pad hit.
+USB_NOTE_OUT = _usb_note_out_steps()
 
 RECIPES = {
     "sync-source-pdl": ("SYNC SOURCE SELECT = PRO DJ LINK", SYNC_SOURCE_PDL),
     "usb-out": ("MIDI OUT MODE (USB) = OUT", USB_OUT),
+    "usb-note-out": ("MIDI OUT MODE (USB) = OUT, MIDI OUT NOTE/CC = ENABLE", USB_NOTE_OUT),
 }
 
 

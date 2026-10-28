@@ -37,7 +37,17 @@ class RecipeTests(unittest.TestCase):
         steps = recipes.USB_OUT
         rows = [s["focus_row"] for s in steps if "focus_row" in s]
         self.assertIn("MIDI OUT MODE (USB)", rows[0])
-        self.assertEqual(rows[1], "OUT")
+        self.assertEqual(rows[1], "OUT$")
+
+    def test_usb_note_out_recipe_targets_the_midi_out_note_cc(self):
+        steps = recipes.USB_NOTE_OUT
+        rows = [s for s in steps if "focus_row" in s]
+        # MIDI OUT MODE (USB) first (unique), then NOTE/CC reached by searching upward (detents -1)
+        self.assertIn("MIDI OUT MODE (USB)", rows[0]["focus_row"])
+        self.assertEqual(rows[1]["focus_row"], "OUT$")
+        self.assertEqual(rows[2]["focus_row"], "NOTE/CC")
+        self.assertEqual(rows[2]["detents"], -1)
+        self.assertEqual(rows[3]["focus_row"], "ENABLE")
 
     def test_set_row_opens_utility_and_returns_home(self):
         steps = recipes.set_row("X", "Y")
