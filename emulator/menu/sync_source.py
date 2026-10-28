@@ -32,6 +32,10 @@ LEFT = [20, 145, 390, 450]     # UTILITY: the setting list (left column)
 RIGHT = [395, 145, 765, 450]   # UTILITY: the focused setting's value (right column)
 UTILITY_TAP = [748, 58]        # the UTILITY icon on the HOME screen
 
+# The row label regexes below feed hwsuite.run_recipe's re.search, so parentheses are written as character classes
+# ([(]... [)]) to match the firmware's literal '(USB)' rather than a regex group.
+MIDI_OUT_USB = "MIDI OUT MODE [(]USB[)]"
+
 
 def set_row(setting, value, value_detents=1):
     """Steps that open UTILITY, focus `setting`, push, focus `value`, push, and return HOME.
@@ -59,7 +63,7 @@ def set_row(setting, value, value_detents=1):
 SYNC_SOURCE_PDL = set_row("SYNC SOURCE SELECT", "PRO DJ LINK", value_detents=1)
 
 #: MIDI OUT MODE (USB) = OUT (generated USB-B note/CC output; firmware setting id 0x2b -> 0x120).
-USB_OUT = set_row("MIDI OUT MODE (USB)", "OUT$", value_detents=0)
+USB_OUT = set_row(MIDI_OUT_USB, "OUT$", value_detents=0)
 
 
 def _usb_note_out_steps():
@@ -75,7 +79,7 @@ def _usb_note_out_steps():
         {"expect_title": "HOME"},
         {"tap": UTILITY_TAP},
         {"expect_title": "UTILITY"},
-        {"focus_row": "MIDI OUT MODE (USB)", "box": LEFT, "max_detents": 60},
+        {"focus_row": MIDI_OUT_USB, "box": LEFT, "max_detents": 60},
         {"press": "selector"},
         {"wait": 0.8},
         {"focus_row": "OUT$", "box": RIGHT, "max_detents": 6, "detents": 1},
