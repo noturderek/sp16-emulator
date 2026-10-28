@@ -789,6 +789,21 @@ class HelpTests(CliCase):
                     for choice in pos.choices or ():
                         self.assertIn(choice, out)
 
+    def test_the_testmode_help_lists_every_testmode_check(self):
+        """--testmode-build names the checks it serves; the list drifted once and left HW-54 out."""
+        sys.path.insert(0, str(TOOLS))
+        try:
+            import hwsuite
+        finally:
+            sys.path.pop(0)
+        code, out, _ = self.main("help", "hwsuite")
+        self.assertEqual(code, 0)
+        named = set(re.findall(r"HW-\d+", out))
+        for first, last in re.findall(r"HW-(\d+)\.\.HW-(\d+)", out):
+            named |= {f"HW-{number}" for number in range(int(first), int(last) + 1)}
+        self.assertEqual(sorted(named & set(hwsuite.TESTMODE_IDS)), sorted(hwsuite.TESTMODE_IDS))
+        self.assertEqual(named - {check.id for check in hwsuite.CHECKS}, set(), f"help names unknown checks: {named}")
+
     def test_unknown_command_suggests_a_fix(self):
         code, _, err = self.main("biuld")
         self.assertEqual(code, 2)

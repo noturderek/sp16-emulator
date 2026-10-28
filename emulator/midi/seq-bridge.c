@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -58,12 +59,55 @@ static int transmit(struct wire *wire, int fd, uint64_t now) {
     wire->next=now+BYTE_NS; /* Never burst overdue bytes after a scheduler stall. */
     return 1;
 }
-#ifndef SP16_QUEUE_CONTRACT
+/* Proxy wire formats and routing, above the contract guard so sp16_din_queue_contract.c can pin them. */
+
+/* An event packet from the ARM app is 'E' then the fixed 28-byte snd_seq_event_t: type, then flags, then tag. The flags
+ * byte (packet[2]) carries SND_SEQ_EVENT_LENGTH_MASK, and a variable-length event (a sysex run) has no single decode, so
+ * it is refused rather than decoded from a truncated buffer. */
+static int proxy_packet_is_fixed_event(const uint8_t *packet, ssize_t size) {
+    return size==(ssize_t)(1+ARM_EVENT_SIZE) && packet[0]=='E' &&
+           !(packet[2]&SND_SEQ_EVENT_LENGTH_MASK);
+}
+
 struct proxy_client {
     int fd;
     uint8_t guest_client, input_port[2], output_port[2];
     unsigned input[2], output[2];
 };
+
+#define ROUTE_DIN 1u
+#define ROUTE_USB 2u
+
+/* The routes a client's own event goes out on. The two subscriptions are independent: one port number subscribed on
+ * both routes (the firmware's shared-port case) goes out on both, so this returns a bitmask rather than the first
+ * match. */
+static unsigned output_routes(const struct proxy_client *client, unsigned event_port) {
+    unsigned routes=0;
+    if (client->output[0] && client->output_port[0]==event_port) routes|=ROUTE_DIN;
+    if (client->output[1] && client->output_port[1]==event_port) routes|=ROUTE_USB;
+    return routes;
+}
+
+/* Drop a leftover socket before binding: a bridge that exited uncleanly leaves its endpoint behind and the next bind
+ * fails, so the sequencer proxy never comes up after a restart. A live endpoint is never removed (that would steal the
+ * other bridge's clients), and neither is a path that is not a socket. */
+static int unlink_stale_socket(const char *path) {
+    struct stat info;
+    if (lstat(path,&info)<0) return errno==ENOENT ? 0 : -1;
+    if (!S_ISSOCK(info.st_mode)) { errno=EEXIST; return -1; }
+    int probe=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);
+    if (probe<0) return -1;
+    struct sockaddr_un addr={.sun_family=AF_UNIX};
+    strncpy(addr.sun_path,path,sizeof addr.sun_path-1);
+    int live=connect(probe,(struct sockaddr *)&addr,sizeof addr)==0;
+    int error=errno;
+    close(probe);
+    if (live) { errno=EADDRINUSE; return -1; }
+    if (error!=ECONNREFUSED) { errno=error; return -1; }
+    return unlink(path);
+}
+
+#ifndef SP16_QUEUE_CONTRACT
 static int usb_enqueue(struct bytes *queue,const uint8_t *data,unsigned size) {
     if (size>CAPACITY-queue->size) return -ENOSPC;
     for (unsigned i=0;i<size;i++) queue->data[(queue->head+queue->size++)%CAPACITY]=data[i];
@@ -93,6 +137,10 @@ static void disable_usb(int *fd,struct bytes *queue,const char *reason) {
     *queue=(struct bytes){0};
 }
 static int proxy_listener(void) {
+    if (unlink_stale_socket(SEQ_PROXY_PATH)<0) {
+        fprintf(stderr,"SP16_DIN proxy=refused path=%s errno=%d\n",SEQ_PROXY_PATH,errno);
+        return -1;
+    }
     int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
     if (fd<0) return -1;
     struct sockaddr_un addr={.sun_family=AF_UNIX};
@@ -142,18 +190,16 @@ static void proxy_input(struct proxy_client *client,struct wire *wire,struct byt
                 }
                 break;
             }
-        } else if (n==(ssize_t)sizeof packet && packet[0]=='E' &&
-                   !(packet[2]&SND_SEQ_EVENT_LENGTH_MASK)) {
+        } else if (proxy_packet_is_fixed_event(packet,n)) {
             snd_seq_event_t event;
             memset(&event,0,sizeof event);
             memcpy(&event,packet+1,ARM_EVENT_SIZE);
             uint8_t bytes[4096];
             long count=snd_midi_event_decode(decoder,bytes,sizeof bytes,&event);
             if (count>0) {
-                if (client->output[0] && event.source.port==client->output_port[0])
-                    (void)enqueue(wire,bytes,(unsigned)count);
-                else if (client->output[1] && event.source.port==client->output_port[1] && usb_fd>=0)
-                    (void)usb_enqueue(usb_queue,bytes,(unsigned)count);
+                unsigned routes=output_routes(client,(unsigned)event.source.port);
+                if (routes&ROUTE_DIN) (void)enqueue(wire,bytes,(unsigned)count);
+                if ((routes&ROUTE_USB) && usb_fd>=0) (void)usb_enqueue(usb_queue,bytes,(unsigned)count);
             }
         }
     }
@@ -198,11 +244,15 @@ static void service_usb(int *fd,struct bytes *queue,snd_midi_event_t *encoder,
     if (usb_flush(queue,*fd)<0) disable_usb(fd,queue,"write-failed");
 }
 static int control_listener(void) {
+    if (unlink_stale_socket(DIN_CONTROL_PATH)<0) {
+        fprintf(stderr,"SP16_DIN control=refused path=%s errno=%d\n",DIN_CONTROL_PATH,errno);
+        return -1;
+    }
     int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
     if (fd<0) return -1;
     struct sockaddr_un addr={.sun_family=AF_UNIX};
     strcpy(addr.sun_path,DIN_CONTROL_PATH);
-    /* The guest root is recreated on boot; refuse a stale/live endpoint. */
+    /* The guest root is recreated on boot; a live endpoint at this path is another bridge, not a leftover. */
     if (bind(fd,(struct sockaddr *)&addr,sizeof addr)<0 || listen(fd,16)<0) {
         close(fd); return -1;
     }

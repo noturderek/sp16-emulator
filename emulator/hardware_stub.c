@@ -208,6 +208,33 @@ static int idle_socket(enum device kind) {
 
 /* The native DIN bridge owns ALSA and the UART. The ARM process keeps a real
  * pollable socket fd; fixed-size 32-bit sequencer events cross it unchanged. */
+/* Wait, bounded, for a nonblocking connect to settle. EINPROGRESS means the attempt is in flight (POLLOUT reports
+ * completion, SO_ERROR the outcome); EAGAIN means the listener's backlog is full and nothing is in flight, so the
+ * connect itself is retried. Returning early on either hands the app a socket whose first write fails, which drops
+ * the proxy client; the bound keeps a wedged bridge from hanging the sequencer open. */
+static int connect_wait(int fd,const struct sockaddr *address,socklen_t length) {
+    uint64_t deadline=mono_ns()+1000000000ULL;
+    int state;
+    for (;;) {
+        if (connect(fd,address,length)==0) return 0;
+        state=errno;
+        if (state!=EAGAIN) break;
+        if (mono_ns()>=deadline) { errno=EAGAIN; return -1; }
+        struct timespec pause={.tv_sec=0,.tv_nsec=1000000};
+        nanosleep(&pause,NULL);
+    }
+    if (state!=EINPROGRESS) { errno=state; return -1; }
+    struct pollfd waiting={ .fd=fd, .events=POLLOUT };
+    int ready;
+    do { ready=poll(&waiting,1,1000); } while (ready<0 && errno==EINTR);
+    if (ready<0) return -1;
+    if (ready==0) { errno=ETIMEDOUT; return -1; }
+    int error=0;
+    socklen_t size=sizeof error;
+    if (getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&size)<0) return -1;
+    if (error) { errno=error; return -1; }
+    return 0;
+}
 static int sequencer_socket(void) {
     const char *path=getenv("SP16_SEQ_PROXY");
     if (!path) path="/dev/sp16-seq-proxy";
@@ -217,7 +244,7 @@ static int sequencer_socket(void) {
     if (fd>=MAX_FDS) { original_close(fd); errno=EMFILE; return -1; }
     struct sockaddr_un address={.sun_family=AF_UNIX};
     strcpy(address.sun_path,path);
-    if (connect(fd,(struct sockaddr *)&address,sizeof address)<0 && errno!=EINPROGRESS) {
+    if (connect_wait(fd,(struct sockaddr *)&address,sizeof address)<0) {
         int error=errno; original_close(fd); errno=error; return -1;
     }
     devices[fd]=(struct state){.kind=SEQUENCER,.peer=-1};
@@ -495,20 +522,28 @@ static int rawmidi_write_byte(int fd,uint8_t byte,int nonblock) {
     while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
     uint64_t now=mono_ns();
     uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
-    struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
-    int slept;
-    do { slept=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); } while (slept==EINTR);
-    int error=slept;
-    if (!error) for (;;) {
+    int error=0;
+    if (nonblock) {
+        /* A nonblocking write must not spend the wire slot before it knows the port can take the byte: try it first and
+         * hand back EAGAIN at once, leaving the slot for the byte that does go out. */
         ssize_t wrote=original_write(fd,&byte,1);
-        if (wrote==1) break;
-        error=wrote==0 ? EIO : errno;
-        if (error!=EAGAIN || nonblock) break;
-        struct pollfd ready={ .fd=fd,.events=POLLOUT };
-        if (poll(&ready,1,-1)<0 && errno!=EINTR) { error=errno; break; }
-        error=0;
+        if (wrote!=1) error=wrote==0 ? EIO : errno;
+    } else {
+        struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
+        int slept;
+        do { slept=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); } while (slept==EINTR);
+        error=slept;
+        if (!error) for (;;) {
+            ssize_t wrote=original_write(fd,&byte,1);
+            if (wrote==1) break;
+            error=wrote==0 ? EIO : errno;
+            if (error!=EAGAIN) break;
+            struct pollfd ready={ .fd=fd,.events=POLLOUT };
+            if (poll(&ready,1,-1)<0 && errno!=EINTR) { error=errno; break; }
+            error=0;
+        }
     }
-    rawmidi_next_ns=target;
+    if (!error) rawmidi_next_ns=target; /* only a byte that went out takes the UART slot */
     __sync_lock_release(&rawmidi_wire_lock);
     return error ? -error : 0;
 }
@@ -767,8 +802,10 @@ static void note_ioctl(unsigned long request, enum device kind) {
 /* Fake eth0 (SP16_FAKE_ETH0=1, set with the factory test mode): the guest has only lo, but the DEVICE TEST page
  * (page 8) reads the MAC (retrying with 250 ms sleeps until bytes 3..5 are not all zero) and the IP of eth0 on the
  * UI thread, so without an interface it never returns. Every value below is fake: a locally administered MAC
- * (02:00:5e:10:00:01), 192.0.2.16/24 (TEST-NET-1) and an interface that is up. Link data (SIOCETHTOOL) is not
- * faked: it fails with EOPNOTSUPP. Off in normal runs, where eth0 stays absent. */
+ * (02:00:5e:10:00:01), 192.0.2.16/24 (TEST-NET-1) and an interface that is up. Link data is fake for the carrier
+ * query only: with SP16_NET_GLINK set, SIOCETHTOOL ETHTOOL_GLINK answers 0/1 for eth0, because QEMU user-mode can
+ * reject a networked guest's own link query; every other SIOCETHTOOL request on the fake interface fails with
+ * EOPNOTSUPP. Off in normal runs, where eth0 stays absent. */
 #define SP16_SIOCGIFFLAGS 0x8913UL
 #define SP16_SIOCGIFADDR 0x8915UL
 #define SP16_SIOCGIFNETMASK 0x891bUL

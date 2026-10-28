@@ -12,11 +12,11 @@ transport word:
 A word carries the stimulus when its peak is at least `--floor` (default 0.01, -40 dBFS) *and* at least `--purity`
 (default 0.5) of its energy lies within `--band` Hz of the stimulus frequency (`--tone`, default 1 kHz). Measured on
 the captures this tool takes, a word carrying the tone scores 0.90 and a word full of full-scale noise scores 0.005,
-so the test separates them by nearly two hundred times: a padded word can have the same peak without the same
-spectrum. The
-table also prints each word's dominant frequency. The untouched page is captured first as the silence baseline, and
-the tap only arms on a stream's first non-zero frame, so a mode that leaves the master stream silent is reported as
-such instead of as a missing measurement.
+which puts the default 0.5 threshold well between them (those are the two scores, not a ratio of discriminating
+power): a padded word can have the same peak without the same spectrum. The table also prints each word's dominant
+frequency. The untouched page is captured first as the silence baseline, and the tap only arms on a stream's
+first non-zero frame, so a mode that leaves the master stream silent is reported as such instead of as a missing
+measurement.
 
 A sixteen-word capture is about 5.6 MB raw and reaches the host as gzip+base64 lines on the serial console, where the
 kernel cuts long writes and other writers' lines land in between, so a whole capture often arrives damaged. The reader

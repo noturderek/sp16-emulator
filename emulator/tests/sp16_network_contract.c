@@ -44,6 +44,14 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[1],"arp")) {
         int packet=socket(AF_PACKET,SOCK_DGRAM,1544);
         assert(packet>=0);
+        /* The isolated stand-in is a local socketpair, so the socket's domain says whether the call passed through:
+         * checking only that the socket exists passes for the stand-in as well. */
+        int domain=-1;
+        socklen_t length=sizeof domain;
+        assert(getsockopt(packet,SOL_SOCKET,SO_DOMAIN,&domain,&length)==0);
+        const char *arp=getenv("SP16_NET_ARP");
+        int passthrough=arp && !strcmp(arp,"1");
+        assert(domain==(passthrough?AF_PACKET:AF_UNIX));
         assert(close(packet)==0);
     } else abort();
     assert(close(fd)==0);

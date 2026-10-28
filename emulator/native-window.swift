@@ -241,7 +241,14 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// Held for the life of the app: App Nap must not throttle a build without an audio sink (audio builds already
     /// take their own assertions). User-initiated tier, but idle system sleep stays allowed for a silent app.
     var panelActivity: NSObjectProtocol?
+    /// The research TX log (`tx-frames.jsonl`): only the timestamp and a copy of the raw frame are taken on the bridge
+    /// reader thread; every hex conversion and the line write happen on this serial queue, so a slow disk cannot stall
+    /// panel-frame reception (pt-i44.78). Only this queue touches `txLog`; `started` and `config` are immutable, so the
+    /// timestamp needs no lock.
+    let txLogQueue = DispatchQueue(label: "sp16.native.txlog")
     var txLog: FileHandle?
+    /// Hex digits for the TX log: 128 bytes become 256 characters without 128 `String(format:)` calls.
+    static let hexDigits: [UInt8] = Array("0123456789abcdef".utf8)
     var lastCapture = 0.0
     let started = ProcessInfo.processInfo.systemUptime
 
@@ -762,6 +769,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 self.panel.setFeedback(generation: generation, live: live, lamps: lamps)
             }
         case Kind.txFrame:
+            // Cheap by design: this hands the queue a copy of the raw bytes; no hex conversion happens on this thread.
             writeTxLog(body.dropFirst())
             if let standby = txStandbyFlag(body) {
                 DispatchQueue.main.async { [weak self] in self?.applyStandby(standby) }
@@ -873,16 +881,36 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         return "{\"error\":\"the guest could not mount \(path) (unsupported media?)\"}"
     }
 
+    /// `bytes` as lowercase hex, built from the table above. Pure formatting: it runs on `txLogQueue`, never on the
+    /// bridge reader thread.
+    static func hexString(_ bytes: [UInt8]) -> String {
+        var out = [UInt8]()
+        out.reserveCapacity(bytes.count * 2)
+        for byte in bytes {
+            out.append(hexDigits[Int(byte >> 4)])
+            out.append(hexDigits[Int(byte & 0x0f)])
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    /// Append one panel frame to the research TX log. The caller is the bridge reader thread, which does only two
+    /// things: it takes the timestamp (before any lock and before the hop to `txLogQueue`, so `t` is when the frame
+    /// arrived rather than when the write finished) and it copies the raw bytes into a value the queue owns. All 128
+    /// hex conversions and the disk write happen on `txLogQueue`. One reader thread and one serial queue keep the lines
+    /// in arrival order.
     func writeTxLog(_ frame: Data) {
         guard config.research == true else { return }
-        lock.lock(); defer { lock.unlock() }
-        if txLog == nil {
-            let path = config.session + "/tx-frames.jsonl"
-            FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
-            txLog = try? FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        let stamp = ProcessInfo.processInfo.systemUptime - started
+        let bytes = [UInt8](frame)
+        txLogQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.txLog == nil {
+                let path = self.config.session + "/tx-frames.jsonl"
+                FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
+                self.txLog = try? FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            }
+            self.txLog?.write(Data("{\"t\":\(stamp),\"hex\":\"\(NativeApplication.hexString(bytes))\"}\n".utf8))
         }
-        let line = "{\"t\":\(ProcessInfo.processInfo.systemUptime - started),\"hex\":\"\(frame.map { String(format: "%02x", $0) }.joined())\"}\n"
-        txLog?.write(Data(line.utf8))
     }
 
     // MARK: Display
@@ -1329,6 +1357,12 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         if let held = panelActivity { ProcessInfo.processInfo.endActivity(held); panelActivity = nil }
         audioSink?.stop()
         audioSink?.output?.stop()
+        // Flush the frames still queued for the TX log and close its handle: the session directory is left in place for
+        // diagnostics, and a half-written tail would be read as a truncated line by timing_probe.py.
+        txLogQueue.sync {
+            try? txLog?.close()
+            txLog = nil
+        }
         // Only the launcher-created IPC directory; diagnostic session files persist.
         let parent = URL(fileURLWithPath: config.socket).deletingLastPathComponent()
         if parent.path.hasPrefix("/tmp/sp16-") { try? FileManager.default.removeItem(at: parent) }

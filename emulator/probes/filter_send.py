@@ -43,22 +43,33 @@ def loop_figures(metrics):
 
 
 def measure(metrics):
-    """One reading of every figure a pass watches, from a single metrics reply so they belong to the same moment."""
+    """One reading of every figure a pass watches, from a single metrics reply so they belong to the same moment.
+
+    A figure the reply does not carry stays None: a measured 0.0 is silence, and folding a stream the sink never
+    reported into it would report a silent send when there was no measurement at all (pt-i44.79)."""
     send, master, loop = stream_figures(metrics, SEND_STREAM), stream_figures(metrics, MASTER_STREAM), loop_figures(metrics)
-    return {"send_peak": float(send.get("peak") or 0.0), "nonzero_send_frames": int(send.get("nonzero_frames") or 0),
-            "master_peak": float(master.get("peak") or 0.0), "loop_send_peak": float(loop.get("send_peak") or 0.0),
-            "loop_return_peak": float(loop.get("return_peak") or 0.0),
-            "loop_underruns": int(loop.get("underruns") or 0)}
+
+    def number(value, kind):
+        return None if value is None else kind(value)
+
+    return {"send_peak": number(send.get("peak"), float),
+            "nonzero_send_frames": number(send.get("nonzero_frames"), int),
+            "master_peak": number(master.get("peak"), float),
+            "loop_send_peak": number(loop.get("send_peak"), float),
+            "loop_return_peak": number(loop.get("return_peak"), float),
+            "loop_underruns": number(loop.get("underruns"), int)}
 
 
 def sample(session, seconds=2.5):
-    """The highest send and loop figures seen while the pad sounds, and the last master figures."""
+    """The highest send and loop figures seen while the pad sounds, and the last master figures.
+
+    A figure that no reading carried stays None, so the report never turns a missing stream into a silent one."""
     best = measure({})
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        reading = measure(session.metrics())
-        for key, value in reading.items():
-            best[key] = max(best[key], value)
+        for key, value in measure(session.metrics()).items():
+            if value is not None and (best[key] is None or value > best[key]):
+                best[key] = value
         time.sleep(0.2)
     return best
 
@@ -115,9 +126,11 @@ def run(args):
                   "streams": {"send": SEND_STREAM, "master": MASTER_STREAM},
                   "passes": {"inactive": passes[0], "active": passes[1]}}
         (out / "filter-send.json").write_text(json.dumps(report, indent=1) + "\n")
-        silent = all(p["send_peak"] == 0 and p["nonzero_send_frames"] == 0 for p in passes)
-        print(f"\nsend stream {'is silent' if silent else 'carried samples'} with ACTIVE on and off; "
-              f"wrote {out / 'filter-send.json'}")
+        missing = [name for name, seen in zip(("inactive", "active"), passes) if seen["send_peak"] is None]
+        silent = not missing and all(p["send_peak"] == 0 and p["nonzero_send_frames"] == 0 for p in passes)
+        verdict = (f"the sink never reported the send stream for {', '.join(missing)}" if missing
+                   else "send stream is silent" if silent else "send stream carried samples")
+        print(f"\nwith ACTIVE on and off: {verdict}; wrote {out / 'filter-send.json'}")
         return report
     finally:
         if session:
