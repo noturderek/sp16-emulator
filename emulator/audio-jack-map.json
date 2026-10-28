@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "about": "Which transport channel carries which output jack. Read by the output monitor menu and by tests; the shim and the sink keep the same numbers (hardware_stub.c MAIN_PAIR_*, audio-sink.swift OutputJack). Grades: O observed, S static, I inferred, U unknown.",
+  "streams": {
+    "ak4458audio-0": {
+      "alsa": "hw:ak4458audio,0", "direction": "playback", "format": "S16_LE", "channels": 16, "rate": 44100,
+      "layout": "8 DAC slots of two channels; only the even channel of each slot carries audio, the odd one is padding that carries a full-scale pattern near the top of the band (observed, grade O)",
+      "padding_channels": [1, 3, 5, 7, 9, 11, 13, 15]
+    },
+    "ak4452audio-0": {
+      "alsa": "hw:ak4452audio,0", "direction": "playback", "format": "S24_LE (carried as FLOAT_LE)", "channels": 2, "rate": 44100,
+      "layout": "headphone DAC, left and right"
+    }
+  },
+  "jacks": [
+    {"jack": "MAIN", "aliases": ["OUT1-2", "MASTER"], "stream": "ak4458audio-0", "left": 12, "right": 14, "grade": "O",
+     "evidence": "AUDIO TEST MODE3 (input to filter to OUT1/2 + MASTER) put the injected signal on channels 12 and 14 only"},
+    {"jack": "OUT3-4", "stream": "ak4458audio-0", "left": 8, "right": 10, "grade": "I",
+     "evidence": "no test mode isolates this pair; MODE1 lights all four pairs and the slot order is regular (reversed against the jack numbers)"},
+    {"jack": "OUT5-6", "stream": "ak4458audio-0", "left": 4, "right": 6, "grade": "I",
+     "evidence": "as OUT3-4"},
+    {"jack": "OUT7-8", "stream": "ak4458audio-0", "left": 0, "right": 2, "grade": "O",
+     "evidence": "AUDIO TEST MODE2 (input to send DAC to return ADC to OUT7-8) put the signal on channels 0 and 2 only"},
+    {"jack": "PHONES", "stream": "ak4452audio-0", "left": 0, "right": 1, "grade": "O",
+     "evidence": "the AK4452 playback stream carries the input in MODE1 and MODE2 and is silent in MODE3"}
+  ],
+  "audio_test": {
+    "page": 11, "modes": ["OFF", "MODE1", "MODE2", "MODE3", "LIMIT"],
+    "mode1": "IN -> OUT 1-2, 3-4, 5-6, 7-8, HP OUT: all four master pairs and PHONES carry the input",
+    "mode2": "send DAC -> return ADC -> OUT7-8: master channels 0/2 and PHONES",
+    "mode3": "analog filter -> OUT1/2 + MASTER: master channels 12/14 only",
+    "limit": "the LIMIT button drives GPIO5_IO06 (1 = limiter on, grade I)",
+    "how": "./sp16 build --name X --research --audio file --app-arg testmode, run with --dev-overlay DIR holding input.wav (and pcm-port-channels containing 0:16), press HOME until PAGE 11, touch the mode buttons at (272,145), (400,145), (528,145) and LIMIT at (656,145)"
+  },
+  "transport": {
+    "default_channels": "ak4458audio-0 channels 12..15, as before (the WAV is unchanged)",
+    "all_channels": "set SP16_PCM_PORT_CHANNELS=0:16 in the guest environment, or put 0:16 in <dev-overlay>/pcm-port-channels; the sink then still writes channels 12..15 to the WAV and offers every channel to the monitor"
+  }
+}

@@ -23,7 +23,8 @@ Wire format (the panel MCU's 128-byte frames; offsets are frame bytes):
      (both 1023 minus the raw word).
   E7 TX frame: byte 0 = 2; 32 RGB lamp channels (3 bytes each, R,G,B): channel 0x10+k -> bytes 1+3k, channel
      k -> bytes 0x31+3k (k = 0..15); 35 mono lamp channels bit-packed into bytes 0x61..0x65, most with a
-     second flag in 0x69..0x6b; extra flags at 0x66, 0x67, 0x68 (bit 0) and a 1..4 level at 0x6e.
+     second flag in 0x69..0x6b; extra flags at 0x66, 0x67, 0x68 (bit 0) and a 1..4 level at 0x6e. Byte 0x67 bit 0 is
+     the standby transition flag, decoded as "standby".
      Channel -> physical lamp assignments are recorded below only when observed.
 
 Per-version measurements (lamp roles, pad curve limits, the selector window) live in the firmware's compatibility
@@ -50,8 +51,9 @@ CONTROL_NAMES = {
 # Controls with no place in the panel layout (driven through the research socket): POWER/STANDBY is the M1 key that M2
 # relays as RX bit (5,4) (service manual key matrix; the app's PowerManager handles button object 14); INPUT LEVEL is
 # the rear analog gain pot; INPUT TONE is a test signal on the input jack and FILTER TONE one at the analog filter's
-# input, where the send DAC plays (research stimuli, level 0..1000, 0 = off).
-HOST_CONTROL_NAMES = {100: "power", 101: "input_level", 102: "input_tone", 103: "filter_tone"}
+# input, where the send DAC plays (research stimuli, level 0..1000, 0 = off); PRESSURE 1..16 holds a pad's raw pressure.
+HOST_CONTROL_NAMES = {100: "power", 101: "input_level", 102: "input_tone", 103: "filter_tone",
+                      **{109 + i: f"pressure{i}" for i in range(1, 17)}}
 ALL_CONTROL_NAMES = {**CONTROL_NAMES, **HOST_CONTROL_NAMES}
 CONTROL_IDS = {name: control for control, name in ALL_CONTROL_NAMES.items()}
 # Analog controls the board applies outside the firmware (no MCU sees them, or, for MAIN OUT, in addition to its ADC
@@ -60,6 +62,10 @@ CONTROL_IDS = {name: control for control, name in ALL_CONTROL_NAMES.items()}
 # and 5 (offset 22), so FILTER TONE is at offset 24.
 HOST_ANALOG = ("main_out", "input_level", "lp_cutoff", "lp_resonance", "input_tone", "filter_tone")
 INPUT_TONE_HZ = 1000
+# PRESSURE n (ids 110..125) holds pad n's raw pressure word (0..PAD_RAW_MAX, the AD value the factory test's pad
+# calibration page shows) instead of a velocity, so a calibration walkthrough can send 48..504 exactly. A value above 0
+# also sets the contact word; 0 lets go. The pad's velocity press and release keep working and override it.
+PAD_RAW_MAX = 1023
 
 FRAME_BYTES = 128
 PAD_A_OFFSET, PAD_B_OFFSET = 0x06, 0x3f
@@ -110,6 +116,9 @@ START_OFF = ("active",)
 COUNTERS = {name: (offset, sign) for name, (offset, sign) in PROFILE["panel"]["counters"].items()}
 
 TX_LENGTH, TX_HEADER, TX_MARKER_OFFSET, TX_MARKER = 128, 2, 0x77, 0xaa
+# The standby transition flag: TX byte 0x67 bit 0. The app sets it once it has handled the power key's release (and in
+# its start-up frames, so read it only after the home screen has settled); a real unit's M1 then cuts the power.
+TX_STANDBY_OFFSET = 0x67
 
 # E7: RGB lamp channel -> first of three consecutive bytes in the TX frame.
 RGB_CHANNELS = {**{0x10 + k: 1 + 3 * k for k in range(16)}, **{k: 0x31 + 3 * k for k in range(16)}}
@@ -136,7 +145,8 @@ def decode_tx(frame):
     mono = {ch: (frame[b] >> bit & 1, None if second is None else frame[second] >> bit & 1)
             for ch, (b, bit, second) in MONO_CHANNELS.items()}
     return {"rgb": rgb, "mono": mono, "level": frame[0x6e],
-            "extra": (frame[0x66] & 1, frame[0x67] & 1, frame[0x68] & 1)}
+            "extra": (frame[0x66] & 1, frame[0x67] & 1, frame[0x68] & 1),
+            "standby": bool(frame[TX_STANDBY_OFFSET] & 1)}
 
 
 # Lamp-only ids shared with panel-layout.json (they have no input).
@@ -158,13 +168,15 @@ LAMP_IDS = {name: lamp for lamp, name in LAMP_NAMES.items()}
 # segments 15-22 bottom to top, step n = RGB n-1 and pad n = RGB 0x10+n-1.
 LAMP_ROLES = profiles.lamp_roles(PROFILE)
 
-# Mono lamps are single-colour; this is only the host presentation colour.
-MONO_COLORS = {"over_led": (255, 40, 40), "rec": (255, 40, 40), "active": (255, 60, 60), "usb_stop": (255, 60, 60),
-               "play": (60, 255, 90), "lamp_pitch": (150, 255, 90), "lamp_repeat": (150, 255, 90),
-               "lamp_user1": (150, 255, 90), "lamp_user2": (150, 255, 90),
-               **{f"bar_led{i}": (60, 255, 90) for i in range(1, 5)},
+# Mono lamps are single-colour; this is only the host presentation colour. OVER (amber), USB CONNECT (yellow-green),
+# the REC and PLAY light pipes, the bar and strip LEDs are sampled from the manufacturer's top-view product render
+# and match the service manual's LED matrix colour classes (p11).
+MONO_COLORS = {"over_led": (255, 218, 68), "usb_led": (159, 241, 61), "rec": (255, 51, 91), "active": (255, 60, 60),
+               "usb_stop": (255, 60, 60), "play": (85, 247, 90), "lamp_pitch": (150, 255, 90),
+               "lamp_repeat": (150, 255, 90), "lamp_user1": (150, 255, 90), "lamp_user2": (150, 255, 90),
+               **{f"bar_led{i}": (91, 241, 49) for i in range(1, 5)},
                **{f"bar{i}": (70, 140, 255) for i in range(1, 5)},
-               **{f"strip_led{i}": (70, 130, 255) for i in range(1, 9)}}
+               **{f"strip_led{i}": (7, 124, 255) for i in range(1, 9)}}
 DIM = 0.35
 # E12: TX byte 0x6e is the PAD/BUTTON BRIGHTNESS level (Utility: NORMAL = 4, DIMMED 1..3 = 3..1).
 # The firmware already scales the RGB lamp bytes with it (step lamp 0x4a/0x25/0x18/0x12 at levels
@@ -177,6 +189,29 @@ def brightness_scale(level):
     return level / BRIGHTNESS_MAX if 1 <= level <= BRIGHTNESS_MAX else 1.0
 # E8: the all-lamps-on test page and step/pad lamps reach 0x4a; scale RGB to the full range.
 RGB_FULL = 74
+
+
+def led_srgb(duty):
+    """LED PWM duty 0..1 is linear light; return the sRGB-encoded 0..1 value a display needs. Without this the
+    firmware's dim track colours (about 22/74 per channel in MUTE mode) draw as muddy near-black hues."""
+    duty = min(1.0, max(0.0, duty))
+    return 12.92 * duty if duty <= 0.0031308 else 1.055 * duty ** (1 / 2.4) - 0.055
+
+
+# A lit RGB LED under a diffuser reads as a vivid colour even at low duty, which a flat screen cannot show by
+# luminance alone; the peak channel of a lit RGB lamp is lifted to at least this fraction (hue kept), so dim states
+# (MUTE-mode track colours at about 22/74) stay as recognisable as on the unit. Full duty is unchanged.
+LIT_RGB_FLOOR = 0.5
+
+
+def rgb_lamp(raw):
+    """Firmware RGB lamp bytes (0..RGB_FULL each) -> display (r, g, b)."""
+    srgb = [led_srgb(v / RGB_FULL) for v in raw]
+    peak = max(srgb)
+    if peak <= 0:
+        return (0, 0, 0)
+    lift = (LIT_RGB_FLOOR + (1 - LIT_RGB_FLOOR) * peak) / peak
+    return tuple(round(255 * min(1.0, c * lift)) for c in srgb)
 
 # E3/E10: velocity -> (raw A, raw B).
 # 1.60 profile: A_MIN 172 (with the staged all-242 calibration A=169 registers, A=168 does not), A_MAX 874 (firmware
@@ -209,7 +244,7 @@ def decode_lamps(frame):
 
     Mono lamps: first bit lit; where a second flag exists, 0 = full brightness and 1 = dim
     (observed: the active pad-mode button has the flag clear). RGB lamps are normalised
-    against RGB_FULL.
+    against RGB_FULL. Both are PWM duty (linear light) and are sRGB-encoded for display (led_srgb).
     """
     raw = decode_tx(frame)
     if raw is None:
@@ -219,10 +254,10 @@ def decode_lamps(frame):
     level = brightness_scale(raw["level"])
     for role, (kind, channel) in LAMP_ROLES.items():
         if kind == "rgb":
-            lamps[ids[role]] = tuple(min(255, v * 255 // RGB_FULL) for v in raw["rgb"][channel])
+            lamps[ids[role]] = rgb_lamp(raw["rgb"][channel])
             continue
         lit, flag = raw["mono"][channel]
         base = MONO_COLORS.get(role, (255, 255, 255))
-        scale = 0.0 if not lit else (DIM if flag else 1.0) * level
+        scale = 0.0 if not lit else led_srgb((DIM if flag else 1.0) * level)
         lamps[ids[role]] = tuple(round(c * scale) for c in base)
     return lamps

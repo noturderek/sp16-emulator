@@ -186,6 +186,11 @@ class PanelModel:
                     self.host_analog[name] = value
                     self.analog_changed = True
                 return INPUT_OK
+            if name.startswith("pressure"):
+                if action != "value" or not 0 <= value <= panel_map.PAD_RAW_MAX:
+                    return INPUT_INVALID
+                self._pressure(int(name[8:]) - 1, value)
+                return INPUT_OK
             if name.startswith("pad") and action in ("press", "release", "value"):
                 if self.pad_curve is None:
                     return INPUT_UNSUPPORTED
@@ -246,6 +251,12 @@ class PanelModel:
         self._set_word(panel_map.PAD_A_OFFSET + 2 * index, a)
         self.changed = True
         return INPUT_OK
+
+    def _pressure(self, index, raw):
+        """Hold pad `index`'s pressure word at `raw` (the calibration walkthrough); contact is set while it is above 0."""
+        self._set_word(panel_map.PAD_A_OFFSET + 2 * index, raw)
+        self._set_word(panel_map.PAD_B_OFFSET + 2 * index, panel_map.PAD_B_CONTACT if raw else 0)
+        self.changed = True
 
     def _pad_edge(self, index, action, value):
         a, b = self.pad_curve(value if action == "press" else 0)

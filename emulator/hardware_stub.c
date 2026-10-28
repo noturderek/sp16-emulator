@@ -86,8 +86,9 @@ static void tx_capture(const struct spi_message *m) {
     struct sockaddr_un address={ .sun_family=AF_UNIX };
     strcpy(address.sun_path,path);
     if (sendto(tx_fd,out,8+m->bytes,MSG_DONTWAIT,(struct sockaddr *)&address,sizeof(address))<0) {
-        if (++tx_dropped==(tx_dropped&-tx_dropped))
-            fprintf(stderr,"[sp16-ui-stub] panel TX frames dropped=%lu errno=%d\n",tx_dropped,errno);
+        unsigned long dropped=++tx_dropped; /* logged at powers of two */
+        if (dropped==(dropped&-dropped))
+            fprintf(stderr,"[sp16-ui-stub] panel TX frames dropped=%lu errno=%d\n",dropped,errno);
     } else tx_sent++;
 }
 
@@ -582,6 +583,7 @@ typedef unsigned long snd_pcm_uframes_t;
 typedef long snd_pcm_sframes_t;
 /* Diagnostic counters (logged every few seconds) so audio pacing can be measured, not guessed. */
 struct ax_ring;
+#define CODEC_RATE 44100u /* the only rate the codec clock offers, see codec_rate_fixed */
 struct pcm_state { snd_pcm_t *handle; unsigned int rate; int stream; char name[24];
                    uint64_t calls, frames, slept_ns, reported_ns, deadline_ns; int tid;
                    uint32_t logged; uint8_t io_logged; struct pcm_tap *tap; struct ax_ring *ax;
@@ -640,7 +642,7 @@ int snd_pcm_open(snd_pcm_t **handle, const char *name, int stream, int mode) {
     if (matched) {
         fprintf(stderr,"[sp16-ui-stub] PCM %s -> null stream=%d result=%d\n",name,stream,result);
         if (!result) for (unsigned i=0;i<16;i++) if (!pcms[i].handle) {
-            pcms[i]=(struct pcm_state){.handle=*handle,.rate=48000,.stream=stream};
+            pcms[i]=(struct pcm_state){.handle=*handle,.rate=CODEC_RATE,.stream=stream};
             snprintf(pcms[i].name,sizeof(pcms[i].name),"%s",name); break; }
     }
     return result;
@@ -670,6 +672,15 @@ static int codec_refuses(const struct pcm_state *s,int format) {
     if (!s || (any && !strcmp(any,"1")) || strncmp(s->name,"hw:ak4452audio,",15)) return 0;
     return format!=2 && format!=6 && format!=36;
 }
+/* The codec master clock is 1024 x 44.1 kHz and has no other setting (service manual clock tree), so every board PCM
+ * accepts 44100 Hz only. set_rate refuses anything else as a driver restricted to one rate would; set_rate_near
+ * answers 44100 whatever was asked, the way a near-search over a one-element rate set does. SP16_PCM_ANY_RATE=1
+ * (research) restores the null plugin's answer. */
+static int codec_rate_fixed(const struct pcm_state *s) {
+    const char *any=getenv("SP16_PCM_ANY_RATE");
+    return s && !(any && !strcmp(any,"1"));
+}
+static int codec_rate_refused(const struct pcm_state *s,unsigned int rate) { return codec_rate_fixed(s) && rate!=CODEC_RATE; }
 int snd_pcm_hw_params_set_format(snd_pcm_t *handle,snd_pcm_hw_params_t *params,int format) {
     int (*real)(snd_pcm_t *,snd_pcm_hw_params_t *,int)=alsa_symbol("snd_pcm_hw_params_set_format");
     if (!real) { errno=ENOSYS; return -ENOSYS; }
@@ -691,8 +702,9 @@ int snd_pcm_hw_params_set_channels(snd_pcm_t *handle,snd_pcm_hw_params_t *params
 int snd_pcm_hw_params_set_rate(snd_pcm_t *handle,snd_pcm_hw_params_t *params,unsigned int rate,int direction) {
     int (*real)(snd_pcm_t *,snd_pcm_hw_params_t *,unsigned int,int)=alsa_symbol("snd_pcm_hw_params_set_rate");
     if (!real) { errno=ENOSYS; return -ENOSYS; }
-    int result=real(handle,params,rate,direction);
     struct pcm_state *s=pcm(handle);
+    int result=codec_rate_refused(s,rate)?-EINVAL:real(handle,params,rate,direction);
+    if (!result && s) s->rate=rate;
     if (s && first_time(s,3)) fprintf(stderr,"[sp16-ui-stub] PCM %s set_rate requested=%u dir=%d result=%d\n",
                                       s->name,rate,direction,result);
     return result;
@@ -702,8 +714,10 @@ int snd_pcm_hw_params_set_rate_near(snd_pcm_t *handle,snd_pcm_hw_params_t *param
     if (!real) real=alsa_symbol("snd_pcm_hw_params_set_rate_near");
     if (!real) { errno=ENOSYS; return -ENOSYS; }
     unsigned int requested=rate?*rate:0; int requested_dir=direction?*direction:0;
+    struct pcm_state *s=pcm(handle);
+    if (codec_rate_fixed(s) && rate) { *rate=CODEC_RATE; if (direction) *direction=0; } /* the clock offers one rate only */
     int result=real(handle,params,rate,direction);
-    struct pcm_state *s=pcm(handle); if (!result && s && rate && *rate) s->rate=*rate;
+    if (!result && s && rate && *rate) s->rate=*rate;
     if (s && first_time(s,4)) fprintf(stderr,"[sp16-ui-stub] PCM %s set_rate_near requested=%u dir=%d returned=%u dir=%d result=%d\n",
                                       s->name,requested,requested_dir,rate?*rate:0,direction?*direction:0,result);
     return result;
@@ -884,6 +898,12 @@ static void ax_init(struct pcm_state *s,unsigned channels,int format) {
     unsigned first=0, count=channels;
     if (id==0 && channels==16) { first=12; count=4; } /* ch12/14 carry the metronome and samples; ch13/15 are not audio-like */
     const char *env=id==0?getenv("SP16_PCM_PORT_CHANNELS"):NULL; /* research override "first:count" */
+    char from_share[32];
+    if (id==0 && !env && original_open && original_read) { /* the same override from the developer share, for a build whose environment is fixed */
+        int fd=original_open("/opt/sp16/dev-share/pcm-port-channels",O_RDONLY|O_CLOEXEC);
+        if (fd>=0) { ssize_t n=original_read(fd,from_share,sizeof from_share-1); original_close(fd);
+                     if (n>0) { from_share[n]=0; env=from_share; } }
+    }
     if (env) { unsigned a,b; if (sscanf(env,"%u:%u",&a,&b)==2 && b && a+b<=channels) { first=a; count=b; } }
     __atomic_store_n(&r->active,0,__ATOMIC_RELEASE);
     /* S24_LE (24 bits low in a 32-bit word) travels as FLOAT_LE, the format the host sink already writes */
@@ -1030,6 +1050,17 @@ static float bm_exp2(float x) { /* 2^x, relative error < 1e-4 for |x| < 60 */
     return r;
 }
 #define BM_DECADES3 9.965784f /* log2(1000): 20 Hz .. 20 kHz over the pot or DAC range */
+static float bm_log2(float x) { /* log2 for x > 0, error < 1e-4: exponent from the bits, mantissa by an atanh series */
+    uint32_t bits; memcpy(&bits,&x,4);
+    int e=(int)((bits>>23)&0xff)-127;
+    bits=(bits&0x7fffffu)|0x3f800000u; float m; memcpy(&m,&bits,4); /* [1,2) */
+    float t=(m-1)/(m+1), t2=t*t;
+    return (float)e+2.8853901f*t*(1+t2/3*(1+t2*3/5*(1+t2*5/7)));
+}
+/* Level scale (grade I, not measured on a unit): the converters' full scale is the rated maximum level of the jacks,
+ * +16 dBu (input and output). The dBu readouts in the metrics are dBFS + 16. */
+#define FS_DBU 16.0f
+static float to_dbu(float peak) { return peak>1e-6f?FS_DBU+6.0205999f*bm_log2(peak):-99.0f; }
 
 /* DAC7811 (high-pass control voltage): the app writes one little-endian 16-bit word per change, only when the
  * HPF pot word changes. The word is control nibble (bits 15..12) + 12-bit code. Logged on change, at most one line
@@ -1195,29 +1226,220 @@ static void loop_return(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frame
         loop_send_peak=loop_return_peak=0; loop_report_ns=now;
     }
 }
-/* MAIN OUT: an analog volume on the master jacks, applied to the copy the host hears (the app's own buffer, the PCM
- * tap and the firmware's ADC word are untouched). Which master channels feed OUT1-2 is not mapped yet, so it scales
- * every channel the transport sends from the master stream. */
+/* Level meters for the metrics: peaks over the report window (linear, 1.0 = converter full scale). The input meter sits after
+ * INPUT LEVEL and before the limiter; the output meter is the MAIN pair after MAIN OUT. */
+static float meter_in_peak, meter_out_peak;
+static unsigned long meter_limited;
+static int meter_source, meter_limiter_logged=-1;  /* 0 off, 1 tone, 2 wav */
+static uint64_t meter_report_ns;
+/* Jack map of the AK4458 master stream, measured with the factory test's AUDIO TEST (docs/audio-jack-map.md): the
+ * stream is 16 S16 channels, i.e. 8 DAC slots of two channels, and only the even channel of a slot carries audio
+ * (the odd one is padding). MODE3 (input -> filter -> OUT1/2 + MASTER) lit channels 12 and 14 only, MODE2 (-> OUT7-8)
+ * channels 0 and 2 only, so OUT1-2 = ch12/ch14 (observed), OUT7-8 = ch0/ch2 (observed), OUT3-4 = ch8/ch10 and
+ * OUT5-6 = ch4/ch6 (inferred from the slot order; MODE1 alone lights all four pairs). */
+#define MAIN_PAIR_LEFT 12u
+#define MAIN_PAIR_RIGHT 14u
+/* MAIN OUT: an analog volume on OUT1-2 / MASTER, applied to the copy the host hears (the app's own buffer, the PCM
+ * tap and the firmware's ADC word are untouched). Only the channels of that pair are scaled; the other jacks are
+ * not behind this knob. The out meter reports the same pair. */
 static void main_out_scale(struct ax_ring *r,uint8_t *data,uint32_t frames) {
     struct analog a=analog_now;
-    if (!a.main_set || a.main_gain==1) return;
     unsigned w=r->width, count=frames*r->sent_ch;
-    for (unsigned i=0;i<count;i++) bm_put(data+(size_t)i*w,(int)r->fmt,bm_get(data+(size_t)i*w,(int)r->fmt)*a.main_gain);
+    int scale=a.main_set && a.main_gain!=1;
+    for (unsigned i=0;i<count;i++) {
+        unsigned channel=r->first_ch+i%r->sent_ch;
+        if (channel!=MAIN_PAIR_LEFT && channel!=MAIN_PAIR_RIGHT) continue;
+        uint8_t *q=data+(size_t)i*w;
+        float v=bm_get(q,(int)r->fmt)*(scale?a.main_gain:1);
+        if (scale) bm_put(q,(int)r->fmt,v);
+        float m=v<0?-v:v; if (m>meter_out_peak) meter_out_peak=m;
+    }
 }
-/* Input jack: silence unless the host turned on the test tone; INPUT LEVEL scales it. The null plugin leaves a capture
- * buffer untouched, so silence is written (all-zero bytes are 0 in every format the codec takes, and 0.0 in FLOAT_LE)
- * or the app's reused buffer would keep the last tone samples. */
+/* Input jack. Source, in order: a WAV the host placed in the developer share (research builds, `./sp16 run
+ * --dev-overlay DIR` with DIR/input.wav; SP16_INPUT_WAV overrides the path), else the host test tone, else silence.
+ * The WAV is 16/24/32-bit PCM or 32-bit float, mono or stereo (mono feeds both channels), up to 64 MB, looped, and
+ * resampled linearly to the codec rate; it is re-read when its size changes (looked at once a second, or every
+ * SP16_INPUT_WAV_POLL_MS milliseconds). Chain, as on the board: INPUT LEVEL gain, then the input limiter when the
+ * firmware has switched it on (GPIO5_IO06), then the converter. The null plugin leaves a capture buffer untouched, so
+ * silence is written (all-zero bytes are 0 in every format the codec takes, and 0.0 in FLOAT_LE) or the app's reused
+ * buffer would keep the last tone samples.
+ *
+ * The file is copied into private memory (a mapping of a file the host truncates or replaces would fault). Threads: the
+ * capture thread holds `inject_busy` for the whole of input_fill; the refresh runs on whichever PCM thread reaches pace()
+ * first (one at a time, `inject_refreshing`), does its file work without the lock and takes it only to swap the source,
+ * then unmaps the old copy, which no reader can reach any more. */
+struct inject { uint8_t *base; size_t size; const uint8_t *data; size_t bytes; unsigned channels, bits, is_float;
+                double rate, pos; uint64_t frames; };
+#define INJECT_MAX_BYTES (64u<<20)
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20
+#endif
+static struct inject inject_now;         /* the source: read and replaced only with inject_busy held */
+static int inject_busy;                  /* 1 while input_fill runs or the source is being swapped */
+static int inject_refreshing;            /* 1 while one thread looks at the file */
+static uint64_t inject_checked_ns, inject_poll_ns;
+static size_t inject_loaded, inject_rejected; /* size of the WAV in use; size of the last file that was not usable (0: none) */
+static int inject_parse(struct inject *w,const uint8_t *b,size_t size) {
+    if (size<44 || memcmp(b,"RIFF",4) || memcmp(b+8,"WAVE",4)) return 0;
+    unsigned fmt_tag=0, channels=0, bits=0; uint32_t rate=0; size_t at=12;
+    int have_fmt=0;
+    while (at+8<=size) {
+        uint32_t len; memcpy(&len,b+at+4,4);
+        if (!memcmp(b+at,"fmt ",4) && len>=16 && at+8+16<=size) {
+            uint16_t v; memcpy(&v,b+at+8,2); fmt_tag=v; memcpy(&v,b+at+10,2); channels=v;
+            memcpy(&rate,b+at+12,4); memcpy(&v,b+at+22,2); bits=v;
+            if (fmt_tag==0xfffe && len>=26 && at+8+26<=size) { memcpy(&v,b+at+8+24,2); fmt_tag=v; }
+            have_fmt=1;
+        } else if (!memcmp(b+at,"data",4) && have_fmt) {
+            size_t avail=size-(at+8); if (len>avail) len=(uint32_t)avail;
+            int ok=(fmt_tag==1 && (bits==16 || bits==24 || bits==32)) || (fmt_tag==3 && bits==32);
+            if (!ok || (channels!=1 && channels!=2) || !rate || len<channels*bits/8) return 0;
+            w->data=b+at+8; w->bytes=len; w->channels=channels; w->bits=bits; w->is_float=fmt_tag==3; w->rate=(double)rate;
+            w->frames=len/(channels*bits/8); w->pos=0; return 1;
+        }
+        at+=8+((size_t)len+1)/2*2;
+    }
+    return 0;
+}
+static float inject_sample(const struct inject *w,uint64_t frame,unsigned c) {
+    const uint8_t *p=w->data+(size_t)frame*w->channels*(w->bits/8)+(c<w->channels?c:0)*(w->bits/8);
+    if (w->is_float) { float f; memcpy(&f,p,4); return f; }
+    if (w->bits==16) { int16_t v; memcpy(&v,p,2); return (float)v/32768.0f; }
+    if (w->bits==24) { int32_t v=(int32_t)((uint32_t)p[0]<<8|(uint32_t)p[1]<<16|(uint32_t)p[2]<<24)>>8; return (float)v/8388608.0f; }
+    int32_t v; memcpy(&v,p,4); return (float)v/2147483648.0f;
+}
+static void inject_lock(void) {
+    while (__atomic_exchange_n(&inject_busy,1,__ATOMIC_ACQUIRE)) { struct timespec t={ .tv_nsec=20000 }; nanosleep(&t,NULL); }
+}
+static void inject_unlock(void) { __atomic_store_n(&inject_busy,0,__ATOMIC_RELEASE); }
+/* Make `next` (NULL: nothing) the source and return the old one, which no reader can reach any more. */
+static struct inject inject_swap(const struct inject *next) {
+    inject_lock();
+    struct inject old=inject_now;
+    if (next) inject_now=*next; else memset(&inject_now,0,sizeof inject_now);
+    __atomic_store_n(&inject_loaded,next?next->size:0,__ATOMIC_RELEASE);
+    inject_unlock();
+    return old;
+}
+static void inject_reload(void) {
+    const char *path=getenv("SP16_INPUT_WAV"); if (!path) path="/opt/sp16/dev-share/input.wav";
+    size_t loaded=__atomic_load_n(&inject_loaded,__ATOMIC_ACQUIRE);
+    int fd=original_open(path,O_RDONLY|O_CLOEXEC);
+    if (fd<0) {
+        inject_rejected=0;
+        if (loaded) { struct inject old=inject_swap(NULL); munmap(old.base,old.size);
+                      fprintf(stderr,"[sp16-ui-stub] input injection: %s removed\n",path); }
+        return;
+    }
+    off_t end=lseek(fd,0,SEEK_END);
+    if (end<44 || (size_t)end==loaded || (size_t)end==inject_rejected) { original_close(fd); return; }
+    if (end>(off_t)INJECT_MAX_BYTES) {
+        inject_rejected=(size_t)end; original_close(fd);
+        fprintf(stderr,"[sp16-ui-stub] input injection: %s is larger than %u MB\n",path,INJECT_MAX_BYTES>>20); return; }
+    uint8_t *copy=mmap(NULL,(size_t)end,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if (copy==(uint8_t *)MAP_FAILED) { original_close(fd); return; }
+    size_t got=0;
+    if (lseek(fd,0,SEEK_SET)==0) while (got<(size_t)end) {
+        ssize_t n=original_read(fd,copy+got,(size_t)end-got); if (n<=0) break; got+=(size_t)n; }
+    off_t again=lseek(fd,0,SEEK_END); original_close(fd);
+    if (got!=(size_t)end || again!=end) { munmap(copy,(size_t)end); return; } /* changing while read: look again at the next poll */
+    struct inject next={ .base=copy, .size=(size_t)end };
+    if (!inject_parse(&next,copy,(size_t)end)) {
+        munmap(copy,(size_t)end); inject_rejected=(size_t)end;
+        fprintf(stderr,"[sp16-ui-stub] input injection: %s is not a usable WAV (16/24/32-bit PCM or float, mono or stereo)\n",path);
+        return; }
+    inject_rejected=0;
+    struct inject old=inject_swap(&next);
+    if (old.base) munmap(old.base,old.size);
+    fprintf(stderr,"[sp16-ui-stub] input injection: %s channels=%u bits=%u rate=%.0f frames=%lu\n",path,next.channels,next.bits,
+            next.rate,(unsigned long)next.frames);
+}
+/* Called from pace() on every PCM thread: at most one thread at a time looks at the file, and a thread that finds another
+ * one at it simply goes on. */
+static void inject_refresh(uint64_t now) {
+    uint64_t poll=__atomic_load_n(&inject_poll_ns,__ATOMIC_RELAXED);
+    if (!poll) { /* SP16_INPUT_WAV_POLL_MS (tests): how often the file is looked at, default 1000 */
+        unsigned ms=1000; const char *e=getenv("SP16_INPUT_WAV_POLL_MS"); if (e) sscanf(e,"%u",&ms);
+        poll=(uint64_t)(ms?ms:1)*1000000ULL; __atomic_store_n(&inject_poll_ns,poll,__ATOMIC_RELAXED);
+    }
+    uint64_t last=__atomic_load_n(&inject_checked_ns,__ATOMIC_RELAXED);
+    if (last && (now<last || now-last<poll)) return;
+    if (!original_open || !original_read || __atomic_exchange_n(&inject_refreshing,1,__ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&inject_checked_ns,now,__ATOMIC_RELAXED);
+    inject_reload();
+    __atomic_store_n(&inject_refreshing,0,__ATOMIC_RELEASE);
+}
+
+/* Input limiter (GPIO5_IO06, the AUDIO TEST LIMIT button). Level above the threshold is soft-saturated towards full
+ * scale. The threshold and curve are assumptions (grade U: the unit's limiter was not measured); high = on (grade I,
+ * from the line name LMT_xOFF/ON). Below the threshold the signal passes unchanged. */
+#define LIMITER_THRESHOLD 0.5f
+static int limiter_on(void) {
+    return __atomic_load_n(&gpio_written[4*32+6],__ATOMIC_ACQUIRE) && __atomic_load_n(&gpio_level[4*32+6],__ATOMIC_ACQUIRE)==1;
+}
+static float limit_soft(float x) {
+    float a=x<0?-x:x;
+    if (a<=LIMITER_THRESHOLD) return x;
+    float over=(a-LIMITER_THRESHOLD)/(1-LIMITER_THRESHOLD), y=LIMITER_THRESHOLD+(1-LIMITER_THRESHOLD)*over/(1+over);
+    return x<0?-y:y;
+}
+static void meter_report(uint64_t now,int force) {
+    int lim=limiter_on();
+    if (!force && lim==meter_limiter_logged && now-meter_report_ns<2000000000ULL) return;
+    if (!force && lim==meter_limiter_logged && meter_in_peak<=0 && meter_out_peak<=0) { meter_report_ns=now; return; }
+    struct analog a=analog_now;
+    static const char *const names[]={"off","tone","wav"};
+    float in=meter_in_peak, out=meter_out_peak;
+    meter_report_ns=now; meter_limiter_logged=lim;
+    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu=%.1f out_peak=%.4f out_dbu=%.1f limited=%lu "
+            "main_out_gain=%.4f input_gain=%.4f source=%s\n",lim,(double)in,(double)to_dbu(in),(double)out,(double)to_dbu(out),
+            meter_limited,(double)a.main_gain,(double)a.input_gain,names[meter_source]);
+    meter_in_peak=meter_out_peak=0; meter_limited=0;
+}
+static void input_fill_locked(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames);
 static void input_fill(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames) {
+    inject_lock();                       /* a refresh cannot swap or unmap the source while this call reads it */
+    input_fill_locked(s,buffer,frames);
+    inject_unlock();
+}
+static void input_fill_locked(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames) {
     struct analog a=analog_now;
     unsigned w=bm_width(s->format);
     if (!w || !s->channels || frames<=0 || !buffer) return;
-    if (a.tone_amp<=0) { memset(buffer,0,(size_t)frames*w*s->channels); return; }
+    struct inject *wav=&inject_now;
+    int use_wav=wav->data!=NULL, limiter=limiter_on();
+    meter_source=use_wav?2:a.tone_amp>0?1:0;
+    if (!use_wav && a.tone_amp<=0) {
+        /* Research switch (file `capture-stale` in the developer share): reproduce what a silent capture did before the
+         * buffer was written. "untouched" leaves the app's buffer as it is, "pattern" fills it with 0x5a bytes. */
+        static int stale=-1;
+        if (stale<0) {
+            char mode[16]={0}; int fd=original_open?original_open("/opt/sp16/dev-share/capture-stale",O_RDONLY|O_CLOEXEC):-1;
+            if (fd>=0) { ssize_t n=original_read?original_read(fd,mode,sizeof mode-1):0; (void)n; original_close(fd); }
+            stale=!strncmp(mode,"untouched",9)?1:!strncmp(mode,"pattern",7)?2:0;
+        }
+        if (stale==1) return;
+        memset(buffer,stale==2?0x5a:0,(size_t)frames*w*s->channels);
+        return;
+    }
     float rate=(float)(s->rate?s->rate:44100), step=2*BM_PI*a.tone_hz/rate, amp=a.tone_amp*a.input_gain;
     uint8_t *p=buffer; unsigned bpf=w*s->channels;
+    double advance=use_wav?wav->rate/(double)rate:0;
     for (snd_pcm_sframes_t i=0;i<frames;i++,p+=bpf) {
-        float y=amp*bm_sin(s->phase);
-        s->phase+=step; if (s->phase>BM_PI) s->phase-=2*BM_PI;
-        for (unsigned c=0;c<s->channels;c++) bm_put(p+c*w,s->format,y);
+        float y[2];
+        if (use_wav) {
+            uint64_t f0=(uint64_t)wav->pos, f1=f0+1<wav->frames?f0+1:0; float t=(float)(wav->pos-(double)f0);
+            for (unsigned c=0;c<2;c++) y[c]=a.input_gain*(inject_sample(wav,f0,c)*(1-t)+inject_sample(wav,f1,c)*t);
+            wav->pos+=advance; while (wav->pos>=(double)wav->frames) wav->pos-=(double)wav->frames; /* a short file at a high rate wraps more than once */
+        } else {
+            y[0]=y[1]=amp*bm_sin(s->phase);
+            s->phase+=step; if (s->phase>BM_PI) s->phase-=2*BM_PI;
+        }
+        for (unsigned c=0;c<2;c++) {
+            float m=y[c]<0?-y[c]:y[c]; if (m>meter_in_peak) meter_in_peak=m;
+            if (limiter) { float l=limit_soft(y[c]); if (l!=y[c]) meter_limited++; y[c]=l; }
+        }
+        for (unsigned c=0;c<s->channels;c++) bm_put(p+c*w,s->format,y[c<2?c:1]);
     }
 }
 
@@ -1233,6 +1455,8 @@ static void pace(snd_pcm_t *handle,snd_pcm_sframes_t frames,unsigned method) {
     if (frames<=0) return;
     uint64_t step=(uint64_t)frames*1000000000ULL/s->rate, now=mono_ns();
     analog_refresh(now);
+    inject_refresh(now);
+    meter_report(now,0);
     dac_flush(now);
     if (!s->deadline_ns || now>s->deadline_ns+PCM_MAX_LAG_NS) s->deadline_ns=now;
     s->deadline_ns+=step;
