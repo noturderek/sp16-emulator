@@ -298,16 +298,23 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
         let destinations = clockDestinations
         guard port != 0, !destinations.isEmpty else { return }
         var clock = [UInt8(0xF8)]
-        var buffer = [UInt8](repeating: 0, count: 256)
-        let list = buffer.withUnsafeMutableBytes { raw -> MIDIPacketList in
+        // A MIDIPacketList is a packet count followed by whole MIDIPacket records, and a MIDIPacket carries a
+        // 256-byte data window on top of its timestamp and length (`sizeof(MIDIPacketList)` is 272), so a literal
+        // 256-byte scratch buffer is smaller than the list bound to it: copying the list back out read past its end.
+        // Size the buffer from the struct (`stride` keeps the list's trailing padding) and send straight from it.
+        let capacity = MemoryLayout<MIDIPacketList>.stride
+        var buffer = [UInt8](repeating: 0, count: capacity)
+        let sent = buffer.withUnsafeMutableBytes { raw -> Bool in
             let listPtr = raw.baseAddress!.assumingMemoryBound(to: MIDIPacketList.self)
             let packet = MIDIPacketListInit(listPtr)
-            _ = MIDIPacketListAdd(listPtr, raw.count, packet, 0, clock.count, &clock)
-            return listPtr.pointee
+            guard MIDIPacketListAdd(listPtr, raw.count, packet, 0, clock.count, &clock) != nil else { return false }
+            for endpoint in destinations {
+                MIDISend(port, endpoint.ref, listPtr)
+            }
+            return true
         }
-        var copy = list
-        for endpoint in destinations {
-            MIDISend(port, endpoint.ref, &copy)
+        if !sent {
+            NSLog("MIDI routing: one clock packet did not fit in the %ld-byte packet list", capacity)
         }
     }
 

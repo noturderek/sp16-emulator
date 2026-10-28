@@ -210,12 +210,25 @@ def absent_reason(profile, capability):
     return None
 
 
+def declared_known_failing(profile):
+    """The profile's hardware.known_failing entries, skipping anything malformed.
+
+    A run validates the profile first (profiles.validate), but these readers also see a hand-edited or half-written
+    file, so an entry that is not an object with a string check is skipped here instead of raising an AttributeError
+    out of a check or out of mark_verified."""
+    hardware = profile.get("hardware") if isinstance(profile, dict) else None
+    entries = hardware.get("known_failing") if isinstance(hardware, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [item for item in entries if isinstance(item, dict) and isinstance(item.get("check"), str)]
+
+
 def known_failing(profile, hw_id):
     """The profile's declaration that a check is expected to fail (an owner sign-off that records the measured gap),
     or None. A check marked here still runs and records its measured figures, but its FAIL verdict is re-labelled
     KNOWN-FAIL so it does not block verification while the cause is investigated."""
-    for item in (profile.get("hardware") or {}).get("known_failing") or []:
-        if item.get("check") == hw_id:
+    for item in declared_known_failing(profile):
+        if item["check"] == hw_id:
             return item
     return None
 
@@ -4514,7 +4527,7 @@ def mark_verified(profile_path, result, result_path, result_sha256):
     profile = json.loads(raw)
     summary, run = result["summary"], result["run"]
     if not summary["verified_eligible"]:
-        raise EnvError("run is not eligible: full tier without --only, every check PASS or N/A")
+        raise EnvError("run is not eligible: full tier without --only, every check PASS, KNOWN-FAIL or N/A")
     if run["profile_sha256"] != hashlib.sha256(raw).hexdigest():
         raise EnvError("the profile changed after the run")
     if run["app_sha256"] != profile["firmware"]["app_sha256"]:
@@ -4524,7 +4537,7 @@ def mark_verified(profile_path, result, result_path, result_sha256):
     unjustified = [v["id"] for v in na if v["reason"] not in absent and not v["reason"].startswith("precondition:")]
     if unjustified:
         raise EnvError(f"N/A without a declared hardware.absent reason: {unjustified}")
-    known = {item.get("check") for item in (profile.get("hardware") or {}).get("known_failing") or []}
+    known = {item["check"] for item in declared_known_failing(profile)}
     undeclared = [v["id"] for v in result["verdicts"] if v["status"] == "KNOWN-FAIL" and v["id"] not in known]
     if undeclared:
         raise EnvError(f"KNOWN-FAIL without a declared hardware.known_failing entry: {undeclared}")
