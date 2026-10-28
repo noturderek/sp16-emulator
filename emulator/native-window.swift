@@ -298,6 +298,14 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         glow.target = self
         viewMenu.addItem(glow)
         viewItem.submenu = viewMenu
+        let outputItem = NSMenuItem(); menu.addItem(outputItem)
+        let outputMenu = NSMenu(title: "Output")
+        for jack in [AudioSink.OutputJack.main, .phones, .out34, .out56, .out78] {
+            let item = NSMenuItem(title: jack.rawValue, action: #selector(monitorChosen(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = jack.rawValue
+            outputMenu.addItem(item)
+        }
+        outputItem.submenu = outputMenu
         let inputItem = NSMenuItem(); menu.addItem(inputItem)
         let inputMenu = NSMenu(title: "Input")
         let release = NSMenuItem(title: "Release All Holds", action: #selector(releaseAllHolds), keyEquivalent: ".")
@@ -308,6 +316,15 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     @objc func releaseAllHolds() { panel.releaseAll() }
+
+    // MARK: Output monitor
+
+    /// Choose which output jack pair the CoreAudio output plays (MAIN by default). The WAV files never change.
+    @objc func monitorChosen(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String, let jack = AudioSink.OutputJack(rawValue: name) else { return }
+        audioSink?.monitor = jack
+        AppLog.log("output monitor: \(jack.rawValue)")
+    }
 
     // MARK: Power on with keys held
 
@@ -420,6 +437,9 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         case #selector(toggleSkin(_:)):
             item.state = panel.showSkin ? .on : .off
             return panel.hasSkin     // greyed out when private/skin/overlay.png is absent
+        case #selector(monitorChosen(_:)):
+            item.state = (audioSink?.monitor.rawValue == item.representedObject as? String) ? .on : .off
+            return audioSink != nil
         default: break
         }
         return true
@@ -901,6 +921,13 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             guard let on = command["on"] as? Bool else { return "{\"error\":\"fault needs on true|false\"}" }
             DispatchQueue.main.sync { self.setFault(on) }
             return "{\"ok\":true}"
+        case "monitor":
+            // Which output jack pair the CoreAudio output plays; the WAV files never change.
+            guard let name = command["name"] as? String, let jack = AudioSink.OutputJack(rawValue: name) else {
+                return "{\"error\":\"monitor needs name MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8\"}"
+            }
+            audioSink?.monitor = jack
+            return "{\"ok\":true,\"monitor\":\"\(jack.rawValue)\"}"
         case "view":
             // View toggles for screenshots: rear on|off, glow on|off.
             guard let name = command["name"] as? String, ["rear", "glow", "skin"].contains(name),

@@ -282,6 +282,19 @@ class SessionctlTests(unittest.TestCase):
         sessionctl.run_command(session, "fault", ["off"])
         self.assertEqual([c.args for c in session.fault.call_args_list], [(True,), (False,)])
 
+    def test_monitor_sends_the_jack_name(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        self.assertEqual(session.monitor("PHONES"), {"ok": True})
+        self.assertEqual(app.received, [{"op": "monitor", "name": "PHONES"}])
+
+    def test_monitor_on_the_command_line_refuses_an_unknown_jack(self):
+        runtime = self.runtime(self.app("answer"))
+        result = subprocess.run([sys.executable, str(TOOLS / "sessionctl.py"), "--runtime", str(runtime), "monitor", "X"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("monitor needs MAIN", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

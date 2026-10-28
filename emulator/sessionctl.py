@@ -245,6 +245,10 @@ class Session:
         """Force the power-fault display (QRT1001 p24): dark panel, WAKE UP blinking red; off restores."""
         return self.call(op="fault", on=on)
 
+    def monitor(self, name):
+        """Choose which output jack pair the CoreAudio output plays (MAIN, PHONES, OUT3-4, OUT5-6, OUT7-8)."""
+        return self.call(op="monitor", name=name)
+
     def metrics(self):
         return self.call(op="metrics")
 
@@ -268,7 +272,7 @@ def main():
     parser.add_argument("command", choices=["event", "press", "turn", "touch", "raw", "clear",
                                             "snapshot", "metrics", "txlog", "period", "panelshot", "resize", "adc", "usb",
                                             "app-restart", "firmware", "power", "standby", "pressure", "calibrate",
-                                            "fault"])
+                                            "fault", "monitor"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=None,
                         help=f"seconds to wait for each reply (default SP16_CONTROL_TIMEOUT or {DEFAULT_TIMEOUT:g})")
@@ -331,6 +335,10 @@ def run_command(session, command, a):
         result = session.standby()
     elif command == "fault":
         result = session.fault(a[:1] != ["off"])
+    elif command == "monitor":
+        if not a or a[0] not in ("MAIN", "PHONES", "OUT3-4", "OUT5-6", "OUT7-8"):
+            raise RuntimeError("monitor needs MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8")
+        result = session.monitor(a[0])
     elif command == "app-restart":
         result = session.app_restart()
     elif command == "firmware":
