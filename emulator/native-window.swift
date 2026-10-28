@@ -57,6 +57,10 @@ enum Kind {
     static let txFrame: UInt8 = 10, stats: UInt8 = 11
 }
 
+/// Host power state machine (QRT1001 p15): BOOT (boot overlay) → RUN at the first LCD frame, OFF (dark panel, WAKE UP
+/// lit) when the firmware's standby flag (TX byte 0x67 bit 0) latches, and back to BOOT when it clears.
+enum PowerState { case boot, run, off }
+
 /// Fixed-size sample window for latency percentiles.
 struct Samples {
     private var values: [Double] = []
@@ -84,6 +88,8 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// True once `applicationShouldTerminate` has started teardown: a second quit request (a second SIGTERM, Cmd-Q)
     /// must not spawn a second teardown thread or wedge the reply. Read and written under `lock`.
     var terminating = false
+    /// The power/boot state machine, driven on the main thread from the TX standby flag and the first LCD frame.
+    var powerState: PowerState = .boot
     var pendingFrame: Data?
     var drawing = false
     var lastPixels: Data?
@@ -196,6 +202,14 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             if mode == "coreaudio" || mode == "both" {
                 output = AudioOutput(deviceUID: device, offline: device.flatMap { OfflineSpec($0) })
                 output?.start()
+                // Power-on mute: the firmware holds xMUTE for about 19.5 s after power-on (QRT1001 p15), so the host
+                // output stays silent through the boot-time codec noise instead of playing it.
+                output?.muted = true
+                let out = output
+                DispatchQueue.global().asyncAfter(deadline: .now() + 19.5) {
+                    out?.muted = false
+                    AppLog.log("audio: power-on mute released")
+                }
             }
             let sink = AudioSink(socketPath: config.socket + ".pcm", directory: config.session,
                                  writeFiles: (mode == "file" || mode == "both") && !audioFilesDisabled, output: output,
@@ -543,11 +557,43 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             }
         case Kind.txFrame:
             writeTxLog(body.dropFirst())
+            if let standby = txStandbyFlag(body) {
+                DispatchQueue.main.async { [weak self] in self?.applyStandby(standby) }
+            }
         case Kind.stats:
             if let object = try? JSONSerialization.jsonObject(with: body.dropFirst()) as? [String: Any] {
                 lock.lock(); guestStats = object; lock.unlock()
             }
         default: throw NSError(domain: "Unknown native message", code: 4)
+        }
+    }
+
+    /// The TX standby flag (byte 0x67 bit 0 of the 128-byte OEM frame) from a txFrame message, or nil when the frame
+    /// is not complete. The payload after the kind byte is `multi, part, parts` then the frame; panel_map.py decode_tx
+    /// reads the same layout.
+    func txStandbyFlag(_ body: Data) -> Bool? {
+        let payload = body.dropFirst()                       // [multi, part, parts] + 128-byte frame
+        guard payload.count >= 3 + 128 else { return nil }
+        let frame = payload.startIndex + 3
+        guard payload[frame] == 2, payload[frame + 0x77] == 0xaa else { return nil }   // TX_HEADER, TX_MARKER
+        return payload[frame + 0x67] & 1 == 1
+    }
+
+    /// Drive the panel from the firmware's standby flag: latch OFF (dark, WAKE UP lit) on standby, return to BOOT when
+    /// it clears. Main thread only.
+    func applyStandby(_ standby: Bool) {
+        if standby {
+            guard powerState != .off else { return }
+            powerState = .off
+            panel.releaseAll()
+            panel.setPanelDark(true)
+            screenSeen = false
+            AppLog.log("panel: standby — dark with WAKE UP lit")
+        } else if powerState == .off {
+            powerState = .boot
+            panel.setPanelDark(false)
+            screenSeen = false   // the next content frame re-arms RUN
+            AppLog.log("panel: wake from standby")
         }
     }
 
@@ -613,6 +659,10 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 return
             }
             screenSeen = true
+            if powerState == .boot {
+                powerState = .run
+                AppLog.log("panel: running (first LCD frame)")
+            }
         }
         panel.setLCD(image)
         frameCount += 1

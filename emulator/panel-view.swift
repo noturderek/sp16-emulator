@@ -246,6 +246,7 @@ struct PanelRenderState {
     var bootSeconds = 0
     var lcdBrightness: CGFloat = 1      // the firmware's LCD backlight level, 0...1 (1 = full, as before)
     var bloom = false                   // additive glow around lit keys, buttons and LEDs (View > Lamp Glow; off by default)
+    var panelDark = false               // standby/fault: black LCD, every lamp off except WAKE UP
 
     func look(_ id: UInt8) -> LampLook {
         guard feedbackLive else { return .unknown }
@@ -982,12 +983,23 @@ final class PanelRenderer {
 
     // MARK: Dynamic layer
 
+    /// The WAKE UP (USB STOP / STBY) key: the only lamp lit while the panel is dark (standby or fault), red as the
+    /// service manual's LED matrix has it (MONO_COLORS usb_stop).
+    static let wakeUpName = "usb_stop"
+    static let wakeUpColor = LampColor(r: 1, g: 60.0 / 255, b: 60.0 / 255)
+
+    /// Effective lamp look: in the dark state every lamp is off except WAKE UP, regardless of firmware feedback.
+    private func look(_ c: PanelLayout.Control, _ st: PanelRenderState) -> LampLook {
+        if st.panelDark { return c.name == PanelRenderer.wakeUpName ? .lit(PanelRenderer.wakeUpColor) : .off }
+        return st.look(c.id)
+    }
+
     func drawDynamic(_ ctx: CGContext, state: PanelRenderState, scale s: CGFloat, dirty: CGRect) {
         drawLCD(ctx, state: state, dirty: dirty)
         for c in layout.controls where c.frame.insetBy(dx: -PanelRenderer.dirtyReach, dy: -PanelRenderer.dirtyReach).intersects(dirty) {
             drawControlDynamic(ctx, c, state, s)
         }
-        if state.bloom && state.feedbackLive { drawBloom(ctx, state: state, dirty: dirty) }
+        if state.bloom && state.feedbackLive && !state.panelDark { drawBloom(ctx, state: state, dirty: dirty) }
         if state.debugOverlay { drawDebug(ctx) }
     }
 
@@ -1002,7 +1014,7 @@ final class PanelRenderer {
         let reach = PanelRenderer.bloomReach
         var lit: [(PanelLayout.Control, LampColor)] = []
         for c in layout.controls where c.kind != .knob && c.kind != .analog && c.kind != .selector && c.kind != .strip {
-            guard !(c.kind == .lamp && c.shape == "text"), case .lit(let col) = state.look(c.id),
+            guard !(c.kind == .lamp && c.shape == "text"), case .lit(let col) = look(c, state),
                   c.frame.insetBy(dx: -reach, dy: -reach).intersects(dirty) else { continue }
             lit.append((c, col))
         }
@@ -1036,6 +1048,11 @@ final class PanelRenderer {
         ctx.clip(to: r)
         ctx.setFillColor(hexColor(0))
         ctx.fill(r)
+        if state.panelDark {
+            // Standby/fault: the glass is dark; no firmware image and no boot overlay.
+            ctx.restoreGState()
+            return
+        }
         if let image = state.lcdImage {
             ctx.interpolationQuality = .none
             ctx.translateBy(x: 0, y: r.minY + r.maxY)
@@ -1071,11 +1088,12 @@ final class PanelRenderer {
     private func drawControlDynamic(_ ctx: CGContext, _ c: PanelLayout.Control, _ st: PanelRenderState, _ s: CGFloat) {
         let f = c.frame
         let held = st.held.contains(c.id)
+        let look = self.look(c, st)
         switch c.kind {
         case .pad, .step, .bar:
-            drawGlassKey(ctx, f, c.cornerRadius, st.look(c.id), held, s)
+            drawGlassKey(ctx, f, c.cornerRadius, look, held, s)
         case .button:
-            drawButtonLamp(ctx, c, st.look(c.id), held, s)
+            drawButtonLamp(ctx, c, look, held, s)
         case .knob:
             drawIndicator(ctx, c, angle: st.knobAngle[c.id] ?? 0, long: false)
         case .analog:
@@ -1085,7 +1103,7 @@ final class PanelRenderer {
         case .strip:
             if let pos = st.stripTouch { drawStripThumb(ctx, f, pos) }
         case .lamp:
-            if c.shape == "text" { drawLampText(ctx, c, st.look(c.id)) } else { drawLED(ctx, c, st.look(c.id), s) }
+            if c.shape == "text" { drawLampText(ctx, c, look) } else { drawLED(ctx, c, look, s) }
         }
     }
 
@@ -1674,6 +1692,16 @@ final class PanelView: NSView, NSViewToolTipOwner {
         guard toolbar.status.stringValue != text else { return }
         toolbar.status.stringValue = text
         toolbar.status.toolTip = text
+    }
+
+    /// Enter or leave the dark panel state (standby or fault): every lamp off except WAKE UP, and a black LCD with no
+    /// boot overlay. The host drives this from the TX standby flag; on wake the LCD is cleared so the boot overlay
+    /// shows until the firmware's next frame.
+    func setPanelDark(_ dark: Bool) {
+        guard dark != state.panelDark else { return }
+        state.panelDark = dark
+        if dark { state.lcdImage = nil }
+        needsDisplay = true
     }
 
     var heldControls: Set<UInt8> { state.held }
