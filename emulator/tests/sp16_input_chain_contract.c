@@ -97,6 +97,13 @@ int main(int argc,char **argv) {
     assert(state && wavpath);
     unlink(wavpath);
     snd_pcm_t *in=capture();
+    if (argc>1 && !strcmp(argv[1],"service")) { /* the service-stimulus preset: INPUT LEVEL at the top, the tone at slot 604 */
+        int16_t b[N*2];
+        assert(snd_pcm_readi(in,b,N)==N);                        /* the first call reports the idle window */
+        analog(state,1000,604); settle();
+        for (int k=0;k<1800;k++) assert(snd_pcm_readi(in,b,N)==N); /* about 2.6 s: the next report is for the tone */
+        return 0;
+    }
     if (argc>1) { /* research switch capture-stale in the developer share: what a silent capture leaves in the app's buffer */
         int16_t b[N*2]; analog(state,500,0); settle();
         assert(snd_pcm_readi(in,b,N)==N);                        /* the first read still runs on the old state */

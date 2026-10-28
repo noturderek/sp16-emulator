@@ -1226,7 +1226,8 @@ static void loop_return(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frame
         loop_send_peak=loop_return_peak=0; loop_report_ns=now;
     }
 }
-/* Level meters for the metrics: peaks over the report window (linear, 1.0 = converter full scale). */
+/* Level meters for the metrics: peaks over the report window (linear, 1.0 = converter full scale). The input meter sits after
+ * INPUT LEVEL and before the limiter; the output meter is the MAIN pair after MAIN OUT. */
 static float meter_in_peak, meter_out_peak;
 static unsigned long meter_limited;
 static int meter_source, meter_limiter_logged=-1;  /* 0 off, 1 tone, 2 wav */

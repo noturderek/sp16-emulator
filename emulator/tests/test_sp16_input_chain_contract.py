@@ -3,7 +3,10 @@
 Runs tests/sp16_input_chain_contract.c against hardware_stub.c under qemu-user in Docker (skipped without Docker), plus
 host-side checks of the bridge's parsing of the shim's level line.
 """
+import contextlib
 import importlib.util
+import io
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -70,6 +73,34 @@ class InputChainTests(unittest.TestCase):
         self.assertEqual(service_stimulus.tone_slot(0.0), 1000)
         with self.assertRaises(ValueError):
             service_stimulus.tone_slot(-61.0)
+
+    def test_service_stimulus_expectation_is_metered_after_input_level(self):
+        # -10 dBV is -7.8 dBu; INPUT LEVEL at the top adds 12.04 dB before the meter, so the meter reads about +4.3 dBu
+        expected = service_stimulus.expected_in_dbu(-10.0)
+        self.assertAlmostEqual(expected, 4.28, delta=0.05)
+        self.assertAlmostEqual(expected - (-10.0 + service_stimulus.DBU_PER_DBV), 12.04, delta=0.1)
+        self.assertAlmostEqual(service_stimulus.expected_in_dbu(-10.0, input_level_slot=500), -7.82, delta=0.1)  # unity
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            service_stimulus.main(["--dry-run"])
+        printed = out.getvalue()
+        self.assertIn("after INPUT LEVEL", printed)
+        self.assertIn("in_dbu near +4.3", printed)
+        self.assertNotIn("before INPUT LEVEL", printed)
+
+    @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
+    def test_shim_meters_the_service_stimulus_where_the_preset_says(self):
+        """The shim's own in_dbu for the preset's tone and INPUT LEVEL matches what service_stimulus.py tells the user."""
+        with arm_contract.ArmContract() as arm:
+            try:
+                out = arm.run("sp16_input_chain_contract", [
+                    "rm -f /tmp/run/analog /tmp/run/none.wav",
+                    "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/none.wav /tmp/run/t service && echo PASS-service"])
+            except subprocess.CalledProcessError as exc:
+                self.fail((exc.stdout or "")[-1500:] + (exc.stderr or "")[-1500:])
+            self.assertIn("PASS-service", out)
+            readings = [float(m) for m in re.findall(r"analog levels limiter=0 in_peak=[0-9.]+ in_dbu=(-?[0-9.]+) .*source=tone", out)]
+            self.assertTrue(readings, out[-1500:])
+            self.assertAlmostEqual(max(readings), service_stimulus.expected_in_dbu(-10.0), delta=0.2)
 
     def test_shim_constants_match_the_reference(self):
         source = (arm_contract.TOOLS / "hardware_stub.c").read_text()

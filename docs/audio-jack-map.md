@@ -32,8 +32,8 @@ changes (a file that is still being written is picked up on a later look) and go
 test tone) when it is removed; replacing or removing it while the firmware plays is safe. Set `SP16_INPUT_WAV` to read
 another path. The chain is the board's: INPUT LEVEL gain, then
 the input limiter while the firmware holds the LIMIT line high, then the converter. `metrics.json` reports
-`guest.board.analog_levels`: peaks and a dBu readout of input and master output (converter full scale is taken as
-+16 dBu, grade I), `limiter_active`, `limited_samples`, and the source (`wav`, `tone` or `off`).
+`guest.board.analog_levels`: peaks and a dBu readout of the input (metered after INPUT LEVEL, before the limiter) and of
+the MAIN output pair (converter full scale is taken as +16 dBu, grade I), `limiter_active`, `limited_samples`, and the source (`wav`, `tone` or `off`).
 `emulator/service_stimulus.py` sets the service manual's stimulus (-10 dBV in, INPUT LEVEL and MAIN OUT at maximum)
 on a running session.
 
