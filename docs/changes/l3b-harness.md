@@ -68,8 +68,11 @@ a build made with `--app-arg testmode`:
 The page is read from pixels where OCR is weak (gauge fill, the red OK) and with OCR elsewhere. Page changes are driven
 one key at a time (HOME next, BACK previous, 13 pages 0..12, wrapping; page 12, the factory reset, is never visited) and
 every value is polled until it is the expected one or a time limit passes, because the app takes seconds to redraw a page on
-a loaded host. Without `--testmode-build` the checks are N/A with a `precondition:` reason. `--testmode-skip bar4` leaves a
-control unpressed (a negative control that needs no rebuild; unit-tested only, see below).
+a loaded host. Without `--testmode-build` the checks are N/A with a `precondition:` reason. The testmode build's firmware
+must be the profile's: its library manifest has to carry the profile's application SHA-256, checked before any session
+starts (the run is refused with exit 3, as for the main build); the session must also report the id that was checked.
+`--testmode-skip bar4` leaves a control unpressed (a negative control that needs no rebuild; unit-tested only, see below);
+a name that is not one of the 50 controls is refused, with the closest control suggested.
 
 Run (the held `./sp16 hwsuite` does not pass `--testmode-build` yet; see Cross-lane requests, so call the runner):
 
@@ -116,6 +119,9 @@ the live negative control).
     a FAIL reported as a size mismatch (another display scale gives another size).
   - Every run with `--shots` writes `shots-report.md`, a heat map `shots/<name>-diff.png` for each difference, and a `shots`
     block in the result JSON.
+  - `--shots-tolerance N` is a whole number from 0 to 254 and `--shots-share F` is from 0 up to, but not including, 1: the
+    parser and `shotdiff` refuse anything else, because a tolerance of 255 or more would call every pixel equal and a share of 1
+    would let a completely changed capture pass.
 - Captures today (13): HW-52 (a new extra, runs in the normal build): the settled home screen as LCD and as whole panel;
   HW-48: page 1 LCD, four panel colours, page 2 panel; HW-49: page 4 LCD and panel; HW-50: page 5 LCD; HW-51: page 6 LCD;
   HW-53: page 3 LCD.
@@ -169,6 +175,21 @@ A second run on the rebuilt build passed again (157 s, 13 of 13), and the page 3
 Not covered (U/S): the RESET touch button (held 5 s, initialises the 16 values) is not driven; what the green and red
 counters mean; the persistent-session behaviour above is inferred from the guest script, not run.
 
+## Review round 1 (Codex), three fixes
+
+| Finding | Commit | Task | What changed | Tests |
+|---|---|---|---|---|
+| 1, blocking: screenshot thresholds outside their range switch the comparison off | `5b680b4` | pt-i44.16 | `shotdiff.check_tolerance` (whole number, 0 to 254) and `check_share` (0 up to, not including, 1) in `changed_pixels` (so `compare` and `heat_map`) and `ShotStore`; the same checks in the `--shots-tolerance` and `--shots-share` parser; the `--shots` help corrected | quick set 387 OK; shotdiff 23 OK; 6 new tests fail on the old code |
+| 2, blocking: the testmode build's firmware was not checked against the profile | `8e7d26f` | pt-i44.11 | `check_firmware` takes the build and returns the id it checked; `run()` refuses before any VM starts, `testmode_checks` checks again where it launches, passes that id to `launch` and stops a session that reports another id; an unreadable manifest is an `EnvError`; the result records the testmode build and firmware | quick set 393 OK; 6 new tests fail on the old code; live HW-48 PASS 10 of 10 |
+| 3, non-blocking: `--testmode-skip` accepted unknown control names | `52a78bb` | pt-i44.11 | `check_testmode_skip` for the parser and the `Runner`; an unknown name is refused with the closest control suggested | quick set 397 OK, `test_sp16_sessionctl` 20 OK; 4 new tests fail on the old code |
+
+Two choices to know about:
+
+- The tolerance range is 0 to 254, not 0 to 255: two 8-bit channels differ by at most 255, so 255 switches the comparison off
+  exactly like 256. Say if 255 should be accepted.
+- A bad threshold or skip name is refused by the argument parser, which exits with 2 (argparse's code, as for `--tier`), not 3. The
+  module's own usage errors (a missing `--profile`) exit 3.
+
 ## Cross-lane requests
 
 `emulator/sp16emu.py` (held):
@@ -190,6 +211,8 @@ decides whether to bump the epoch.
 
 - `./sp16 hwsuite --smoke` and any of HW-01..HW-46: not run. The brief accepts the new checks alone; the changes to
   `panel.py` are a new branch for names starting with `pressure` and a new decoded key, covered by unit tests.
+- After the review fixes only HW-48 was run live (the launch path changed for all testmode checks; HW-49, HW-50, HW-51 and
+  HW-53 were not repeated, their own code did not change).
 - Unit tests only: `--testmode-skip`, the `calibrate` command and its timing (a fixed 7 s per pass; HW-53 drives the same
   presses), `shotdiff` masks and `--shots-tolerance`.
 
