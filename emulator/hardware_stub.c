@@ -897,8 +897,7 @@ static void ax_init(struct pcm_state *s,unsigned channels,int format) {
     unsigned width=tap_width(format);
     if (id>=AX_STREAMS || !width || width*channels>32) return;
     struct ax_ring *r=&ax_rings[id];
-    unsigned first=0, count=channels;
-    if (id==0 && channels==16) { first=12; count=4; } /* ch12/14 carry the metronome and samples; ch13/15 are not audio-like */
+    unsigned first=0, count=channels;   /* by default the whole stream travels, so the host output monitor can pick any pair */
     const char *env=id==0?getenv("SP16_PCM_PORT_CHANNELS"):NULL; /* research override "first:count" */
     char from_share[32];
     if (id==0 && !env && original_open && original_read) { /* the same override from the developer share, for a build whose environment is fixed */
