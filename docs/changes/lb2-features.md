@@ -19,6 +19,22 @@ Branch `lane/lb2-features`, cut from `emu/2026-10-28` (`d6058eb`). Three commits
 plus this file. One research build was made (`build/lb2`, `--research --audio file`, QEMU reused from
 `build/qemu-source`) and booted once to investigate the live USB-B and measurement tasks.
 
+## Review round 1
+
+The dispatcher flagged two blocking findings on `pt-i44.37`; each is fixed in its own commit:
+
+- `86503e7` — `emulator/native.py` now lists `midi-routing.swift` in `SWIFT_SOURCES`, so the app compiles from the
+  real source list. Verified with the exact `xcrun swiftc -typecheck -parse-as-library $(python3 -c 'import native;
+  print(" ".join(native.SWIFT_SOURCES))')` command (no errors, only the pre-existing macOS 27 deprecation warnings,
+  and no file appended by hand).
+- `b91770a` — `emulator/midi-routing.swift` guards the clock-send path with one `routingLock`: `sendClockByte()`
+  snapshots (port, destinations) under the lock and holds it across `MIDISend`; `rebuildClockRouting()` swaps the
+  ports under the lock and disposes the old ones only after the swap; `setConfig`/`reload` mutate
+  `settings`/`destinations` under the same lock; and `deinit` zeroes the ports under the lock before disposing. No
+  send can race a `MIDIPortDispose`.
+
+Both pass the Swift type-check and the 14-module quick set (452 tests, `OK`).
+
 ## Per task
 
 ### 1. `pt-i44.77` — HW-35 known-failing, recording the measured gap: `6a8a348`
