@@ -86,6 +86,59 @@ static uint64_t mono_ns(void) {
 }
 static void dac_write(const void *buffer,size_t count);
 
+/* The OEM's JUCE MIDI path uses ALSA sequencer subscriptions. Record the result at the
+ * API boundary so a registered device cannot be mistaken for a connected route. */
+typedef struct _snd_seq snd_seq_t;
+typedef struct snd_seq_event snd_seq_event_t;
+static void *midi_alsa_symbol(const char *name) {
+    static void *alsa;
+    void *handle=__atomic_load_n(&alsa,__ATOMIC_ACQUIRE);
+    if (!handle) {
+        void *candidate=dlopen("libasound.so.2",RTLD_NOW|RTLD_LOCAL);
+        if (!candidate) {
+            fprintf(stderr,"[sp16-ui-stub] MIDI ALSA load failed: %s\n",dlerror());
+            return NULL;
+        }
+        void *empty=NULL;
+        if (__atomic_compare_exchange_n(&alsa,&empty,candidate,0,__ATOMIC_RELEASE,__ATOMIC_ACQUIRE))
+            handle=candidate;
+        else { dlclose(candidate); handle=empty; }
+    }
+    void *symbol=dlsym(handle,name);
+    if (!symbol) fprintf(stderr,"[sp16-ui-stub] MIDI ALSA symbol missing: %s (%s)\n",name,dlerror());
+    return symbol;
+}
+int snd_seq_open(snd_seq_t **handle,const char *name,int streams,int mode) {
+    int (*real)(snd_seq_t **,const char *,int,int)=midi_alsa_symbol("snd_seq_open");
+    if (!real) return -ENOSYS;
+    int result=real(handle,name,streams,mode);
+    fprintf(stderr,"[sp16-ui-stub] MIDI seq open name=%s streams=%d result=%d\n",name,streams,result);
+    return result;
+}
+int snd_seq_connect_from(snd_seq_t *handle,int my_port,int client,int port) {
+    int (*real)(snd_seq_t *,int,int,int)=midi_alsa_symbol("snd_seq_connect_from");
+    if (!real) return -ENOSYS;
+    int result=real(handle,my_port,client,port);
+    fprintf(stderr,"[sp16-ui-stub] MIDI seq connect_from local=%d peer=%d:%d result=%d\n",my_port,client,port,result);
+    return result;
+}
+int snd_seq_connect_to(snd_seq_t *handle,int my_port,int client,int port) {
+    int (*real)(snd_seq_t *,int,int,int)=midi_alsa_symbol("snd_seq_connect_to");
+    if (!real) return -ENOSYS;
+    int result=real(handle,my_port,client,port);
+    fprintf(stderr,"[sp16-ui-stub] MIDI seq connect_to local=%d peer=%d:%d result=%d\n",my_port,client,port,result);
+    return result;
+}
+int snd_seq_event_input(snd_seq_t *handle,snd_seq_event_t **event) {
+    int (*real)(snd_seq_t *,snd_seq_event_t **)=midi_alsa_symbol("snd_seq_event_input");
+    if (!real) return -ENOSYS;
+    int result=real(handle,event);
+    static unsigned events;
+    if (result>=0 && __atomic_fetch_add(&events,1,__ATOMIC_RELAXED)<16)
+        fprintf(stderr,"[sp16-ui-stub] MIDI seq input event=%d\n",result);
+    return result;
+}
+
 /* Bind a native-only datagram endpoint (panel RX or CDC strip). `input` is 1 for the
  * panel and 2 for the CDC controller, which closes/unlinks its own path. */
 static int input_socket(enum device kind, const char *env, const char *fallback, char *saved) {
