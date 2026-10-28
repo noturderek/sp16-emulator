@@ -107,6 +107,16 @@ class WrapperTests(unittest.TestCase):
         at = lines.index("-append")
         self.assertEqual(lines[at + 1], "console=ttyAMA0 rdinit=/init sp16.net=mcast")
 
+    def test_cmdline_metacharacters_stay_literal(self):
+        value = "console=$HOME `touch /tmp/sp16-unexpected`"
+        code, lines = self.run_wrapper(("-append", value, "-device", "x=y"), SP16_NET_MODE="mcast")
+        self.assertEqual(code, 0)
+        self.assertEqual(lines, ["-append", value + " sp16.net=mcast", "-device", "x=y"])
+
+    def test_net_mode_requires_append(self):
+        code, _ = self.run_wrapper(SP16_NET_MODE="mcast")
+        self.assertEqual(code, 2)
+
 
 
 class FakeMasterTests(unittest.TestCase):

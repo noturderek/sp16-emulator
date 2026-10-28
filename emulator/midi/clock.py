@@ -23,7 +23,7 @@ import math
 PPQN = 24.0
 SAMPLE_RATE = 44100.0
 RELEASE_LATENCY = 0.003  # seconds: inbound events reach the app this long after their edge timestamp
-ZETA = 1.0 / math.sqrt(2.0)  # damping 0.707: no overshoot, fastest lock
+ZETA = 1.0 / math.sqrt(2.0)  # damping 0.707: small overshoot with fast settling
 
 
 def clock_period_seconds(bpm: float) -> float:
@@ -40,7 +40,7 @@ class ClockDLL:
     """Second-order DLL that recovers the period and BPM of a jittered MIDI clock stream.
 
     Feed it each clock event's host timestamp (seconds, monotonic); read `period`/`bpm` after it has locked. The
-    first event sets the centre and is returned as-is (no period yet); `locked` is true once enough events have
+    first event sets the centre (tick returns None); `locked` is true once enough events have
     arrived to trust the estimate.
     """
 
@@ -85,7 +85,7 @@ class ClockGenerator:
 
     Model on the sample-position accumulator of a host MIDI clock: each output sample advances an accumulator by
     clocks-per-sample; every time it crosses a whole pulse the sample offset of a 0xF8 is emitted. A BPM change
-    re-scales the accumulator so the next pulse lands exactly on the new tempo's grid (no drift, no timer).
+    keeps the fractional accumulator across BPM changes for rate continuity (no timer).
     """
 
     def __init__(self, bpm: float = 120.0, sample_rate: float = SAMPLE_RATE):
