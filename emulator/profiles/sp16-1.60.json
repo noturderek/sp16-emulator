@@ -1459,6 +1459,43 @@
       "left": 12,
       "right": 14
     },
+    "jacks": {
+      "MAIN": {
+        "aliases": [
+          "OUT1-2",
+          "MASTER"
+        ],
+        "stream": "hw:ak4458audio,0",
+        "left": 12,
+        "right": 14,
+        "grade": "O"
+      },
+      "OUT3-4": {
+        "stream": "hw:ak4458audio,0",
+        "left": 8,
+        "right": 10,
+        "grade": "I"
+      },
+      "OUT5-6": {
+        "stream": "hw:ak4458audio,0",
+        "left": 4,
+        "right": 6,
+        "grade": "I"
+      },
+      "OUT7-8": {
+        "stream": "hw:ak4458audio,0",
+        "left": 0,
+        "right": 2,
+        "grade": "O"
+      },
+      "PHONES": {
+        "stream": "hw:ak4452audio,0",
+        "left": 0,
+        "right": 1,
+        "grade": "O"
+      }
+    },
+    "jacks_note": "the transport channel each output jack carries, measured with the factory AUDIO TEST modes (see audio-jack-map.json next to this folder): MAIN and OUT7-8 observed, PHONES on the AK4452 stream observed, OUT3-4 and OUT5-6 inferred from the regular slot order",
     "default_bpm": 120,
     "step_lamps": "rgb 0-15",
     "playhead_colour": [

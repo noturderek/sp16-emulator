@@ -31,6 +31,8 @@ GUEST_PATH = re.compile(r"/(?:[A-Za-z0-9._-]+/?)*")
 TOKEN = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 LAMP_KINDS = {"mono": range(0, 35), "rgb": range(0, 32)}
 FRAME_BYTES = 128
+JACK_MAP = "audio-jack-map.json"      # next to the profiles folder: the measured record of what the jacks carry
+JACK_GRADES = ("O", "S", "I", "U")  # observed, static, inferred, unknown
 
 # Hardware-suite fields at the top level of a profile and their JSON container types (the names the suite uses;
 # selector_window_frames, pad_curve, button_roles, lamp_roles and analog_words live under "panel").
@@ -133,7 +135,64 @@ def validate(profile):
     _require(isinstance(absent, list) and all(isinstance(item, dict) and isinstance(item.get("capability"), str)
                                               and isinstance(item.get("reason"), str) for item in absent),
              "hardware.absent entries need capability and reason")
+    # The output jacks are runtime data the monitor menu reads, so they are checked only when the profile carries the
+    # audio section (a shipped copy may drop it).
+    if profile.get("audio") is not None:
+        _check_jacks(profile, jack_map())
     return profile
+
+
+def jack_map(directory=None):
+    """emulator/audio-jack-map.json: which transport channel carries which output jack, with the grade and evidence of
+    each mapping. `directory` is a profiles folder (the file sits next to it). None when the file is not there, which is
+    how a shipped profile folder looks; the jacks themselves then live in the profile."""
+    folder = Path(directory) if directory else PROFILE_DIR
+    try:
+        data = json.loads((folder.parent / JACK_MAP).read_text())
+    except (OSError, ValueError):
+        return None
+    streams = data.get("streams")
+    return data if isinstance(streams, dict) and isinstance(data.get("jacks"), list) else None
+
+
+def audio_jacks(profile):
+    """The output jacks the transport carries, name -> (stream, left channel, right channel, grade). The output monitor
+    menu reads this; validate() checks it against audio-jack-map.json when that file is next to the profiles."""
+    return {name: (spec["stream"], spec["left"], spec["right"], spec["grade"])
+            for name, spec in (profile.get("audio") or {}).get("jacks", {}).items()}
+
+
+def _check_jacks(profile, measured=None):
+    """audio.jacks: every jack names a playback stream of the profile, two channels inside it in ascending order, and a
+    grade; and, when the jack map is there, the same mapping it records, jack for jack and channel for channel."""
+    audio = profile.get("audio")
+    _require(isinstance(audio, dict), "audio")
+    jacks = audio.get("jacks")
+    _require(isinstance(jacks, dict) and jacks, "audio.jacks")
+    streams = {stream.get("name"): stream for stream in audio.get("alsa_streams") or []
+               if isinstance(stream, dict) and stream.get("direction") == "playback"}
+    for name, spec in jacks.items():
+        _require(isinstance(name, str) and name and name == name.strip(), f"jack name {name!r}")
+        _require(isinstance(spec, dict), f"jack {name}")
+        stream, left, right = spec.get("stream"), spec.get("left"), spec.get("right")
+        _require(stream in streams, f"jack {name}: stream {stream!r} is not one of the profile's playback streams")
+        _require(isinstance(left, int) and isinstance(right, int) and not isinstance(left, bool)
+                 and not isinstance(right, bool) and 0 <= left < right < (streams[stream].get("channels") or 0),
+                 f"jack {name}: channels {left!r}/{right!r} are not two ascending channels of {stream}")
+        _require(spec.get("grade") in JACK_GRADES, f"jack {name}: grade {spec.get('grade')!r}")
+        aliases = spec.get("aliases", [])
+        _require(isinstance(aliases, list) and all(isinstance(a, str) and a for a in aliases), f"jack {name}: aliases")
+    if measured is None:
+        return
+    expected = {}
+    for entry in measured["jacks"]:
+        stream = (measured["streams"].get(entry.get("stream")) or {}).get("alsa")
+        expected[entry.get("jack")] = (stream, entry.get("left"), entry.get("right"), entry.get("grade"),
+                                       tuple(entry.get("aliases") or ()))
+    found = {name: (spec["stream"], spec["left"], spec["right"], spec["grade"], tuple(spec.get("aliases") or ()))
+             for name, spec in jacks.items()}
+    disagree = sorted(name for name in set(expected) | set(found) if expected.get(name) != found.get(name))
+    _require(not disagree, f"audio.jacks disagree with {JACK_MAP} for {', '.join(disagree)}")
 
 
 def load(profile_id=LEGACY_PROFILE, directory=None):

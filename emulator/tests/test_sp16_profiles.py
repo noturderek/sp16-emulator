@@ -146,6 +146,61 @@ class VersionDataTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         profiles.product(directory=folder)
 
+    def test_the_output_jacks_are_the_same_in_both_versions_and_the_jack_map(self):
+        """The menua output monitor reads audio.jacks; every jack, stream, channel pair and grade must be what
+        audio-jack-map.json records (the measurement), in 1.50 as in 1.60."""
+        expected = {"MAIN": ("hw:ak4458audio,0", 12, 14, "O"), "OUT3-4": ("hw:ak4458audio,0", 8, 10, "I"),
+                    "OUT5-6": ("hw:ak4458audio,0", 4, 6, "I"), "OUT7-8": ("hw:ak4458audio,0", 0, 2, "O"),
+                    "PHONES": ("hw:ak4452audio,0", 0, 1, "O")}
+        for version in ("sp16-1.50", "sp16-1.60"):
+            with self.subTest(version=version):
+                profile = profiles.load(version)
+                self.assertEqual(profiles.audio_jacks(profile), expected)
+                self.assertEqual(profile["audio"]["jacks"]["MAIN"]["aliases"], ["OUT1-2", "MASTER"])
+                self.assertEqual(profile["audio"]["sound_channels"], {"stream": "hw:ak4458audio,0", "left": 12,
+                                                                       "right": 14})
+        measured = profiles.jack_map()
+        self.assertIsNotNone(measured)
+        alsa = {name: stream["alsa"] for name, stream in measured["streams"].items()}
+        self.assertEqual({entry["jack"]: (alsa[entry["stream"]], entry["left"], entry["right"], entry["grade"])
+                          for entry in measured["jacks"]}, expected)
+
+    def test_a_profile_whose_jacks_disagree_with_the_map_is_refused(self):
+        profile = copy.deepcopy(profiles.legacy())
+        profile["audio"]["jacks"]["OUT3-4"].update({"left": 12, "right": 14})      # two plausible channels, the wrong pair
+        with self.assertRaisesRegex(ValueError, "audio.jacks disagree with audio-jack-map.json for OUT3-4"):
+            profiles.validate(profile)
+        swapped = copy.deepcopy(profiles.legacy())
+        swapped["audio"]["jacks"]["OUT3-4"].update({"left": 10, "right": 8})       # the right pair, reversed
+        with self.assertRaisesRegex(ValueError, "jack OUT3-4: channels 10/8 are not two ascending channels"):
+            profiles.validate(swapped)
+        renamed = copy.deepcopy(profiles.legacy())
+        renamed["audio"]["jacks"]["OUT9-10"] = renamed["audio"]["jacks"].pop("OUT5-6")
+        with self.assertRaisesRegex(ValueError, "audio.jacks disagree with audio-jack-map.json for OUT5-6, OUT9-10"):
+            profiles.validate(renamed)
+        for broken, why in (({"left": 10, "right": 8}, "ascending"),
+                            ({"left": 14, "right": 16}, "ascending"),
+                            ({"stream": "hw:ak4452audio,1"}, "ascending"),      # a 2-channel stream
+                            ({"stream": "hw:ak4499audio,0"}, "playback streams"),
+                            ({"grade": "X"}, "grade"),
+                            ({"aliases": "MAIN"}, "aliases")):
+            with self.subTest(why=why):
+                broken_profile = copy.deepcopy(profiles.legacy())
+                broken_profile["audio"]["jacks"]["MAIN"].update(broken)
+                with self.assertRaisesRegex(ValueError, why):
+                    profiles.validate(broken_profile, )
+                with self.assertRaisesRegex(ValueError, "audio.jacks"):
+                    del broken_profile["audio"]["jacks"]
+                    profiles.validate(broken_profile)
+
+    def test_the_jacks_survive_a_shipped_profile_that_drops_the_audio_section(self):
+        """native.shipped_profile keeps runtime fields only, so a shipped copy without audio still validates (the
+        monitor menu needs audio.jacks there; that switch is a cross-lane request, see docs/changes)."""
+        shipped = native.shipped_profile(profiles.legacy())
+        self.assertNotIn("audio", shipped)
+        self.assertEqual(profiles.audio_jacks(shipped), {})
+        self.assertEqual(profiles.validate(shipped), shipped)
+
     def test_product_descriptor_and_profile_choice(self):
         product = profiles.product()
         self.assertEqual(product["reference_profile"], "sp16-1.60")
