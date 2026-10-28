@@ -549,6 +549,9 @@ class BoardModelTests(unittest.TestCase):
                          ("midi_loopback", {"node": "/dev/ttymxc1", "first_bytes": 4}))
         self.assertIsNone(board_line("[sp16-ui-stub] dac write of 7 bytes ignored (expected 2)"))
         self.assertEqual(board_line("[sp16-ui-stub] gpio GPIO5_IO05=1 SEL_xTHRU/DSF"), ("gpio", ("GPIO5_IO05", 1)))
+        self.assertEqual(board_line("[sp16-ui-stub] backlight level=0"), ("backlight", 0))
+        self.assertEqual(board_line("[sp16-ui-stub] backlight level=255"), ("backlight", 255))
+        self.assertIsNone(board_line("[sp16-ui-stub] backlight level=256"))
 
     def test_shim_board_lines_match_the_bridge_patterns(self):
         source = (TOOLS / "hardware_stub.c").read_text()

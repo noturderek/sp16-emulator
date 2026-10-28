@@ -671,7 +671,16 @@ int ioctl(int fd, unsigned long request, ...) {
 }
 
 static int device_ioctl(struct state *s, int fd, unsigned long request, void *arg) {
-    if (s->kind==BACKLIGHT && request==0x40047000UL) return arg?0:(errno=EFAULT,-1);
+    if (s->kind==BACKLIGHT && request==0x40047000UL) {
+        if (!arg) { errno=EFAULT; return -1; }
+        uint32_t level=*(const uint32_t *)arg;
+        static uint32_t last_level=UINT32_MAX;
+        if (level!=last_level) {
+            last_level=level;
+            fprintf(stderr,"[sp16-ui-stub] backlight level=%u\n",level);
+        }
+        return 0;
+    }
     if (s->kind==MIDI) {
         /* A UART line setting has no meaning on the cable: TCGETS reports a zeroed kernel termios (36 bytes on
          * ARM), the TCSETS family and TCFLSH are accepted, FIONREAD is answered by the socket. */

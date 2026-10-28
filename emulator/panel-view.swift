@@ -1673,11 +1673,16 @@ final class PanelView: NSView, NSViewToolTipOwner {
         if liveChanged { needsDisplay = true } else { invalidate(changed) }
     }
 
-    /// The firmware's LCD backlight level, 0...1. Host side only for now: nothing feeds it from the guest yet
-    /// (docs/changes/l1-panel-ui.md, cross-lane requests); the research op `lcd-backlight` sets it.
+    /// The firmware's LCD backlight level, 0...1; the research op can override it.
     var lcdBacklight: CGFloat {
         get { state.lcdBrightness }
-        set { state.lcdBrightness = min(1, max(0, newValue)); setNeedsDisplay(lcdFrame) }
+        set {
+            let level = min(1, max(0, newValue))
+            if level != state.lcdBrightness {
+                state.lcdBrightness = level
+                setNeedsDisplay(lcdFrame)
+            }
+        }
     }
 
     /// What the guest is doing before the first LCD frame (host-side knowledge only: VM started, bridge connected, ...).

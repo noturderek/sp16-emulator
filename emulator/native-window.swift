@@ -769,6 +769,10 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         case Kind.stats:
             if let object = try? JSONSerialization.jsonObject(with: body.dropFirst()) as? [String: Any] {
                 lock.lock(); guestStats = object; lock.unlock()
+                if let board = object["board"] as? [String: Any], let level = board["backlight"] as? Int,
+                   (0...255).contains(level) {
+                    DispatchQueue.main.async { [weak self] in self?.panel.lcdBacklight = CGFloat(level) / 255 }
+                }
             }
         default: throw NSError(domain: "Unknown native message", code: 4)
         }
