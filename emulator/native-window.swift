@@ -806,9 +806,13 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         do { try DataImage.validateUSBImage(path) }
         catch { return "{\"error\":\"\(error)\"}" }
         // Eject first so the guest unmounts and announces the removal (a raw device_del would leave a stale mount).
-        if let result = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-eject",
-                                                 until: ["usb-ejected", "usb-busy"], timeout: 30) {
-            if result == "usb-busy" { return "{\"error\":\"usb stick is busy; eject it first\"}" }
+        // Refuse the swap unless the guest confirmed the eject: a nil reply must not fall through to the QMP swap.
+        guard let ejectResult = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-eject",
+                                                         until: ["usb-ejected", "usb-busy"], timeout: 30) else {
+            return "{\"error\":\"usb eject got no reply from the guest; refusing to swap the stick\"}"
+        }
+        if ejectResult == "usb-busy" {
+            return "{\"error\":\"usb stick is busy; eject it first\"}"
         }
         do { try QMP.swapUSB(socketPath: config.socket + ".qmp", imagePath: path) }
         catch {
