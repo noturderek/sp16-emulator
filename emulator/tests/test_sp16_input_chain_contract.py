@@ -1,0 +1,127 @@
+"""Contract: INPUT LEVEL gain, the input limiter, WAV injection and the analog level metrics.
+
+Runs tests/sp16_input_chain_contract.c against hardware_stub.c under qemu-user in Docker (skipped without Docker), plus
+host-side checks of the bridge's parsing of the shim's level line.
+"""
+import contextlib
+import importlib.util
+import io
+import re
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import analog_laws  # noqa: E402
+import service_stimulus  # noqa: E402
+import arm_contract  # noqa: E402
+
+LEVELS = ("[sp16-ui-stub] analog levels limiter=1 in_peak=0.9770 in_dbu=15.8 out_peak=0.2500 out_dbu=4.0 limited=412 "
+          "main_out_gain=0.2500 input_gain=1.0000 source=tone")
+
+
+def load_board_line():
+    source = (arm_contract.TOOLS / "guest-bridge.py").read_text()
+    head = source[source.index("UNKNOWN_IOCTL = "):source.index("def main():")]
+    scope = {}
+    exec("import re\n" + head, scope)
+    return scope["board_line"]
+
+
+class InputChainTests(unittest.TestCase):
+    def test_bridge_reports_the_levels_and_the_limiter(self):
+        key, value = load_board_line()(LEVELS)
+        self.assertEqual(key, "analog_levels")
+        self.assertIs(value["limiter_active"], True)
+        self.assertEqual((value["in_dbu"], value["out_dbu"], value["limited_samples"], value["source"]), (15.8, 4.0, 412, "tone"))
+        self.assertIs(load_board_line()(LEVELS.replace("limiter=1", "limiter=0"))[1]["limiter_active"], False)
+        self.assertIsNone(load_board_line()("[sp16-ui-stub] analog levels garbage"))
+
+    @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
+    def test_capture_stale_switch_reproduces_the_old_silent_capture(self):
+        pre = "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/none.wav /tmp/run/t"
+        with arm_contract.ArmContract() as arm:
+            try:
+                out = arm.run("sp16_input_chain_contract", [
+                    "mkdir -p /opt/sp16/dev-share; rm -f /tmp/run/analog",
+                    "printf pattern > /opt/sp16/dev-share/capture-stale; %s pattern && echo PASS-pattern" % pre,
+                    "printf untouched > /opt/sp16/dev-share/capture-stale; %s untouched && echo PASS-untouched" % pre])
+            except subprocess.CalledProcessError as exc:
+                self.fail((exc.stdout or "")[-2500:] + (exc.stderr or "")[-1500:])
+            self.assertIn("PASS-pattern", out)
+            self.assertIn("PASS-untouched", out)
+
+    @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
+    def test_replacing_the_wav_while_it_is_read_is_safe(self):
+        """The file is replaced and removed every few milliseconds while two PCM threads run; no torn or foreign frame."""
+        with arm_contract.ArmContract() as arm:
+            try:
+                out = arm.run("sp16_input_race_contract", [
+                    "rm -f /tmp/run/analog /tmp/run/in.wav",
+                    "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/in.wav -E SP16_INPUT_WAV_POLL_MS=2 "
+                    "/tmp/run/t && echo PASS-race"])
+            except subprocess.CalledProcessError as exc:
+                self.fail((exc.stdout or "")[-1500:] + (exc.stderr or "")[-1500:])
+            self.assertIn("PASS-race", out)
+            self.assertRegex(out, r"race: reads=\d+ bad=0 ")
+
+    def test_service_stimulus_preset(self):
+        self.assertEqual(service_stimulus.events(-10.0), [("main_out", 1000), ("input_level", 1000), ("input_tone", 604)])
+        self.assertAlmostEqual(service_stimulus.dbv_to_dbfs(-10.0), -23.79, places=1)
+        self.assertEqual(service_stimulus.tone_slot(0.0), 1000)
+        with self.assertRaises(ValueError):
+            service_stimulus.tone_slot(-61.0)
+
+    def test_service_stimulus_expectation_is_metered_after_input_level(self):
+        # -10 dBV is -7.8 dBu; INPUT LEVEL at the top adds 12.04 dB before the meter, so the meter reads about +4.3 dBu
+        expected = service_stimulus.expected_in_dbu(-10.0)
+        self.assertAlmostEqual(expected, 4.28, delta=0.05)
+        self.assertAlmostEqual(expected - (-10.0 + service_stimulus.DBU_PER_DBV), 12.04, delta=0.1)
+        self.assertAlmostEqual(service_stimulus.expected_in_dbu(-10.0, input_level_slot=500), -7.82, delta=0.1)  # unity
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            service_stimulus.main(["--dry-run"])
+        printed = out.getvalue()
+        self.assertIn("after INPUT LEVEL", printed)
+        self.assertIn("in_dbu near +4.3", printed)
+        self.assertNotIn("before INPUT LEVEL", printed)
+
+    @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
+    def test_shim_meters_the_service_stimulus_where_the_preset_says(self):
+        """The shim's own in_dbu for the preset's tone and INPUT LEVEL matches what service_stimulus.py tells the user."""
+        with arm_contract.ArmContract() as arm:
+            try:
+                out = arm.run("sp16_input_chain_contract", [
+                    "rm -f /tmp/run/analog /tmp/run/none.wav",
+                    "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/none.wav /tmp/run/t service && echo PASS-service"])
+            except subprocess.CalledProcessError as exc:
+                self.fail((exc.stdout or "")[-1500:] + (exc.stderr or "")[-1500:])
+            self.assertIn("PASS-service", out)
+            readings = [float(m) for m in re.findall(r"analog levels limiter=0 in_peak=[0-9.]+ in_dbu=(-?[0-9.]+) .*source=tone", out)]
+            self.assertTrue(readings, out[-1500:])
+            self.assertAlmostEqual(max(readings), service_stimulus.expected_in_dbu(-10.0), delta=0.2)
+
+    def test_shim_constants_match_the_reference(self):
+        source = (arm_contract.TOOLS / "hardware_stub.c").read_text()
+        self.assertIn("#define FS_DBU %s" % analog_laws.FULL_SCALE_DBU, source.replace("16.0f", "16.0"))
+        self.assertIn("#define LIMITER_THRESHOLD %sf" % analog_laws.LIMITER_THRESHOLD, source)
+
+    @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
+    def test_input_chain_contract(self):
+        with arm_contract.ArmContract() as arm:
+            try:
+                out = arm.run("sp16_input_chain_contract", [
+                    "rm -f /tmp/run/analog /tmp/run/in.wav",
+                    "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/in.wav /tmp/run/t && echo PASS-input-chain"])
+            except subprocess.CalledProcessError as exc:
+                self.fail((exc.stdout or "")[-2500:] + (exc.stderr or "")[-1500:])
+            self.assertIn("PASS-input-chain", out)
+            self.assertIn("analog levels limiter=1", out)
+            self.assertIn("analog levels limiter=0", out)
+            self.assertIn("source=wav", out)
+            self.assertIn("input injection: /tmp/run/in.wav channels=2 bits=16", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
