@@ -81,6 +81,57 @@ def finish(frame):
     return bytes(frame)
 
 
+RX_HEADER, RX_CRC_OFFSET = 0x01, 124
+
+
+def decode_rx(frame, check_crc=True):
+    """A complete RX frame -> the input it carries, or None if the frame is not one.
+
+    The inverse of PanelModel.frame() and the one place a received frame is named: buttons by role (frame bytes 1..5),
+    encoder counters (u16 detents, offsets from the profile), every pad's pressure and contact word, and the pots the
+    profile maps as raw words and as host levels (0..1000, 0x3ff minus the word where the profile says inverted). The
+    touch strip is not in this frame: it has its own CDC channel and its own decoder, decode_strip().
+
+    A wrong length, header or CRC-16 means the frame is not an RX frame, never a frame with unknown content.
+    Counters stay unsigned 16-bit, the way the model wraps them; signed_detents() reads a delta out of one.
+    """
+    if len(frame) != panel_map.FRAME_BYTES or frame[0] != RX_HEADER:
+        return None
+    if check_crc and struct.unpack_from("<H", frame, RX_CRC_OFFSET)[0] != crc16(frame[:RX_CRC_OFFSET]):
+        return None
+    word = lambda offset: struct.unpack_from(">H", frame, offset)[0]
+    buttons = {role: bool(frame[byte] >> bit & 1) for role, (byte, bit) in panel_map.BUTTON_BITS.items()}
+    counters = {name: word(offset) for name, (offset, _) in panel_map.COUNTERS.items()}
+    pads = [{"pressure": word(panel_map.PAD_A_OFFSET + 2 * index),
+             "contact": word(panel_map.PAD_B_OFFSET + 2 * index)} for index in range(16)]
+    analog_words = {name: word(offset) for name, (offset, _) in panel_map.ANALOG_WORDS.items()}
+    analog = {name: analog_level(analog_words[name], inverted)
+              for name, (_, inverted) in panel_map.ANALOG_WORDS.items()}
+    return {"buttons": buttons, "counters": counters, "pads": pads, "analog_words": analog_words, "analog": analog}
+
+
+def analog_level(raw, inverted=False):
+    """A 10-bit pot word -> the host level 0..1000 the panel view uses, inverted where the profile says so."""
+    if not 0 <= raw <= panel_map.ANALOG_FULL_SCALE:
+        raise ValueError(f"analog word {raw} is outside 0..{panel_map.ANALOG_FULL_SCALE}")
+    return round((panel_map.ANALOG_FULL_SCALE - raw if inverted else raw) * 1000 / panel_map.ANALOG_FULL_SCALE)
+
+
+def signed_detents(value):
+    """A counter word (0..0xffff, wrapping) as the signed step count it represents."""
+    if not 0 <= value <= 0xffff:
+        raise ValueError(f"counter word {value} is outside 0..0xffff")
+    return value - 0x10000 if value & 0x8000 else value
+
+
+def decode_strip(byte0, byte1):
+    """E5 over the two CDC bytes: value = (0x7f - b0) | b1 << 8; position = value & 0x7f, contact = bit 15."""
+    if not 0 <= byte0 <= 0xff or not 0 <= byte1 <= 0xff:
+        raise ValueError("strip bytes are 0..255")
+    word = (0x7f - byte0) | byte1 << 8
+    return word & 0x7f, word >> 15 & 1
+
+
 def analog_state_bytes(slots, sequence=0, tone_hz=None):
     """Encode the shared analog state: magic, u32 sequence (even = stable), five u16 slots (MAIN OUT, INPUT LEVEL,
     CUTOFF, RESONANCE, INPUT TONE), u16 tone frequency, then the FILTER TONE slot (hardware_stub.c reads the same)."""
@@ -366,13 +417,10 @@ class PanelModel:
     def rx_state(self):
         """Research readback of the held input the guest is sending (hardware suite HW-13): button bytes 1..5 as
         hex and the pads whose pressure word is non-zero."""
-        with self.lock:
-            frame = bytearray(self.raw)
-            for offset, byte in self.overrides.items():
-                frame[offset] = byte
-        pads = [index + 1 for index in range(16)
-                if struct.unpack_from(">H", frame, panel_map.PAD_A_OFFSET + 2 * index)[0]]
-        return {"buttons": frame[1:6].hex(), "pads": pads}
+        frame = self.frame()
+        state = decode_rx(frame)
+        return {"buttons": frame[1:6].hex(),
+                "pads": [index + 1 for index, pad in enumerate(state["pads"]) if pad["pressure"]]}
 
     def release_all(self):
         with self.lock:
