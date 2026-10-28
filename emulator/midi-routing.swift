@@ -40,9 +40,18 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private static var active: MidiRoutingPreferences?
 
     private let client: MIDIClientRef
+    private var sendThread: Thread?
+    private var readoutTimer: Timer?
+
+    /// One owner for every piece of mutable routing and clock state in this class: `stateLock`. Every access —
+    /// reads included — takes this lock, from the main thread (UI actions, `reload`, the readout), the clock thread
+    /// (`clockLoop` → `sendClockByte`) and the CoreMIDI input callback (`onClockByte`). `client` is set once in
+    /// `init` and never mutated, so it stays outside the lock; `sendThread` and `readoutTimer` are main-thread only.
+    private let stateLock = NSLock()
+
+    // Routing state (owned by stateLock).
     private var inputPort: MIDIPortRef = 0
     private var outputPort: MIDIPortRef = 0
-
     private var sources: [MidiEndpoint] = []
     private var destinations: [MidiEndpoint] = []
     /// Every endpoint (sources first, then destinations), the table's row order.
@@ -50,22 +59,17 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     /// The persisted per-endpoint config, keyed by "src:ID" / "dst:ID".
     private var settings: [String: MidiRoutingConfig.PortConfig] = [:]
 
-    private var sendThread: Thread?
+    // Clock state (owned by stateLock).
     private var clockSource: String = "internal"          // "internal" or the decimal ID of a source
     private var nominalBPM: Double = 120.0
 
-    /// Serializes the clock-send path: the clock thread reads `outputPort` and `clockDestinations` while the main
-    /// thread swaps and disposes those ports in `rebuildClockRouting()` and mutates `settings` in `setConfig`/`reload()`.
-    private let routingLock = NSLock()
-
-    // Clock-recovery readout (a second-order DLL, the same loop as emulator/midi/clock.py).
+    // Clock-recovery readout (a second-order DLL, the same loop as emulator/midi/clock.py), owned by stateLock.
     private var centre: Double?
     private var period: Double = 60.0 / (120.0 * 24.0)    // 120 BPM at 24 PPQN
     private var lockEvents = 0
     private let zeta = 1.0 / sqrt(2.0), loopHz = 2.0
     private var intervals: [Double] = []                  // recent inter-clock seconds, for the jitter readout
     private var lastClockTime: Double?
-    private var readoutTimer: Timer?
 
     private let tableView = NSTableView()
     private let clockPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -74,7 +78,7 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private let jitterLabel = NSTextField(labelWithString: "—")
 
     private var clockDestinations: [MidiEndpoint] {
-        destinations.filter { self.config(for: $0).sendClock }
+        destinations.filter { settings[key($0)]?.sendClock == true }
     }
     private var clockSourceEndpoint: MidiEndpoint? {
         guard clockSource != "internal" else { return nil }
@@ -107,13 +111,13 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
 
     deinit {
         readoutTimer?.invalidate()
-        stopClock()
-        routingLock.lock()
+        stopClock()   // cancels the clock thread and waits for it, so no send can race the disposals below
+        stateLock.lock()
         let inPort = inputPort
         let outPort = outputPort
         inputPort = 0
         outputPort = 0
-        routingLock.unlock()
+        stateLock.unlock()
         if inPort != 0 { MIDIPortDispose(inPort) }
         if outPort != 0 { MIDIPortDispose(outPort) }
         MIDIClientDispose(client)
@@ -205,14 +209,14 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
             dst.append(MidiEndpoint(ref: ref, name: endpointName(ref, uniqueID: &id), uniqueID: id, isSource: false))
         }
         // Remembered ports keep their settings across a replug by unique ID; a brand-new port starts off.
-        routingLock.lock()
+        stateLock.lock()
         for endpoint in src + dst where settings[key(endpoint)] == nil {
             settings[key(endpoint)] = blank(endpoint)
         }
         sources = src
         destinations = dst
         rows = src + dst
-        routingLock.unlock()
+        stateLock.unlock()
         tableView.reloadData()
         rebuildClockPicker()
         rebuildClockRouting()
@@ -225,14 +229,10 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
                                      inEnabled: false, outEnabled: false, sendClock: false, receiveClock: false)
     }
 
-    func config(for endpoint: MidiEndpoint) -> MidiRoutingConfig.PortConfig {
-        settings[key(endpoint)] ?? blank(endpoint)
-    }
-
     private func setConfig(_ value: MidiRoutingConfig.PortConfig, for endpoint: MidiEndpoint) {
-        routingLock.lock()
+        stateLock.lock()
         settings[key(endpoint)] = value
-        routingLock.unlock()
+        stateLock.unlock()
         persist()
     }
 
@@ -247,16 +247,27 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
         thread.start()
     }
 
+    /// Cancels the clock thread and waits for it to finish, so `deinit` can dispose the ports knowing no send is
+    /// still running. The loop checks `isCancelled` after every sleep (≤ ~50 ms), so this returns promptly.
     private func stopClock() {
-        sendThread?.cancel()
+        let thread = sendThread
         sendThread = nil
+        guard let thread else { return }
+        thread.cancel()
+        while !thread.isFinished {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
     }
 
     private func clockLoop() {
         while !Thread.current.isCancelled {
-            if clockSource == "internal" {
+            stateLock.lock()
+            let isInternal = clockSource == "internal"
+            let bpm = nominalBPM
+            stateLock.unlock()
+            if isInternal {
                 sendClockByte()
-                Thread.sleep(forTimeInterval: clockPeriodSeconds(nominalBPM))
+                Thread.sleep(forTimeInterval: clockPeriodSeconds(bpm))
             } else {
                 Thread.sleep(forTimeInterval: 0.05)
             }
@@ -268,8 +279,8 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private func sendClockByte() {
         // Take a snapshot of the port and the destination list under the same lock that rebuildClockRouting() uses to
         // swap and dispose ports, and hold it across MIDISend so a send can never race a MIDIPortDispose on the old port.
-        routingLock.lock()
-        defer { routingLock.unlock() }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         let port = outputPort
         let destinations = clockDestinations
         guard port != 0, !destinations.isEmpty else { return }
@@ -288,7 +299,7 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     }
 
     private func rebuildClockRouting() {
-        routingLock.lock()
+        stateLock.lock()
         let oldInputPort = inputPort
         let oldOutputPort = outputPort
         inputPort = 0
@@ -308,13 +319,17 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
             }
             MIDIPortConnectSource(inputPort, source.ref, nil)
         }
-        routingLock.unlock()
+        stateLock.unlock()
         // Dispose the old ports only after the swap, so no send (which runs under the lock) can still use them.
         if oldInputPort != 0 { MIDIPortDispose(oldInputPort) }
         if oldOutputPort != 0 { MIDIPortDispose(oldOutputPort) }
     }
 
     private func onClockByte(at t: Double) {
+        // Runs on the CoreMIDI input thread; takes the state lock so the readout mutation is atomic against
+        // `refreshReadout` on the main thread.
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if lastClockTime == nil { centre = t } else {
             lockEvents += 1
             if centre == nil { centre = t } else {
@@ -330,29 +345,40 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     }
 
     private func refreshReadout() {
-        if clockSource == "internal" {
-            bpmLabel.stringValue = String(format: "%.1f", nominalBPM)
+        stateLock.lock()
+        let isInternal = clockSource == "internal"
+        let bpm = nominalBPM
+        let periodValue = period
+        let lockValue = lockEvents
+        let intervalsSnapshot = intervals
+        stateLock.unlock()
+        if isInternal {
+            bpmLabel.stringValue = String(format: "%.1f", bpm)
             lockLabel.stringValue = "internal"
             jitterLabel.stringValue = "—"
         } else {
-            bpmLabel.stringValue = String(format: "%.1f", 60.0 / (period * 24.0))
-            lockLabel.stringValue = lockEvents >= 8 ? "locked" : "unlocked"
-            let jitter = intervals.isEmpty ? 0 : intervals.reduce(0, +) / Double(intervals.count)
+            bpmLabel.stringValue = String(format: "%.1f", 60.0 / (periodValue * 24.0))
+            lockLabel.stringValue = lockValue >= 8 ? "locked" : "unlocked"
+            let jitter = intervalsSnapshot.isEmpty ? 0 : intervalsSnapshot.reduce(0, +) / Double(intervalsSnapshot.count)
             jitterLabel.stringValue = String(format: "%.0f µs", jitter * 1_000_000)
         }
     }
 
     private func rebuildClockPicker() {
+        stateLock.lock()
+        let snapshotSources = sources
+        let selectedID = clockSource
+        stateLock.unlock()
         clockPopup.removeAllItems()
         clockPopup.addItem(withTitle: "Internal")
-        for source in sources {
+        for source in snapshotSources {
             let item = NSMenuItem(title: source.name, action: nil, keyEquivalent: "")
             item.representedObject = String(source.uniqueID)
             clockPopup.menu?.addItem(item)
         }
         clockPopup.selectItem(at: 0)
-        if let source = clockSourceEndpoint,
-           let index = clockPopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == String(source.uniqueID) }) {
+        if selectedID != "internal",
+           let index = clockPopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == selectedID }) {
             clockPopup.selectItem(at: index)
         }
     }
@@ -364,6 +390,8 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
         .appendingPathComponent("SP-16 Emulator/midi-routing.json")
 
     private func loadPersisted() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if let data = UserDefaults.standard.data(forKey: Self.defaultsKey),
            let stored = try? JSONDecoder().decode([String: MidiRoutingConfig.PortConfig].self, from: data) {
             settings = stored
@@ -374,17 +402,24 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     }
 
     private func persist() {
-        if let data = try? JSONEncoder().encode(settings) {
+        stateLock.lock()
+        let settingsSnapshot = settings
+        let source = clockSource
+        let bpm = nominalBPM
+        stateLock.unlock()
+        if let data = try? JSONEncoder().encode(settingsSnapshot) {
             UserDefaults.standard.set(data, forKey: Self.defaultsKey)
         }
-        UserDefaults.standard.set(clockSource, forKey: "midi-routing.clockSource")
-        UserDefaults.standard.set(nominalBPM, forKey: "midi-routing.bpm")
+        UserDefaults.standard.set(source, forKey: "midi-routing.clockSource")
+        UserDefaults.standard.set(bpm, forKey: "midi-routing.bpm")
         writeBridgeConfig()
     }
 
     /// The bridge config the Python DIN/USB bridges read: clock source, tempo, and every touched port.
     func writeBridgeConfig() {
+        stateLock.lock()
         let config = MidiRoutingConfig(clockSource: clockSource, bpm: nominalBPM, ports: Array(settings.values))
+        stateLock.unlock()
         guard let data = try? JSONEncoder().encode(config) else { return }
         try? FileManager.default.createDirectory(at: Self.configURL.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
@@ -393,12 +428,22 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
 
     // MARK: Table view
 
-    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return rows.count
+    }
 
     func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
-        guard let column = tableColumn, row < rows.count else { return nil }
+        guard let column = tableColumn else { return nil }
+        stateLock.lock()
+        guard row < rows.count else {
+            stateLock.unlock()
+            return nil
+        }
         let endpoint = rows[row]
-        let c = config(for: endpoint)
+        let c = settings[key(endpoint)] ?? blank(endpoint)
+        stateLock.unlock()
         switch column.identifier.rawValue {
         case "col0": return endpoint.name
         case "col1": return endpoint.isSource ? NSNumber(value: c.inEnabled) : nil
@@ -410,7 +455,10 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     }
 
     func tableView(_ tableView: NSTableView, shouldEdit tableColumn: NSTableColumn?, row: Int) -> Bool {
-        guard let column = tableColumn, row < rows.count else { return false }
+        guard let column = tableColumn else { return false }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard row < rows.count else { return false }
         let endpoint = rows[row]
         switch column.identifier.rawValue {
         case "col1", "col4": return endpoint.isSource      // In / Receive clock apply to sources
@@ -421,11 +469,17 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
 
     @objc private func toggle(_ sender: NSButtonCell) {
         let row = tableView.clickedRow
-        guard row >= 0, row < rows.count else { return }
-        let endpoint = rows[row]
-        var c = config(for: endpoint)
+        let tag = sender.tag
         let on = sender.state == .on
-        switch sender.tag {
+        stateLock.lock()
+        guard row >= 0, row < rows.count else {
+            stateLock.unlock()
+            return
+        }
+        let endpoint = rows[row]
+        var c = settings[key(endpoint)] ?? blank(endpoint)
+        stateLock.unlock()
+        switch tag {
         case 1: c.inEnabled = on
         case 2: c.outEnabled = on
         case 3: c.sendClock = on
@@ -433,11 +487,14 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
         default: break
         }
         setConfig(c, for: endpoint)
-        if sender.tag == 3 { rebuildClockRouting() }
+        if tag == 3 { rebuildClockRouting() }
     }
 
     @objc private func clockSourceChosen(_ sender: NSPopUpButton) {
-        clockSource = (sender.selectedItem?.representedObject as? String) ?? "internal"
+        let source = (sender.selectedItem?.representedObject as? String) ?? "internal"
+        stateLock.lock()
+        clockSource = source
+        stateLock.unlock()
         persist()
         rebuildClockRouting()
     }
