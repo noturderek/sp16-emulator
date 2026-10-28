@@ -162,8 +162,8 @@ if [ "$sp16_devlayer" = 1 ]; then
 fi
 : > /tmp/sp16-root/dev/null
 : > /tmp/sp16-root/dev/full
-# Publish the DIN sequencer client before the app probes its ALSA endpoints. The card-presence probe is a
-# synthetic proc file; the actual event transport is the guest kernel sequencer.
+# Publish the DIN sequencer client before the app probes its ALSA endpoints. The proc node is opened through
+# the preload shim, which reports the bridge's current queue capacity.
 if modprobe snd_seq; then
   mkdir -p /tmp/sp16-root/dev/snd /tmp/sp16-root/proc/asound/snddinmidi
   : > /tmp/sp16-root/proc/asound/snddinmidi/midi0
@@ -175,6 +175,12 @@ for source in glob.glob('/dev/snd/*'):
         os.mknod('/tmp/sp16-root/dev/snd/' + os.path.basename(source), 0o600 | stat.S_IFCHR, os.stat(source).st_rdev)
 PYDEV
   /opt/sp16/din-seq-bridge > /dev/console 2>&1 &
+  sp16_din_ready=0
+  for sp16_din_try in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -S /tmp/sp16-root/dev/sp16-din-control ]; then sp16_din_ready=1; break; fi
+    sleep .1
+  done
+  if [ "$sp16_din_ready" != 1 ]; then echo 'SP16_DIN control=missing' > /dev/console; fi
   echo 'SP16_DIN sequencer=started' > /dev/console
 else
   echo 'SP16_DIN sequencer=missing' > /dev/console

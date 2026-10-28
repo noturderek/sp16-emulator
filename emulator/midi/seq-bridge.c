@@ -7,21 +7,38 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #define BYTE_NS 320000ULL
 #define CAPACITY 8192
+#define DIN_CONTROL_PATH "/tmp/sp16-root/dev/sp16-din-control"
+#define DIN_CAPACITY_REQUEST UINT32_MAX
 struct bytes { uint8_t data[CAPACITY]; unsigned head, size; };
 struct wire { struct bytes normal, realtime; uint64_t next; unsigned dropped; };
-static void enqueue(struct wire *wire, const uint8_t *data, unsigned size) {
+static int enqueue(struct wire *wire, const uint8_t *data, unsigned size) {
     if (size > CAPACITY - wire->normal.size - wire->realtime.size) {
         wire->dropped += size;
-        return; /* Drop a whole message, never leave its data bytes orphaned. */
+        return -ENOSPC; /* Drop a whole message, never leave its data bytes orphaned. */
     }
     for (unsigned i=0; i<size; i++) {
         struct bytes *q = data[i]>=0xf8 ? &wire->realtime : &wire->normal;
         q->data[(q->head+q->size++)%CAPACITY]=data[i];
     }
+    return 0;
+}
+static int din_request(struct wire *wire, uint32_t request) {
+    static const uint8_t realtime[]={0xf8,0xfa,0xfb,0xfc,0xfe,0xff};
+    if (request==DIN_CAPACITY_REQUEST)
+        return CAPACITY-wire->normal.size-wire->realtime.size;
+    if (request<sizeof realtime) return enqueue(wire,&realtime[request],1);
+    if ((request>>24)==0xf2 && (request&0xff)==0xff &&
+        !((request>>16)&0x80) && !((request>>8)&0x80)) {
+        uint8_t position[]={0xf2,(uint8_t)(request>>16),(uint8_t)(request>>8)};
+        return enqueue(wire,position,3);
+    }
+    return -EINVAL;
 }
 /* One slot per completed UART byte; realtime takes precedence at the next slot. */
 static int transmit(struct wire *wire, int fd, uint64_t now) {
@@ -38,6 +55,30 @@ static int transmit(struct wire *wire, int fd, uint64_t now) {
     return 1;
 }
 #ifndef SP16_QUEUE_CONTRACT
+static int control_listener(void) {
+    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
+    if (fd<0) return -1;
+    struct sockaddr_un addr={.sun_family=AF_UNIX};
+    strcpy(addr.sun_path,DIN_CONTROL_PATH);
+    /* The guest root is recreated on boot; refuse a stale/live endpoint. */
+    if (bind(fd,(struct sockaddr *)&addr,sizeof addr)<0 || listen(fd,16)<0) {
+        close(fd); return -1;
+    }
+    return fd;
+}
+static void receive_control(int listener,struct wire *wire) {
+    for (int i=0;i<32;i++) {
+        int fd=accept4(listener,NULL,NULL,SOCK_CLOEXEC);
+        if (fd<0) break;
+        struct timeval timeout={.tv_sec=0,.tv_usec=100000};
+        (void)setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof timeout);
+        uint32_t request;
+        ssize_t n=recv(fd,&request,sizeof request,0);
+        int32_t result=n==(ssize_t)sizeof request ? din_request(wire,request) : -EINVAL;
+        (void)send(fd,&result,sizeof result,MSG_NOSIGNAL);
+        close(fd);
+    }
+}
 static uint64_t mono_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -58,11 +99,14 @@ int main(void) {
     snd_midi_event_no_status(decoder,1);
     int serial=open("/dev/sp16-din",O_RDWR|O_NONBLOCK|O_CLOEXEC);
     if (serial<0) { perror("SP16_DIN virtio"); return 1; }
+    int control=control_listener();
+    if (control<0) { perror("SP16_DIN control"); return 1; }
     int count=snd_seq_poll_descriptors_count(seq,POLLIN);
     if (count<1 || count>15) return 1;
-    struct pollfd pollfds[16];
+    struct pollfd pollfds[17];
     snd_seq_poll_descriptors(seq,pollfds,count,POLLIN);
     pollfds[count]=(struct pollfd){.fd=serial,.events=POLLIN};
+    pollfds[count+1]=(struct pollfd){.fd=control,.events=POLLIN};
     struct wire wire={0};
     unsigned long received=0,sent=0;
     fprintf(stderr,"SP16_DIN forwarder=ready client=%d port=%d\n",snd_seq_client_id(seq),port);
@@ -71,8 +115,9 @@ int main(void) {
         if ((wire.normal.size || wire.realtime.size) && !wire.next) wire.next=now+BYTE_NS;
         uint64_t wait=wire.next ? (wire.next>now ? wire.next-now : 0) : 100000000ULL;
         struct timespec timeout={.tv_sec=0,.tv_nsec=(long)wait};
-        int ready=ppoll(pollfds,count+1,&timeout,NULL);
+        int ready=ppoll(pollfds,count+2,&timeout,NULL);
         if (ready<0) { if (errno==EINTR) continue; break; }
+        if (pollfds[count+1].revents&POLLIN) receive_control(control,&wire);
         if (pollfds[count].revents&POLLIN) {
             uint8_t buffer[4096];
             ssize_t n=read(serial,buffer,sizeof buffer);
@@ -105,6 +150,8 @@ int main(void) {
     }
     fprintf(stderr,"SP16_DIN closed input=%lu output=%lu dropped=%u\n",received,sent,wire.dropped);
     close(serial);
+    close(control);
+    unlink(DIN_CONTROL_PATH);
     snd_midi_event_free(encoder); snd_midi_event_free(decoder); snd_seq_close(seq);
     return 1;
 }

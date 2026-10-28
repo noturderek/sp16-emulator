@@ -25,7 +25,7 @@
 #include <unistd.h>
 
 #define MAX_FDS 1024
-enum device { NONE, PANEL, CDC, DAC, BACKLIGHT, MEDIA, PACKET, MIDI, GPIO };
+enum device { NONE, PANEL, CDC, DAC, BACKLIGHT, MEDIA, PACKET, MIDI, GPIO, MIDI_CONTROL };
 /* media: 1 = /proc/udev_usb1, 2 = /proc/udev_usbctn1 (only meaningful when kind==MEDIA). */
 struct state { enum device kind; int peer; uint32_t interval, bytes, offset; uint16_t bits; uint8_t timer, endian, input, media; };
 struct spi_message { uint8_t multi_id, reserved, part_id, part_num; uint32_t bytes; uint64_t tx_buf; };
@@ -39,6 +39,47 @@ static ssize_t (*original_write)(int, const void *, size_t);
 static int (*original_ioctl)(int, unsigned long, ...);
 static char panel_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static char cdc_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+/* The sequencer bridge owns the sole DIN output queue. Each request is one packet and gets
+ * an explicit acceptance/capacity response; no second virtio reader is opened here. */
+static int din_control_request(uint32_t request) {
+    const char *path=getenv("SP16_DIN_CONTROL");
+    if (!path) path="/dev/sp16-din-control";
+    if (!*path || strlen(path)>=sizeof(((struct sockaddr_un *)0)->sun_path)) { errno=EINVAL; return -1; }
+    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);
+    if (fd<0) return -1;
+    struct timeval timeout={.tv_sec=1};
+    (void)setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof timeout);
+    struct sockaddr_un address={.sun_family=AF_UNIX};
+    strcpy(address.sun_path,path);
+    int32_t result=-EIO;
+    int error=0;
+    if (connect(fd,(struct sockaddr *)&address,sizeof address)<0) error=errno;
+    else {
+        ssize_t n=send(fd,&request,sizeof request,MSG_NOSIGNAL);
+        if (n!=(ssize_t)sizeof request) error=n<0 ? errno : EIO;
+        else {
+            n=recv(fd,&result,sizeof result,0);
+            if (n!=(ssize_t)sizeof result) error=n<0 ? errno : EIO;
+        }
+    }
+    original_close(fd);
+    if (error) { errno=error; return -1; }
+    if (result<0) { errno=-result; return -1; }
+    return result;
+}
+static int din_capacity_file(void) {
+    int available=din_control_request(UINT32_MAX);
+    if (available<0) return -1;
+    int fd=(int)syscall(SYS_memfd_create,"sp16-din-capacity",MFD_CLOEXEC);
+    if (fd<0) return -1;
+    char report[64];
+    int length=snprintf(report,sizeof report,"Avail        : %d\n",available);
+    if (length<0 || length>=(int)sizeof report || original_write(fd,report,(size_t)length)!=length ||
+        lseek(fd,0,SEEK_SET)<0) {
+        int error=errno ? errno : EIO; original_close(fd); errno=error; return -1;
+    }
+    return fd;
+}
 static uint64_t mono_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)t.tv_sec*1000000000ULL+(uint64_t)t.tv_nsec;
@@ -214,10 +255,11 @@ static enum device classify(const char *path) {
     if (!strcmp(path, "/dev/backlight")) return BACKLIGHT;
     if (!strcmp(path, "/proc/udev_usb1") || !strcmp(path, "/proc/udev_usbctn1")) return MEDIA;
     if (!strcmp(path, "/dev/gpiodrv")) return GPIO;
-    /* DIN MIDI (UART2 and the din_midi driver) only when a loopback cable is asked for (factory test mode). */
+    /* The factory cable and normal app ioctl endpoint have separate semantics. */
     if (!strcmp(path, "/dev/ttymxc1") || !strcmp(path, "/dev/din_midi")) {
         const char *loop=getenv("SP16_MIDI_LOOPBACK");
-        return loop && !strcmp(loop,"1") ? MIDI : NONE;
+        if (loop && !strcmp(loop,"1")) return MIDI;
+        return !strcmp(path,"/dev/din_midi") ? MIDI_CONTROL : NONE;
     }
     return NONE;
 }
@@ -471,6 +513,7 @@ static void note_unknown_device(const char *path) {
 static int open_device(const char *path, int flags, mode_t mode) {
     if (!original_open) original_open=dlsym(RTLD_NEXT,"open");
     if (!original_close) original_close=dlsym(RTLD_NEXT,"close");
+    if (path && !strcmp(path,"/proc/asound/snddinmidi/midi0")) return din_capacity_file();
     enum device kind = classify(path);
     if (!kind) {
         if (path && unknown_device_node(path)) note_unknown_device(path);
@@ -483,6 +526,10 @@ static int open_device(const char *path, int flags, mode_t mode) {
     if (native && kind==PANEL) fd=input_socket(PANEL,"SP16_PANEL_SOCKET","/dev/sp16-panel-input",panel_path);
     else if (native && kind==CDC) fd=input_socket(CDC,"SP16_CDC_SOCKET","/dev/sp16-cdc-input",cdc_path);
     else if (kind==MIDI) fd=midi_socket(!strcmp(path,"/dev/din_midi")?2:1);
+    else if (kind==MIDI_CONTROL) {
+        if (din_control_request(UINT32_MAX)<0) return -1;
+        fd=idle_socket(kind);
+    }
     else if (kind==GPIO) fd=gpio_open();
     else if (kind==MEDIA) {
         int node=!strcmp(path,"/proc/udev_usbctn1")?2:1;
@@ -554,6 +601,7 @@ ssize_t write(int fd, const void *buffer, size_t count) {
         if (s->peer<0) return media_write(s,fd,buffer,count);
     }
     if (s->kind==MIDI) return midi_write(s,buffer,count);
+    if (s->kind==MIDI_CONTROL) { errno=ENOTSUP; return -1; }
     if (s->kind==GPIO) return gpio_io(s,(void *)buffer,count,1);
     if (s->kind == MEDIA || s->kind==PACKET) { errno=ENOTSUP; return -1; }
     if (s->timer) { errno=EFAULT; return -1; }
@@ -584,6 +632,7 @@ ssize_t read(int fd, void *buffer, size_t count) {
         return result;
     }
     if (s->kind==MIDI) return original_read(fd,buffer,count); /* the loopback cable */
+    if (s->kind==MIDI_CONTROL) { errno=ENOTSUP; return -1; }
     if (s->kind==GPIO) return gpio_io(s,buffer,count,0);
     if (s->kind==MEDIA) {
         media_note(s,"read");
@@ -600,7 +649,7 @@ ssize_t read(int fd, void *buffer, size_t count) {
 static void note_ioctl(unsigned long request, enum device kind) {
     static unsigned long seen[32];
     static int count;
-    static const char *names[] = {"none", "panel", "cdc", "dac", "backlight", "media", "packet", "midi", "gpio"};
+    static const char *names[] = {"none", "panel", "cdc", "dac", "backlight", "media", "packet", "midi", "gpio", "din-control"};
     int known = __atomic_load_n(&count, __ATOMIC_ACQUIRE);
     for (int i=0; i<known && i<32; i++) if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED)==request) return;
     int slot = __atomic_fetch_add(&count, 1, __ATOMIC_ACQ_REL);  /* a racing duplicate line is harmless */
@@ -726,6 +775,11 @@ static int device_ioctl(struct state *s, int fd, unsigned long request, void *ar
         if (request==0x5402UL || request==0x5403UL || request==0x5404UL || request==0x540bUL) return 0;
         fprintf(stderr, "[sp16-ui-stub] unsupported ioctl fd=%d request=0x%lx\n", fd, request);
         errno=ENOTTY; return -1;
+    }
+    if (s->kind==MIDI_CONTROL) {
+        if (request!=0x40047000UL) { errno=ENOTTY; return -1; }
+        if (!arg) { errno=EFAULT; return -1; }
+        return din_control_request(*(const uint32_t *)arg);
     }
     if (s->kind!=PANEL && s->kind!=CDC && s->kind!=DAC) { errno=ENOTTY; return -1; }
     if (!arg) { errno=EFAULT; return -1; }
