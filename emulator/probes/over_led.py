@@ -249,10 +249,11 @@ def run(args):
             time.sleep(1.0)
         seen = window(runner, args.track, "hw-tone-m30.wav", args.seconds)
         control = pass_figures(seen)
-        # the fixture is -30 dBFS on paper but the measured level is what the report must name
+        # the fixture is -30 dBFS on paper, but the window plays it at whatever track volume the last pass left, so
+        # the report must name the volume with the measured level or the number reads as a mis-levelled fixture
         measured = control["peak_dbfs"]
         control.update(wanted=None, read_back=level, control=True,
-                       label=f"-30 dBFS fixture control (measured {level_label(measured)})")
+                       label=f"-30 dBFS fixture at track volume {level} (measured {level_label(measured)})")
         passes["control"] = control
         print(f"{control['label']}: peak={control['peak']} over_lit={control['over_lit']} "
               f"mono lit={control['mono_channels_lit']} "

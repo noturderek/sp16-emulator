@@ -357,7 +357,7 @@ class SweepTests(unittest.TestCase):
         control = report["passes"]["control"]
         self.assertTrue(control["control"])
         self.assertEqual(control["peak_dbfs"], -35.5)
-        self.assertEqual(control["label"], "-30 dBFS fixture control (measured -35.5 dBFS)")
+        self.assertEqual(control["label"], "-30 dBFS fixture at track volume 127 (measured -35.5 dBFS)")
         self.assertNotIn("m30", report["passes"])  # no pass is named after the fixture's nominal level
 
     def test_a_silent_control_is_labelled_silent_not_none(self):
@@ -366,7 +366,7 @@ class SweepTests(unittest.TestCase):
                                                      "main_out_gain_min": None, "main_out_gain_max": None,
                                                      "shim_out_peak": None})
         self.assertEqual(report["passes"]["control"]["label"],
-                         "-30 dBFS fixture control (measured silent)")
+                         "-30 dBFS fixture at track volume 127 (measured silent)")
         self.assertIn("measured silent", printed)
         self.assertNotIn("measured None", printed)
 
