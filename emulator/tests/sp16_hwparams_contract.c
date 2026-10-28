@@ -91,11 +91,13 @@ int main(void) {
     assert(snd_pcm_readi(handle,buffer,0)==0);
     assert(snd_pcm_close(handle)==0);
     /* By default: the AK4452 codec lists S16_LE, S24_LE and S20_3LE, so FLOAT_LE
-     * and S32_LE are refused as the unit's driver would and the app's format search settles on S24_LE; the master
+     * and S32_LE are refused as the unit's driver would and the app's format search settles on S24_LE; S20_3LE is
+     * refused too because the board model's sample path carries only 2- and 4-byte layouts; the master
      * codec stream is not filtered. */
     assert(snd_pcm_open(&handle,"hw:ak4452audio,0",1,0)==0);
     assert(snd_pcm_hw_params_set_format(handle,p,14)<0);
     assert(snd_pcm_hw_params_set_format(handle,p,10)<0);
+    assert(snd_pcm_hw_params_set_format(handle,p,36)<0);
     assert(snd_pcm_hw_params_set_format(handle,p,6)==0);
     assert(snd_pcm_close(handle)==0);
     assert(snd_pcm_open(&handle,"hw:ak4458audio,0",0,0)==0);
