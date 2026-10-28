@@ -12,7 +12,26 @@ if [ -n "${SP16_NET_KIND:-}" ]; then
   mac="52:54:00:$(echo "$hex" | sed 's/\(..\)\(..\)\(..\)/\1:\2:\3/')"
   case "$SP16_NET_KIND" in
    unix) backend="stream,id=sp16net,server=off,addr.type=unix,addr.path=$SP16_NET_TARGET" ;;
-   mcast) backend="socket,id=sp16net,mcast=$SP16_NET_TARGET" ;;
+   mcast)
+     # QEMU's socket,mcast backend binds its socket to the group address, which macOS never delivers to other
+     # local listeners. A host-side relay (net/segment_relay.py, copied next to this wrapper by the build) joins
+     # the group on a wildcard-bound socket instead, and QEMU attaches to it over a unix stream with the same
+     # framing socket_vmnet uses. SP16_NET_NO_RELAY=1 leaves the relay out (an already-running relay on
+     # SP16_NET_SOCKET); SP16_NET_SOCKET overrides the socket path.
+     sock="${SP16_NET_SOCKET:-${TMPDIR:-/tmp}/sp16r-$$.sock}"
+     backend="stream,id=sp16net,server=off,addr.type=unix,addr.path=$sock"
+     if [ -z "${SP16_NET_NO_RELAY:-}" ]; then
+       "${SP16_PYTHON:-python3}" "$(dirname "$0")/segment_relay.py" \
+         --socket "$sock" --target "$SP16_NET_TARGET" --mac "$mac" &
+       i=0
+       while [ ! -S "$sock" ] && [ "$i" -lt 100 ]; do
+         kill -0 "$!" 2>/dev/null || break
+         sleep 0.02
+         i=$((i + 1))
+       done
+       [ -S "$sock" ] || echo "qemu-net: segment relay did not start (socket $sock)" >&2
+     fi
+     ;;
    *) echo "qemu-net: unknown SP16_NET_KIND" >&2; exit 2 ;;
   esac
   echo "qemu-net: NIC $mac on $SP16_NET_KIND $SP16_NET_TARGET" >&2

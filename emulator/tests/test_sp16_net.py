@@ -19,7 +19,8 @@ class NetEnvironmentTests(unittest.TestCase):
 
     def test_mcast_needs_no_daemon(self):
         self.assertEqual(native.net_environment("mcast"),
-                         {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": "230.0.0.1:34567", "SP16_NET_MODE": "mcast"})
+                         {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": "230.0.0.1:34567", "SP16_NET_MODE": "mcast",
+                          "SP16_PYTHON": sys.executable})
         self.assertEqual(native.net_environment("mcast:40000")["SP16_NET_TARGET"], "230.0.0.1:40000")
 
     def test_refused_modes(self):
@@ -75,17 +76,26 @@ class WrapperTests(unittest.TestCase):
     def test_without_net_the_arguments_are_unchanged(self):
         self.assertEqual(self.run_wrapper(), (0, ["-m", "1"]))
 
-    def test_mcast_adds_a_nic_with_its_own_mac(self):
+    def test_mcast_uses_the_relay_stream_backend(self):
         macs = set()
         for _ in range(3):
-            code, args = self.run_wrapper(SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:1234")
+            code, args = self.run_wrapper(SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:1234",
+                                          SP16_NET_NO_RELAY="1", SP16_NET_SOCKET="/tmp/sp16-test.sock")
             self.assertEqual(code, 0)
             self.assertEqual(args[:3], ["-m", "1", "-netdev"])
-            self.assertEqual(args[3], "socket,id=sp16net,mcast=230.0.0.1:1234")
+            self.assertEqual(args[3], "stream,id=sp16net,server=off,addr.type=unix,addr.path=/tmp/sp16-test.sock")
             device = args[5]
             self.assertTrue(device.startswith("virtio-net-device,netdev=sp16net,mac=52:54:00:"), device)
             macs.add(device.rsplit("=", 1)[1])
         self.assertEqual(len(macs), 3)
+
+    def test_mcast_relay_socket_defaults_under_tmp(self):
+        import re
+        code, args = self.run_wrapper(SP16_NET_KIND="mcast", SP16_NET_TARGET="230.0.0.1:34567",
+                                      SP16_NET_NO_RELAY="1")
+        self.assertEqual(code, 0)
+        self.assertRegex(args[3], r"^stream,id=sp16net,server=off,addr.type=unix,addr.path="
+                                 r".*sp16r-\d+\.sock$")
 
     def test_unix_uses_the_stream_backend(self):
         _, args = self.run_wrapper(SP16_NET_KIND="unix", SP16_NET_TARGET="/x/socket_vmnet")

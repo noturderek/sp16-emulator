@@ -393,6 +393,10 @@ def bundle(output, qemu, guest, variant="stock", profile=None, research=False, t
     wrapper = output / NET_WRAPPER
     shutil.copy2(TOOLS / "net" / NET_WRAPPER, wrapper)
     wrapper.chmod(0o700)
+    # The mcast wrapper spawns this relay next to itself (see net/qemu-net.sh).
+    relay = output / NET_RELAY
+    shutil.copy2(TOOLS / "net" / NET_RELAY, relay)
+    relay.chmod(0o700)
     defaults = {"qemu": str(wrapper),
                 "arguments": arguments(qemu, guest, "@SOCKET@", trace, persistent, audio, True, padcal, app_arg),
                 "session": str(sessions), "socket": "@SOCKET@", "variant": variant,
@@ -540,6 +544,7 @@ def dev_overlay_path(folder):
 
 
 NET_WRAPPER = "qemu-net.sh"
+NET_RELAY = "segment_relay.py"
 NET_IFACE = re.compile(r"[a-z]{1,8}[0-9]{1,3}")
 NET_MCAST_GROUP = "230.0.0.1"
 NET_MCAST_PORT = 34567
@@ -606,7 +611,8 @@ def net_environment(mode, net_ip=None):
             raise ValueError("--net mcast:PORT needs a port from 1024 to 65535")
         if net_ip is not None:
             raise ValueError("--net-ip needs --net bridged:IF")
-        return {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": f"{NET_MCAST_GROUP}:{port}", "SP16_NET_MODE": mode}
+        return {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": f"{NET_MCAST_GROUP}:{port}", "SP16_NET_MODE": mode,
+                "SP16_PYTHON": sys.executable}
     raise ValueError(f"--net must be {NET_MODES}")
 
 
