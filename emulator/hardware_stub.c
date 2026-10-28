@@ -583,6 +583,30 @@ static void note_ioctl(unsigned long request, enum device kind) {
 #define SP16_SIOCGIFNETMASK 0x891bUL
 #define SP16_SIOCGIFHWADDR 0x8927UL
 #define SP16_SIOCETHTOOL 0x8946UL
+/* A networked guest has a real eth0, but QEMU user-mode can reject its carrier
+ * query. Only an explicit opt-in supplies the ETHTOOL_GLINK result. */
+static int network_glink_ioctl(unsigned long request, void *arg, int *result) {
+    const char *value=getenv("SP16_NET_GLINK");
+    if (!value || (strcmp(value,"0") && strcmp(value,"1")) ||
+        request!=SP16_SIOCETHTOOL || !arg) return 0;
+    struct ifreq *ifr=arg;
+    if (strncmp(ifr->ifr_name,"eth0",IFNAMSIZ)) return 0;
+    if (!ifr->ifr_data) { errno=EFAULT; *result=-1; return 1; }
+    uint32_t *ethtool=(uint32_t *)ifr->ifr_data;
+    if (ethtool[0]!=10) return 0; /* ETHTOOL_GLINK only */
+    ethtool[1]=value[0]=='1' ? 1U : 0U;
+    static int logged;
+    if (!__atomic_exchange_n(&logged,1,__ATOMIC_RELAXED))
+        fprintf(stderr,"[sp16-ui-stub] network eth0 GLINK=%u\n",ethtool[1]);
+    *result=0;
+    return 1;
+}
+
+static int network_arp_enabled(void) {
+    const char *value=getenv("SP16_NET_ARP");
+    return value && !strcmp(value,"1");
+}
+
 static int fake_eth0_enabled(void) {
     static int enabled=-1;
     if (enabled<0) { const char *v=getenv("SP16_FAKE_ETH0"); enabled = v && !strcmp(v,"1"); }
@@ -637,6 +661,7 @@ int ioctl(int fd, unsigned long request, ...) {
     struct state *s = device(fd);
     if (!s) {
         int fake_result;
+        if (network_glink_ioctl(request, arg, &fake_result)) return fake_result;
         if (fake_eth0_ioctl(request, arg, &fake_result)) return fake_result;
         return original_ioctl(fd, request, arg);
     }
@@ -1702,7 +1727,7 @@ int poll(struct pollfd *fds,nfds_t count,int timeout) {
 
 int socket(int domain,int type,int protocol) {
     int (*real)(int,int,int)=dlsym(RTLD_NEXT,"socket");
-    if (domain==AF_PACKET && (type&0xf)==SOCK_DGRAM && protocol==1544) {
+    if (domain==AF_PACKET && (type&0xf)==SOCK_DGRAM && protocol==1544 && !network_arp_enabled()) {
         int fd=idle_socket(PACKET);
         fprintf(stderr,"[sp16-ui-stub] ARP socket -> isolated idle fd=%d\n",fd);
         return fd;
