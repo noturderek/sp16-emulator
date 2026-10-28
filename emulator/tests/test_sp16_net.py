@@ -170,6 +170,14 @@ class FakeMasterTests(unittest.TestCase):
         pitch, _, bpm, beat = struct.unpack(">IHHB", packet[0x54:0x5d])
         self.assertEqual((pitch, bpm, beat), (round(1.02 * 0x100000), 12800, 3))
 
+    def test_beat_packet_ends_with_the_redundant_device_number(self):
+        # The follower's beat handler reads byte 0x5f and requires it to be 1-4 and equal to the followed master, so
+        # the 96-byte packet ends 0x5d=0x00, 0x5e=0x00, 0x5f=player for every player number.
+        for player in (1, 2, 3, 4):
+            packet = self.master.beat_packet("CDJ-3000", player, 128.0, 0.0, 1, 100)
+            self.assertEqual(len(packet), 96)
+            self.assertEqual((packet[0x5d], packet[0x5e], packet[0x5f]), (0x00, 0x00, player))
+
     def test_status_packet_flags_master_sync_play(self):
         import struct
         packet = self.master.status_packet("CDJ-3000", 1, 128.0, 0.02, 2, 7)
@@ -177,6 +185,16 @@ class FakeMasterTests(unittest.TestCase):
         self.assertEqual(packet[0x89] & 0x78, 0x78)
         self.assertEqual(struct.unpack(">H", packet[0x92:0x94])[0], 12800)
         self.assertEqual((struct.unpack(">I", packet[0xa0:0xa4])[0], packet[0xa6]), (7, 2))
+
+    def test_status_packet_sets_p3_and_master_meaningful(self):
+        import struct
+        playing = self.master.status_packet("CDJ-3000", 1, 128.0, 0.02, 2, 7)
+        stopped = self.master.status_packet("CDJ-3000", 1, 128.0, 0.02, 2, 7, playing=False)
+        # P3 at 0x9d: 0x0d (track loaded, playing forward) passes the follower's (P3 & 1) || (P3 & 8) gate.
+        self.assertEqual(playing[0x9d], 0x0d)
+        self.assertEqual(stopped[0x9d], 0x00)
+        # Mm (master meaningful) and Mv (rekordbox-track multiplier) match a real CDJ.
+        self.assertEqual((playing[0x9e], struct.unpack(">H", playing[0x90:0x92])[0]), (0x01, 0x8000))
 
     def test_packet_name_reads_each_family_at_its_own_offset(self):
         mac, ip = bytes.fromhex("020000000007"), bytes([169, 254, 7, 7])
