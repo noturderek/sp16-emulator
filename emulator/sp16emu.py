@@ -1096,7 +1096,8 @@ def plan_mod(ctx, args, tail):
 
 # ---------------------------------------------------------------------------------------------------- ctl
 CTL_COMMANDS = ("event", "press", "turn", "touch", "raw", "clear", "snapshot", "metrics", "txlog", "period",
-                "panelshot", "resize", "adc", "usb", "app-restart", "firmware")
+                "panelshot", "resize", "adc", "usb", "app-restart", "firmware", "power", "standby", "pressure",
+                "calibrate")
 CTL_OPTS = [
     Opt("--build", "The research build whose newest running session to drive (default: build/sp16-dev, else the "
         "only research build).", "NAME", emit=False),
@@ -1124,6 +1125,73 @@ def plan_ctl(ctx, args, tail):
     return Plan([Step(argv)])
 
 
+# -------------------------------------------------------------------------------------------------- midi
+MIDI_COMMANDS = ("ports", "learn", "preset", "run")
+# The midi_bridge options each subcommand understands, by launcher dest; anything else is refused here instead of by
+# the tool. `build_dir` defaults to this checkout's build/ folder.
+MIDI_TOOL_ARGS = (("runtime", "--runtime"), ("build_dir", "--build-dir"), ("build", "--build"),
+                  ("in", "--in"), ("out", "--out"), ("name", "--name"), ("profile", "--profile"),
+                  ("mapping", "--mapping"), ("preset", "--preset"), ("controls", "--controls"),
+                  ("timeout", "--timeout"), ("channel", "--channel"), ("note_base", "--note-base"),
+                  ("cc_page", "--cc-page"), ("no_leds", "--no-leds"), ("seconds", "--seconds"),
+                  ("out_dir", "--out-dir"))
+MIDI_ALLOWED = {
+    "ports": ("build_dir",),
+    "learn": ("build_dir", "in", "name", "controls", "timeout", "no_leds", "out_dir"),
+    "preset": ("name", "channel", "note_base", "cc_page", "out_dir"),
+    "run": ("runtime", "build_dir", "build", "in", "out", "profile", "mapping", "preset", "channel",
+            "note_base", "cc_page", "no_leds", "seconds"),
+}
+MIDI_OPTS = [
+    Opt("--build", "The build whose newest running session the bridge drives (default: any research build).",
+        "NAME"),
+    Opt("--runtime", "A running session's runtime.json instead of the newest session of a build.", "FILE", path=True),
+    Opt("--build-dir", "Where the builds are (default build/).", "DIR", path=True),
+    Opt("--in", "Part of the MIDI source's name (learn, run).", "NAME"),
+    Opt("--out", "MIDI destination for the LED echo (run; default: the source's name).", "NAME"),
+    Opt("--name", "Name of the profile and mapping to write (learn, preset).", "NAME"),
+    Opt("--profile", "Profile name or file (run).", "NAME"),
+    Opt("--mapping", "Mapping name or file (run; default: the profile's).", "NAME"),
+    Opt("--preset", "Use the built-in preset instead of --profile (run).", "NAME", choices=("sp16",)),
+    Opt("--controls", "Comma list of emulator controls to learn (learn; default: the pads, steps and main keys).", "LIST"),
+    Opt("--timeout", "Seconds to wait for each control while learning (learn).", "SECONDS"),
+    Opt("--channel", "The track's MIDI channel 1..16, or any (preset, run).", "CHANNEL"),
+    Opt("--note-base", "Note of pad 1 (preset, run; default 60 = C5).", "NOTE"),
+    Opt("--cc-page", "The knobs' MIDI CC page (preset, run).", "PAGE", choices=("1", "2")),
+    Opt("--no-leds", "No LED echo (run) and no LED outputs for learned buttons (learn).", flag=True),
+    Opt("--seconds", "Stop after this long (run; default: until interrupted).", "SECONDS"),
+    Opt("--out-dir", "Write profiles and mappings under DIR instead of private/midi (learn, preset).", "DIR",
+        path=True),
+]
+
+
+def plan_midi(ctx, args, tail):
+    """python3 -m emulator.midi_bridge from the repository root, with only the options that subcommand knows."""
+    allowed = MIDI_ALLOWED[args.midi_command]
+    for dest in {"learn": ("in", "name"), "run": ("in",)}.get(args.midi_command, ()):
+        if not getattr(args, dest, None):
+            flag = dict(MIDI_TOOL_ARGS)[dest]
+            raise UsageError(f"midi {args.midi_command}: {flag} is required; see: ./sp16 help midi")
+    tokens = []
+    for dest, flag in MIDI_TOOL_ARGS:
+        given = getattr(args, dest, None)
+        if given is None or given is False:
+            continue
+        if dest not in allowed:
+            raise UsageError(f"midi {args.midi_command}: {flag} is not an option of that subcommand; "
+                             f"see: ./sp16 help midi")
+        if given is True:
+            tokens.append(flag)
+            continue
+        value = os.path.expanduser(str(given)) if any(o.dest == dest and o.path for o in MIDI_OPTS) else str(given)
+        tokens += [flag, value]
+    if "build_dir" in allowed and args.build_dir is None:
+        tokens[0:0] = ["--build-dir", str(ctx.build)]        # honour SP16EMU_BUILD_DIR like every other command
+    env = {"PYTHONPATH": os.pathsep.join(filter(None, [str(ctx.root), ctx.env.get("PYTHONPATH")]))}
+    argv = [ctx.python(), "-m", "emulator.midi_bridge", args.midi_command] + tokens + list(tail)
+    return Plan([Step(argv, env=env)])
+
+
 # ------------------------------------------------------------------------------------------------ hwsuite
 HWSUITE_OPTS = [
     Opt("--build", "The research build to test (built with --research --audio file; default: build/sp16-dev).",
@@ -1134,7 +1202,11 @@ HWSUITE_OPTS = [
         "version of the firmware under test).", "VERSION|FILE", emit=False),
     Opt("--firmware", "The firmware id in the library (default: the session's).", "ID"),
     Opt("--runtime", "The runtime.json of a running research session to use as the main session.", "FILE", path=True),
-    Opt("--tier", "smoke, core or full (default full).", "TIER", choices=("smoke", "core", "full")),
+    Opt("--tier", "smoke, core, full or extra (default full); extra runs the factory-test pages and the screenshot "
+        "checks too, which need --testmode-build and a recorded reference.", "TIER",
+        choices=("smoke", "core", "full", "extra")),
+    Opt("--testmode-build", "The build made with --app-arg testmode that the factory-test checks (HW-48..HW-53) drive "
+        "(default: build/NAME-testmode when it exists).", "NAME", emit=False),
     Opt("--smoke", "Same as --tier smoke.", flag=True),
     Opt("--only", "Comma-separated check ids, such as HW-24.", "IDS"),
     Opt("--fixtures", "Fixture folder (default <out>/fixtures).", "DIR", path=True),
@@ -1144,6 +1216,14 @@ HWSUITE_OPTS = [
         "PATH", path=True),
     Opt("--make-fixtures", "Only generate the fixtures into DIR and exit.", "DIR", path=True),
     Opt("--json-only", "Print JSON only.", flag=True),
+    Opt("--shots", "Screenshot regression: record this run's captures, or compare them with the references.", "MODE",
+        choices=("record", "compare")),
+    Opt("--shots-dir", "Folder of reference captures (default private/hwsuite-shots/<firmware version>).", "DIR",
+        path=True),
+    Opt("--shots-tolerance", "Per-channel difference at which two pixels count as the same (default 8).", "N"),
+    Opt("--shots-share", "Fraction of compared pixels that may change and still match (default 0).", "F"),
+    Opt("--testmode-skip", "Comma list of the controls HW-49 leaves unpressed, its negative control (such as bar4).",
+        "IDS"),
 ]
 
 
@@ -1193,6 +1273,16 @@ def plan_hwsuite(ctx, args, tail):
                          f"{build_hint(info.name + '-uncal', '--research --audio file --uncalibrated --library ' + str(info.library))}")
     if control:
         argv += ["--control-build", str(pick_build(ctx, control, need_research=True).path)]
+    testmode = args.testmode_build
+    if testmode is None:
+        candidate = ctx.build / (info.name + "-testmode")
+        testmode = candidate.name if (candidate / "assets.json").is_file() else None
+    if testmode:
+        argv += ["--testmode-build", str(pick_build(ctx, testmode, need_research=True).path)]
+    elif args.tier == "extra":
+        notes.append(f"no testmode build (make {info.name}-testmode with --app-arg testmode): the factory-test checks "
+                     f"are N/A; create it with: "
+                     f"{build_hint(info.name + '-testmode', '--research --audio file --app-arg testmode --library ' + str(info.library))}")
     argv += HWSUITE_COMMAND.emit(args) + list(tail)
     return Plan([Step(argv)], notes)
 
@@ -2860,6 +2950,9 @@ def help_ctl_lines():
         "resize WIDTH HEIGHT          resize the panel window",
         "metrics | adc | txlog [off] | period MS    counters, analog words, panel traffic, frame period",
         "usb eject|attach             eject or reattach the virtual USB stick",
+        "power [SECONDS] | standby yes  press the power key into standby, or leave standby (reads the TX standby flag)",
+        "pressure PAD 0..1023        hold a pad at a raw pressure word (0 lets go)",
+        "calibrate PAD [RAW]          hold a pad and make the three factory-test calibration passes",
         "app-restart | firmware       restart only the firmware's app; library and running firmware",
     ]
 
@@ -3032,6 +3125,26 @@ def make_commands():
                "NAME is a control: pad1..pad16, step1..step16, bar1..bar4, knob1..knob6, selector, strip, or a button "
                "such as play, rec, stop, shift, home, back (the full list is CONTROL_IDS in panel_map.py)."],
         handler=plan_ctl)
+    add("midi", "Develop and test", "Drive the emulator from a MIDI controller: list ports, learn a controller, run a bridge",
+        "Runs the MIDI bridge (emulator/midi_bridge) against a running research session. `ports` lists the CoreMIDI "
+        "sources and destinations; `learn` records a controller's pads, keys and knobs into a profile and a mapping "
+        "(private/midi/) by watching calls reach the firmware; `preset` writes the built-in SP-16 profile and mapping "
+        "without a running session; `run` translates one controller's MIDI into control events, and echoes the lamps back "
+        "as LED notes unless --no-leds. Options come before or after the subcommand; anything after `--` goes unchanged "
+        "to the bridge.",
+        positionals=[Pos("midi_command", "what the bridge does", choices=MIDI_COMMANDS, metavar="COMMAND")],
+        opts=MIDI_OPTS, usage="./sp16 midi COMMAND [options] [-- BRIDGE_ARGS...]",
+        examples=["./sp16 midi ports",
+                  "./sp16 midi preset --name sp16-cc1",
+                  "./sp16 midi learn --in nanoKONTROL2 --name nano",
+                  "./sp16 midi run --in nanoKONTROL2 --preset sp16 --seconds 30",
+                  "./sp16 --dry-run midi run --in nanoKONTROL2 --profile nano"],
+        notes=["The session must run from a build made with --research; learn and run wait for it about a second per "
+               "control.",
+               "A profile and a mapping are written under private/midi/ (git-ignored), or under --out-dir.",
+               "--preset sp16 is the built-in SP-16 layout: pads as MIDI notes from --note-base on --channel, the knobs "
+               "on the CC1 or CC2 page."],
+        handler=plan_midi)
     HWSUITE_COMMAND = add(
         "hwsuite", "Develop and test", "Run the hardware conformance suite against a research build",
         "Checks that the emulated hardware behaves correctly for a firmware (panel protocol, lamps, encoders, pads, "
@@ -3040,6 +3153,7 @@ def make_commands():
         "first: the suite starts and stops its own sessions.",
         opts=HWSUITE_OPTS, usage="./sp16 hwsuite [--build NAME] [--control NAME] [--profile VERSION] [options]",
         examples=["./sp16 hwsuite --smoke", "./sp16 hwsuite --profile 1.60 --tier core",
+                  "./sp16 hwsuite --tier extra --testmode-build sp16-dev-testmode",
                   "./sp16 hwsuite --tier full --mark-verified"],
         notes=["Exit codes: 0 pass, 1 fail, 2 blocked (missing profile data), 3 environment, 4 session lost.",
                "Only a full-tier run in which every check passes can mark a profile verified."],
