@@ -463,6 +463,91 @@ class TestmodePageTests(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertIn("synthetic default", result["reason"])
 
+    def test_the_page_4_status_cell_names_the_control_it_counted(self):
+        """The status cell prints the control the page counted (`PAD 1 : 3`); the reader must name that control and no
+        other, so a press the page misattributes is visible."""
+        self.assertEqual(hwsuite.testmode_status_controls("PAD 1 : 3"), {"pad1"})
+        self.assertEqual(hwsuite.testmode_status_controls("STEP 16 : 1"), {"step16"})
+        self.assertEqual(hwsuite.testmode_status_controls("STEP 1 : 1"), {"step1"})
+        self.assertEqual(hwsuite.testmode_status_controls("BAR 3 : 41"), {"bar3"})
+        self.assertEqual(hwsuite.testmode_status_controls("USB STOP : 2"), {"usb_stop"})   # not STOP
+        self.assertEqual(hwsuite.testmode_status_controls("USBSTOP : 2"), {"usb_stop"})    # OCR drops the space
+        self.assertEqual(hwsuite.testmode_status_controls("PAD12 : 1"), {"pad12"})
+        self.assertEqual(hwsuite.testmode_status_controls("STOP : 2"), {"stop"})
+        self.assertEqual(hwsuite.testmode_status_controls("SHIFT"), {"shift"})
+        self.assertEqual(hwsuite.testmode_status_controls("MODE : ---"), {"mode"})
+        # Not a name: the idle placeholder, an empty cell, and a name that is not the cell's first tokens.
+        self.assertEqual(hwsuite.testmode_status_controls("--------- : ---"), set())
+        self.assertEqual(hwsuite.testmode_status_controls(""), set())
+        self.assertEqual(hwsuite.testmode_status_controls("n/a : play"), set())
+
+    def test_every_control_page_4_counts_has_a_printed_name(self):
+        self.assertEqual(set(hwsuite.TESTMODE_STATUS_NAMES), set(hwsuite.TESTMODE_CONTROLS))
+        self.assertEqual(len({words for words in hwsuite.TESTMODE_STATUS_NAMES.values()}), 50)
+
+    def hw49_runner(self, tmp, skip=()):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        runner = hwsuite.Runner(json.loads(profile_path.read_text()), profile_path, tmp, None, tmp, tmp, "extra",
+                                ["HW-49"], testmode_build=tmp, testmode_skip=skip)
+        runner.session = FakeSession()
+        return runner
+
+    def run_hw49(self, misnaming=None, skip=()):
+        """hw49 against a page that counts every press, and names the control in `misnaming` (default: the one pressed)
+        as another control, which is what a swapped mapping looks like."""
+        misnaming = misnaming or {}
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw49_runner(tmp, skip)
+
+            def pressed():
+                names = [call[1] for call in runner.session.calls if call[0] == "press" and call[1] != "selector"]
+                return names[-1] if names else None
+
+            def counted(image, row, total):
+                presses = [call for call in runner.session.calls if call[0] == "press" and call[1] != "selector"]
+                return min(len(presses), 48) if row == hwsuite.TESTMODE_LED_ROW else len(presses)
+
+            def named(image):
+                name = pressed()
+                return None if name is None else misnaming.get(name, name)
+            with mock.patch.object(hwsuite, "wait_settled"), mock.patch.object(hwsuite, "ocr", return_value="OK"), \
+                    mock.patch.object(hwsuite, "testmode_counter", side_effect=counted), \
+                    mock.patch.object(hwsuite, "testmode_status_name", side_effect=named), \
+                    mock.patch.object(hwsuite.Runner, "testmode_page_is",
+                                      return_value=hwsuite.sub("stepped to page 4", True)):
+                return runner.hw49()
+
+    def test_hw49_passes_when_every_press_is_counted_and_named(self):
+        result = self.run_hw49()
+        self.assertEqual(result["status"], "PASS")
+        self.assertIn("the status line named the control that was pressed", [s["name"] for s in result["subresults"]])
+
+    def test_hw49_fails_when_the_page_names_another_control_for_a_press(self):
+        """Two controls with swapped mappings still move RESULT, so the totals pass; the page's own status line names
+        the other control and that must fail the check."""
+        result = self.run_hw49({"bar4": "bar3"})
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("bar4 -> bar3", result["reason"])
+        self.assertEqual([s["status"] for s in result["subresults"] if s["name"].startswith("every control moved")],
+                         ["PASS"])
+
+    def test_hw49_reports_an_unreadable_status_line_as_not_applicable(self):
+        """A cell the OCR cannot read is not proof of a wrong mapping: the totals still decide, and the gap is named."""
+        result = self.run_hw49({"pad7": None})
+        self.assertEqual(result["status"], "PASS")
+        unread = [s for s in result["subresults"] if s["name"] == "the status line was readable for every press"]
+        self.assertEqual([s["status"] for s in unread], ["N/A"])
+        self.assertIn("pad7", unread[0]["observed"])
+
+    def test_hw49_does_not_judge_a_control_it_was_told_to_skip(self):
+        """--testmode-skip leaves a control unpressed (the totals then fall short by design); its name is never judged."""
+        result = self.run_hw49({"bar4": "bar3"}, skip=("bar4",))
+        status = [s["status"] for s in result["subresults"]
+                  if s["name"] == "the status line named the control that was pressed"]
+        self.assertEqual(status, ["PASS"])
+        self.assertEqual(result["metrics"]["skipped"], ["bar4"])
+        self.assertNotIn("bar4 -> bar3", result["reason"])
+
     def test_testmode_skip_names_must_be_controls_hw49_presses(self):
         self.assertEqual(hwsuite.check_testmode_skip([]), ())
         self.assertEqual(hwsuite.check_testmode_skip(["bar4", "pad16", "shift"]), ("bar4", "pad16", "shift"))
