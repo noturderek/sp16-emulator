@@ -677,6 +677,8 @@ RUN_OPTS = [
         "bridge100 on this Mac); bridged:IF (for example bridged:en0, the real network); mcast[:PORT] (no root: links "
         "emulators on this Mac only). host and bridged need the socket_vmnet daemon running; each start gets its own MAC.",
         "MODE"),
+    Opt("--net-ip", "With --net bridged:IF: the guest's address on the real network, a.b.c.d[/prefix] (default /24), "
+        "kept beside its 169.254 Pro DJ Link address.", "ADDR"),
     Opt("--no-audio-files", "Audio builds (--audio file or both): keep reading and counting the guest's audio (metrics) "
         "but write no WAV into the session folder, for unattended runs that read no audio (about 28 MB a minute "
         "otherwise).", flag=True),
