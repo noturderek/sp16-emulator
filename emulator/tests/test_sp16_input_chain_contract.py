@@ -36,6 +36,20 @@ class InputChainTests(unittest.TestCase):
         self.assertIs(load_board_line()(LEVELS.replace("limiter=1", "limiter=0"))[1]["limiter_active"], False)
         self.assertIsNone(load_board_line()("[sp16-ui-stub] analog levels garbage"))
 
+    @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
+    def test_capture_stale_switch_reproduces_the_old_silent_capture(self):
+        pre = "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/none.wav /tmp/run/t"
+        with arm_contract.ArmContract() as arm:
+            try:
+                out = arm.run("sp16_input_chain_contract", [
+                    "mkdir -p /opt/sp16/dev-share; rm -f /tmp/run/analog",
+                    "printf pattern > /opt/sp16/dev-share/capture-stale; %s pattern && echo PASS-pattern" % pre,
+                    "printf untouched > /opt/sp16/dev-share/capture-stale; %s untouched && echo PASS-untouched" % pre])
+            except subprocess.CalledProcessError as exc:
+                self.fail((exc.stdout or "")[-2500:] + (exc.stderr or "")[-1500:])
+            self.assertIn("PASS-pattern", out)
+            self.assertIn("PASS-untouched", out)
+
     def test_service_stimulus_preset(self):
         self.assertEqual(service_stimulus.events(-10.0), [("main_out", 1000), ("input_level", 1000), ("input_tone", 604)])
         self.assertAlmostEqual(service_stimulus.dbv_to_dbfs(-10.0), -23.79, places=1)

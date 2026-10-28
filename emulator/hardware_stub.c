@@ -1346,7 +1346,19 @@ static void input_fill(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames
     struct inject *wav=&inject_now;
     int use_wav=wav->data!=NULL, limiter=limiter_on();
     meter_source=use_wav?2:a.tone_amp>0?1:0;
-    if (!use_wav && a.tone_amp<=0) { memset(buffer,0,(size_t)frames*w*s->channels); return; }
+    if (!use_wav && a.tone_amp<=0) {
+        /* Research switch (file `capture-stale` in the developer share): reproduce what a silent capture did before the
+         * buffer was written. "untouched" leaves the app's buffer as it is, "pattern" fills it with 0x5a bytes. */
+        static int stale=-1;
+        if (stale<0) {
+            char mode[16]={0}; int fd=original_open?original_open("/opt/sp16/dev-share/capture-stale",O_RDONLY|O_CLOEXEC):-1;
+            if (fd>=0) { ssize_t n=original_read?original_read(fd,mode,sizeof mode-1):0; (void)n; original_close(fd); }
+            stale=!strncmp(mode,"untouched",9)?1:!strncmp(mode,"pattern",7)?2:0;
+        }
+        if (stale==1) return;
+        memset(buffer,stale==2?0x5a:0,(size_t)frames*w*s->channels);
+        return;
+    }
     float rate=(float)(s->rate?s->rate:44100), step=2*BM_PI*a.tone_hz/rate, amp=a.tone_amp*a.input_gain;
     uint8_t *p=buffer; unsigned bpf=w*s->channels;
     double advance=use_wav?wav->rate/(double)rate:0;

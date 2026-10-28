@@ -92,11 +92,20 @@ static void wav(const char *path,unsigned channels,unsigned rate,const int16_t *
     for (unsigned i=0;i<frames;i++) fwrite(frame,2,channels,f);
     fclose(f);
 }
-int main(void) {
+int main(int argc,char **argv) {
     const char *state=getenv("SP16_ANALOG"), *wavpath=getenv("SP16_INPUT_WAV");
     assert(state && wavpath);
     unlink(wavpath);
     snd_pcm_t *in=capture();
+    if (argc>1) { /* research switch capture-stale in the developer share: what a silent capture leaves in the app's buffer */
+        int16_t b[N*2]; analog(state,500,0); settle();
+        assert(snd_pcm_readi(in,b,N)==N);                        /* the first read still runs on the old state */
+        memset(b,0x11,sizeof b);
+        assert(snd_pcm_readi(in,b,N)==N);
+        const uint8_t *raw=(const uint8_t *)b; int pattern=!strcmp(argv[1],"pattern");
+        for (unsigned i=0;i<sizeof b;i++) assert(raw[i]==(pattern?0x5a:0x11));
+        return 0;
+    }
     /* 1. INPUT LEVEL law: gain = 4 * pot^2 (unity at pot 0.5). A 0 dBFS tone at pot 0.5 peaks near full scale, at
      * pot 0.25 near a quarter, and a tone at -30 dBFS at pot 0.5 near 0.0316 full scale. */
     analog(state,500,1000);
