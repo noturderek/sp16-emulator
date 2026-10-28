@@ -1026,7 +1026,7 @@ static void *ax_forwarder(void *unused) {
  *  - The filter is an insert loop: the "Send & Return" playback (send DAC) goes through an analog low-pass (CUTOFF,
  *    RESONANCE pots, never seen by any MCU) and a high-pass whose cutoff is a control voltage from a DAC7811 on
  *    /dev/dac_spi4.0, and comes back on the "Send & Return" capture (return ADC). Here the send frames are queued and
- *    returned one period later through a two-pole low-pass and a two-pole high-pass.
+ *    drained by the return capture through a two-pole low-pass and a two-pole high-pass.
  *  - MAIN OUT is an analog volume after the master DAC (its pot position also reaches the firmware as an ADC word),
  *    INPUT LEVEL an analog gain before the input ADC (no MCU sees it).
  * Host-only state (MAIN OUT gain, INPUT LEVEL, CUTOFF, RESONANCE, a test tone on the input) comes from the bridge
@@ -1167,8 +1167,9 @@ static float svf_run(struct svf *f,unsigned c,float x,int high) {
     return high?x-f->k*v1-v2:v2;
 }
 
-/* The loop: the send playback is queued as stereo float; the return capture takes it one period later. A capture
- * that finds the queue empty returns silence (counted), a full queue drops the newest send frames (counted). */
+/* The loop: the send playback is queued as stereo float and the return capture drains it on demand (a FIFO, no fixed
+ * one-period delay). A capture that finds the queue empty returns silence (counted), a full queue drops the newest
+ * send frames (counted). */
 #define LOOP_FRAMES 8192u
 static float loop_buf[LOOP_FRAMES][2];
 static uint32_t loop_head, loop_tail;
