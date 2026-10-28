@@ -103,6 +103,9 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     var log: FileHandle?
     var stderrCapture: StderrCapture?
     var audioSink: AudioSink?
+    /// Held for the life of the app: App Nap must not throttle a build without an audio sink (audio builds already
+    /// take their own assertions). User-initiated tier, but idle system sleep stays allowed for a silent app.
+    var panelActivity: NSObjectProtocol?
     var txLog: FileHandle?
     var lastCapture = 0.0
     let started = ProcessInfo.processInfo.systemUptime
@@ -124,6 +127,11 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // App Nap otherwise delays every thread of a background or occluded app by tens to hundreds of milliseconds,
+        // stalling the panel frame transport (docs/changes/l2-audio-timing.md section 6). Audio builds hold their own
+        // assertions in AudioSink/AudioOutput; this one covers builds without a sink, for the life of the app.
+        panelActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
+                                                              reason: "SP-16 panel transport")
         NSApp.setActivationPolicy(.regular)
         installMenus()
         loadSkinOverlay()
@@ -972,6 +980,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     func applicationWillTerminate(_ notification: Notification) {
         AppLog.markCleanExit("quit")
+        if let held = panelActivity { ProcessInfo.processInfo.endActivity(held); panelActivity = nil }
         audioSink?.stop()
         audioSink?.output?.stop()
         // Only the launcher-created IPC directory; diagnostic session files persist.
