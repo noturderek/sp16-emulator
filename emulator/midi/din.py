@@ -3,6 +3,9 @@
 Run directly with ``python3 -m midi.din --socket PATH`` from emulator/, or let
 native.py launch it for the newest session. The QEMU socket carries raw MIDI
 bytes in both directions. No firmware data passes through this process.
+
+The app's MIDI routing preferences (midi-routing.json, see midi.routing) decide what this port carries: our own
+source row gates the guest-to-host direction and our own destination row the host-to-guest one.
 """
 import argparse
 from collections import deque
@@ -15,6 +18,7 @@ import threading
 import time
 
 from midi.clock import ClockDLL
+from midi.routing import Routing, config_argument
 from midi_bridge.midi import Port, hex_line
 
 BYTE_NS = 320_000  # 31,250 bit/s, ten bits per MIDI byte
@@ -161,15 +165,21 @@ def session_socket(build, since, timeout=60, suffix=".midi"):
     raise TimeoutError(f"no new MIDI session appeared under {build}")
 
 
-def bridge(path, build_dir=None, name="SP-16 DIN"):
+def bridge(path, build_dir=None, name="SP-16 DIN", routing=None):
     """Run until the guest disconnects; cancel pending input before releasing its socket."""
     sock = connect(path)
+    routing = Routing() if routing is None else routing
     writer = PacedInput(sock.sendall)
     worker = threading.Thread(target=writer.run, name="din-midi-input", daemon=True)
     worker.start()
     dll = ClockDLL()
 
     def received(data):
+        # Host -> guest: our destination row's Out and Send clock decide what reaches the UART.
+        to_guest = routing.route(name, is_source=False)
+        data = bytes(byte for byte in data if to_guest.carries_to_guest(byte))
+        if not data:
+            return
         stamp = time.monotonic()
         for byte in data:
             if byte == 0xF8:
@@ -186,6 +196,9 @@ def bridge(path, build_dir=None, name="SP-16 DIN"):
             if not data:
                 break
             for message in messages.feed(data):
+                # Guest -> host: our source row's In and Receive clock decide what leaves the UART.
+                if not routing.route(name, is_source=True).carries_from_guest(message):
+                    continue
                 port.process.stdin.write("out " + hex_line(message) + "\n")
                 port.process.stdin.flush()
     finally:
@@ -206,9 +219,10 @@ def main(argv=None):
     parser.add_argument("--name", default="SP-16 DIN", help="CoreMIDI endpoint label")
     parser.add_argument("--since", type=float, default=0)
     parser.add_argument("--build-dir", type=Path, help="helper binary cache")
+    parser.add_argument("--config", type=config_argument, help="the app's midi-routing.json")
     args = parser.parse_args(argv)
     path = args.socket or session_socket(args.wait_for_session, args.since)
-    bridge(path, args.build_dir, args.name)
+    bridge(path, args.build_dir, args.name, Routing(args.config))
     return 0
 
 

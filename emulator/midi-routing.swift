@@ -17,9 +17,14 @@ struct MidiEndpoint: Equatable {
     let isSource: Bool
 }
 
-/// The bridge config the preferences window writes and the DIN/USB bridges read. Clock source is "internal" or the
-/// decimal string of a source's unique ID. One entry per port the user has touched; untouched ports keep the bridge
-/// default.
+/// The bridge config the preferences window writes and the Python DIN/USB bridges read (`emulator/midi/routing.py`):
+/// the clock source ("internal" or the decimal string of a source's unique ID), the tempo the window's own clock
+/// generator sends, and one entry per port the user has toggled. A port the user has not touched is *absent*, which
+/// the bridges read as "carry everything" — the same as no preferences file at all. The bridges match an entry by
+/// `name`, the label they gave their own virtual endpoint, and never by `uniqueID` (the system assigns that and a
+/// bridge cannot know it before its port exists); `uniqueID` is what this window remembers a re-plugged device by.
+/// A row is one CoreMIDI endpoint, so its toggles apply where its kind is: In/Receive clock on a source (the host
+/// reads it), Out/Send clock on a destination (the host writes it).
 struct MidiRoutingConfig: Codable {
     var clockSource: String = "internal"
     var bpm: Double = 120.0
@@ -58,6 +63,10 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private var rows: [MidiEndpoint] = []
     /// The persisted per-endpoint config, keyed by "src:ID" / "dst:ID".
     private var settings: [String: MidiRoutingConfig.PortConfig] = [:]
+    /// The keys whose toggles the user has actually changed. Only these are written to the bridge config: `reload`
+    /// gives every visible endpoint a blank entry, so writing all of `settings` would tell the bridges that every
+    /// port is switched off the first time this window opens.
+    private var touched: Set<String> = []
 
     // Clock state (owned by stateLock).
     private var clockSource: String = "internal"          // "internal" or the decimal ID of a source
@@ -232,6 +241,7 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private func setConfig(_ value: MidiRoutingConfig.PortConfig, for endpoint: MidiEndpoint) {
         stateLock.lock()
         settings[key(endpoint)] = value
+        touched.insert(key(endpoint))
         stateLock.unlock()
         persist()
     }
@@ -397,6 +407,7 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
             settings = stored
         }
         if let src = UserDefaults.standard.string(forKey: "midi-routing.clockSource") { clockSource = src }
+        if let keys = UserDefaults.standard.stringArray(forKey: "midi-routing.touched") { touched = Set(keys) }
         let bpm = UserDefaults.standard.double(forKey: "midi-routing.bpm")
         if bpm > 0 { nominalBPM = bpm }
     }
@@ -404,21 +415,25 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private func persist() {
         stateLock.lock()
         let settingsSnapshot = settings
+        let touchedSnapshot = touched
         let source = clockSource
         let bpm = nominalBPM
         stateLock.unlock()
         if let data = try? JSONEncoder().encode(settingsSnapshot) {
             UserDefaults.standard.set(data, forKey: Self.defaultsKey)
         }
+        UserDefaults.standard.set(touchedSnapshot.sorted(), forKey: "midi-routing.touched")
         UserDefaults.standard.set(source, forKey: "midi-routing.clockSource")
         UserDefaults.standard.set(bpm, forKey: "midi-routing.bpm")
         writeBridgeConfig()
     }
 
-    /// The bridge config the Python DIN/USB bridges read: clock source, tempo, and every touched port.
+    /// The bridge config the Python DIN/USB bridges read (`emulator/midi/routing.py`): clock source, tempo, and the
+    /// ports the user has toggled, in a stable order. Untouched ports are left out on purpose (see `touched`).
     func writeBridgeConfig() {
         stateLock.lock()
-        let config = MidiRoutingConfig(clockSource: clockSource, bpm: nominalBPM, ports: Array(settings.values))
+        let ports = touched.sorted().compactMap { settings[$0] }
+        let config = MidiRoutingConfig(clockSource: clockSource, bpm: nominalBPM, ports: ports)
         stateLock.unlock()
         guard let data = try? JSONEncoder().encode(config) else { return }
         try? FileManager.default.createDirectory(at: Self.configURL.deletingLastPathComponent(),
