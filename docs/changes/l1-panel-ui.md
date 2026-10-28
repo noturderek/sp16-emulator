@@ -21,7 +21,7 @@ Files owned: `emulator/panel-view.swift`, `emulator/panel-layout.json`, `emulato
 ## What changed and how to use it
 
 **pt-i44.22 Lamp bloom.** Lit pads, steps, bars, buttons and LEDs throw an additive halo (plus-lighter blend, drawn
-after all controls, LCD glass excluded). View > Lamp Glow turns it off. Static, so an idle panel repaints nothing.
+after all controls, LCD glass excluded). Off by default; View > Lamp Glow turns it on (not remembered between launches). Static, so an idle panel repaints nothing.
 
 **pt-i44.24 Redraw cost.** `metrics.json` and the research `metrics` op carry `panel_redraw`: passes, total and worst
 ms, mean dirty-area fraction. Research op `redraw-bench count=N` returns the mean ms of a whole-view repaint.

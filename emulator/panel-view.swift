@@ -245,7 +245,7 @@ struct PanelRenderState {
     var bootStage = "Starting the virtual machine"   // shown on the dark LCD until the first firmware frame
     var bootSeconds = 0
     var lcdBrightness: CGFloat = 1      // the firmware's LCD backlight level, 0...1 (1 = full, as before)
-    var bloom = true                    // additive glow around lit keys, buttons and LEDs
+    var bloom = false                   // additive glow around lit keys, buttons and LEDs (View > Lamp Glow; off by default)
 
     func look(_ id: UInt8) -> LampLook {
         guard feedbackLive else { return .unknown }
