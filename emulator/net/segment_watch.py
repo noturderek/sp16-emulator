@@ -10,7 +10,9 @@ import socket
 import struct
 import time
 
-MAGIC = b"Qspt1WmJOL"
+import fake_master
+
+MAGIC = fake_master.MAGIC
 
 
 def describe(frame):
@@ -30,9 +32,8 @@ def describe(frame):
     payload = frame[14 + ihl + 8:14 + ihl + length]
     text = f"UDP {ip_src}:{sport} -> {ip_dst}:{dport} len {len(payload)}"
     if payload.startswith(MAGIC):
-        # The name field is 20 bytes at offset 0x0c (after the 10-byte magic, the type byte and one reserved byte).
-        name = payload[12:32].split(b"\0")[0].decode("ascii", "replace")
-        text += f" PRODJLINK type {payload[10]:#04x} name {name!r}"
+        # The name's offset depends on the packet family: 0x0c on port 50000, 0x0b on 50001/50002.
+        text += f" PRODJLINK type {payload[10]:#04x} name {fake_master.packet_name(payload, dport)!r}"
         if dport == 50000 and len(payload) == 54:
             text += f" mac {payload[0x26:0x2c].hex(':')} ip {socket.inet_ntoa(payload[0x2c:0x30])}"
         if dport == 50001 and payload[10] == 0x28 and len(payload) >= 0x5c:

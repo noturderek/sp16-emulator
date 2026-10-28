@@ -44,6 +44,17 @@ def send_packet(seg, group, port, src_mac, src_ip, dst_ip, dst_port, payload):
     seg.sendto(frame, (group, port))
 
 
+def frame_name(parsed):
+    """The device name in one parsed segment frame, decoded at its packet family's offset."""
+    return fake_master.packet_name(parsed["payload"], parsed["dst_port"])
+
+
+def keepalive_line(seen, parsed):
+    """The line printed for one guest keep-alive: its source, its type byte and its decoded name."""
+    return (f"guest keep-alive {seen}: {parsed['src_mac']} {parsed['src_ip']} "
+            f"type {parsed['payload'][10]:#04x} name {frame_name(parsed)!r}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--group", default=GROUP)
@@ -124,10 +135,8 @@ def main(argv=None):
                 continue  # our own frames echoed back by the segment's multicast loopback
             if parsed["dst_port"] == fake_master.PORT_KEEPALIVE and parsed["payload"][:10] == MAGIC:
                 seen += 1
-                name = parsed["payload"][11:31].split(b"\0")[0].decode("ascii", "replace")
                 if seen <= 12 or seen % 10 == 0:
-                    print(f"guest keep-alive {seen}: {parsed['src_mac']} {parsed['src_ip']} "
-                          f"type {parsed['payload'][10]:#04x} name {name!r}", flush=True)
+                    print(keepalive_line(seen, parsed), flush=True)
         time.sleep(max(0.0, min(next_keepalive, next_status, next_beat) - time.monotonic()))
     if log:
         log.close()

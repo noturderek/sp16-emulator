@@ -163,6 +163,31 @@ class FakeMasterTests(unittest.TestCase):
         self.assertEqual(struct.unpack(">H", packet[0x92:0x94])[0], 12800)
         self.assertEqual((struct.unpack(">I", packet[0xa0:0xa4])[0], packet[0xa6]), (7, 2))
 
+    def test_packet_name_reads_each_family_at_its_own_offset(self):
+        mac, ip = bytes.fromhex("020000000007"), bytes([169, 254, 7, 7])
+        self.assertEqual(self.master.packet_name(self.master.keepalive("TORAIZ", 2, mac, ip), 50000), "TORAIZ")
+        self.assertEqual(self.master.packet_name(self.master.beat_packet("CDJ-3000", 1, 128.0, 0.0, 1, 100), 50001),
+                         "CDJ-3000")
+        self.assertEqual(self.master.packet_name(self.master.status_packet("CDJ-3000", 1, 128.0, 0.0, 1, 1), 50002),
+                         "CDJ-3000")
+        # A join-stage hello on 50000 carries the same reserved byte before the name.
+        hello = b"Qspt1WmJOL\x0a\x00" + b"CDJ-3000".ljust(20, b"\0") + b"\x01\x02\x00\x25\x01"
+        self.assertEqual(self.master.packet_name(hello, 50000), "CDJ-3000")
+
+    def test_name_offset_falls_back_to_shape_without_a_known_port(self):
+        keepalive = self.master.keepalive("TORAIZ", 2, bytes(6), bytes(4))
+        beat = self.master.beat_packet("CDJ-3000", 1, 128.0, 0.0, 1, 100)
+        self.assertEqual(self.master.name_offset(keepalive, 50000), 0x0c)
+        self.assertEqual(self.master.name_offset(beat, 50001), 0x0b)
+        self.assertEqual(self.master.name_offset(beat, 50002), 0x0b)
+        self.assertEqual(self.master.name_offset(keepalive), 0x0c)   # 54-byte type 0x06: the 50000 layout
+        self.assertEqual(self.master.name_offset(beat), 0x0b)
+
+    def test_packet_name_refuses_a_payload_too_short_for_the_field(self):
+        for payload in (b"Qspt1WmJOL\x06", b"Qspt1WmJOL\x06\x00" + b"TORAIZ"):
+            with self.assertRaises(ValueError, msg=payload):
+                self.master.packet_name(payload, 50000)
+
 
 if __name__ == "__main__":
     unittest.main()
