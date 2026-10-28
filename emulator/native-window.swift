@@ -36,6 +36,10 @@ struct DataConfig: Decodable {
     let size: UInt64?
 }
 
+/// `--app-arg TOKEN` of this launch: the argument the guest starts the firmware app with (the profile's allowlist,
+/// e.g. testmode, applies in the guest). Set only for research builds.
+var launchAppArg: String?
+
 /// Held for the whole session; the kernel drops the flock if the app dies.
 var sessionLockFD: Int32 = -1
 var ephemeralImagePath: String?
@@ -119,6 +123,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         installMenus()
+        loadSkinOverlay()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
@@ -170,6 +175,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         AppLog.log("QEMU started pid=\(process.processIdentifier)")
         startQEMUReaper()
         panel.setStatus("Starting native QEMU…")
+        panel.setBootStage("Starting the virtual machine")
         if let audio = config.audio {
             // "file": a WAV per playback stream. "coreaudio": host output only. "both": the two.
             // Optional ":<device UID>" or ":offline:<wav>[:rate[:ppm[:block]]]" follows the mode; no UID = system default.
@@ -241,9 +247,32 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             let library = NSMenuItem(title: "Library…", action: #selector(showFirmwareLibrary), keyEquivalent: "l")
             library.target = self
             firmwareMenu.addItem(library)
+            firmwareMenu.addItem(.separator())
+            let power = NSMenuItem(title: "Power On With Keys Held", action: nil, keyEquivalent: "")
+            let powerMenu = NSMenu(title: "Power On With Keys Held")
+            for (title, mode) in [("Normal", PowerOn.normal), ("Test Mode (HOLD + TRACK + STEP 1)", .test),
+                                  ("Update Mode (MODE + HOLD, experimental)", .update)] {
+                let item = NSMenuItem(title: title, action: #selector(powerOnChosen(_:)), keyEquivalent: "")
+                item.target = self; item.representedObject = mode.rawValue
+                powerMenu.addItem(item)
+            }
+            power.submenu = powerMenu
+            firmwareMenu.addItem(power)
             firmwareItem.submenu = firmwareMenu
             menu.addItem(helpMenuItem())
         }
+        let viewItem = NSMenuItem(); menu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let rear = NSMenuItem(title: "Rear I/O Panel", action: #selector(toggleRearPanel(_:)), keyEquivalent: "r")
+        rear.target = self
+        viewMenu.addItem(rear)
+        let skin = NSMenuItem(title: "Private Skin Overlay", action: #selector(toggleSkin(_:)), keyEquivalent: "")
+        skin.target = self
+        viewMenu.addItem(skin)
+        let glow = NSMenuItem(title: "Lamp Glow", action: #selector(toggleLampGlow(_:)), keyEquivalent: "")
+        glow.target = self
+        viewMenu.addItem(glow)
+        viewItem.submenu = viewMenu
         let inputItem = NSMenuItem(); menu.addItem(inputItem)
         let inputMenu = NSMenu(title: "Input")
         let release = NSMenuItem(title: "Release All Holds", action: #selector(releaseAllHolds), keyEquivalent: ".")
@@ -254,6 +283,122 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     @objc func releaseAllHolds() { panel.releaseAll() }
+
+    // MARK: Power on with keys held
+
+    enum PowerOn: String { case normal, test, update }
+
+    /// Normal: restart only the firmware app (fast), or relaunch the emulator when this launch carried an app argument.
+    /// Test mode: the factory test UI is chosen by the app argument `testmode`, which the guest reads once at boot, so
+    /// the emulator relaunches itself with `--app-arg testmode` (a full boot; research builds only).
+    /// Update mode: the unit enters it with MODE + HOLD held at power-on; the keys are held on the panel across an app
+    /// restart. Grade I: no host-visible argument is known for it.
+    func powerOn(_ mode: PowerOn) -> String {
+        switch mode {
+        case .normal:
+            return launchAppArg == nil ? restartApp(holding: []) : relaunch(appArg: nil)
+        case .test:
+            guard config.research == true else { return "test mode needs a research build (./sp16 build --research)" }
+            return launchAppArg == "testmode" ? restartApp(holding: []) : relaunch(appArg: "testmode")
+        case .update:
+            return restartApp(holding: ["mode", "hold"])
+        }
+    }
+
+    /// The guest's app-restart with the given panel keys held across the restart and for four seconds after.
+    func restartApp(holding keys: [String]) -> String {
+        guard config.firmware != nil, config.data != nil else { return "app restart needs a decoupled build" }
+        panel.holdForBoot(keys)
+        let socket = config.socket + ".ctl"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = DataImage.requestControl(socketPath: socket, message: "app-restart",
+                                                  until: ["app-restarted", "app-restart-error"], timeout: 30)
+            AppLog.log("power on with keys held: app restart -> \(result ?? "no reply")")
+            DispatchQueue.main.asyncAfter(deadline: .now() + (keys.isEmpty ? 0 : 4)) { self?.panel.releaseBootHolds() }
+        }
+        return "restarting the firmware app" + (keys.isEmpty ? "" : " with \(keys.joined(separator: " + ")) held")
+    }
+
+    /// Starts a new emulator with the same arguments (and `--app-arg` as given) once this one has quit, then quits.
+    /// The new process waits for this pid to exit, so the data image lock is free when it starts.
+    func relaunch(appArg: String?) -> String {
+        var arguments = Array(CommandLine.arguments.dropFirst())
+        if let index = arguments.firstIndex(of: "--app-arg"), index + 1 < arguments.count { arguments.removeSubrange(index...(index + 1)) }
+        if let appArg { arguments += ["--app-arg", appArg] }
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = ["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.3; done; bundle=$2; shift 2; exec /usr/bin/open -n \"$bundle\" --args \"$@\"",
+                            "sp16-relaunch", String(getpid()), Bundle.main.bundleURL.path] + arguments
+        do { try helper.run() } catch { return "cannot relaunch: \(error.localizedDescription)" }
+        AppLog.log("power on with keys held: relaunching" + (appArg.map { " with --app-arg \($0)" } ?? " without an app argument"))
+        DispatchQueue.main.async { NSApp.terminate(nil) }
+        return "relaunching the emulator" + (appArg.map { " with the \($0) argument" } ?? "")
+    }
+
+    @objc func powerOnChosen(_ sender: NSMenuItem) {
+        guard let mode = (sender.representedObject as? String).flatMap(PowerOn.init(rawValue:)) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Power on with keys held: \(sender.title)"
+        alert.informativeText = mode == .test || (mode == .normal && launchAppArg != nil)
+            ? "The emulator quits and starts again with a full boot. Unsaved work in the firmware is lost."
+            : "The firmware app restarts. Unsaved work in the firmware is lost."
+        alert.addButton(withTitle: "Restart")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let note = powerOn(mode)
+        panel.setStatus(note)
+        AppLog.log("power on with keys held: \(note)")
+    }
+
+    @objc func toggleRearPanel(_ sender: NSMenuItem) { panel.showRear.toggle() }
+    /// The user's own artwork, never shipped: private/skin/overlay.png of the checkout this app was built in (the app
+    /// sits in <checkout>/build/<name>/), or the file named by SP16_SKIN_OVERLAY. Off until View > Private Skin
+    /// Overlay turns it on; the choice is remembered. A missing file leaves the panel unchanged.
+    static let skinDefaultsKey = "SP16PrivateSkinOverlay"
+    func skinOverlayURL() -> URL? {
+        let fm = FileManager.default
+        if let path = ProcessInfo.processInfo.environment["SP16_SKIN_OVERLAY"], fm.fileExists(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        var folder = Bundle.main.bundleURL.deletingLastPathComponent()
+        for _ in 0..<4 {
+            let candidate = folder.appendingPathComponent("private/skin/overlay.png")
+            if fm.fileExists(atPath: candidate.path) { return candidate }
+            folder = folder.deletingLastPathComponent()
+        }
+        return nil
+    }
+
+    func loadSkinOverlay() {
+        guard let url = skinOverlayURL() else { return }
+        if panel.loadSkin(from: url) {
+            AppLog.log("skin overlay available (View > Private Skin Overlay)")
+            panel.showSkin = UserDefaults.standard.bool(forKey: Self.skinDefaultsKey)
+        } else {
+            AppLog.log("skin overlay: cannot read the image, ignored")
+        }
+    }
+
+    @objc func toggleSkin(_ sender: NSMenuItem) {
+        panel.showSkin.toggle()
+        UserDefaults.standard.set(panel.showSkin, forKey: Self.skinDefaultsKey)
+    }
+
+    @objc func toggleLampGlow(_ sender: NSMenuItem) { panel.lampBloom.toggle() }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(toggleRearPanel(_:)): item.state = panel.showRear ? .on : .off
+        case #selector(toggleLampGlow(_:)): item.state = panel.lampBloom ? .on : .off
+        case #selector(powerOnChosen(_:)):
+            return (item.representedObject as? String) != PowerOn.test.rawValue || config.research == true
+        case #selector(toggleSkin(_:)):
+            item.state = panel.showSkin ? .on : .off
+            return panel.hasSkin     // greyed out when private/skin/overlay.png is absent
+        default: break
+        }
+        return true
+    }
 
     var libraryWindow: FirmwareLibraryWindow?
     @objc func showFirmwareLibrary() {
@@ -314,6 +459,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             Darwin.close(fd); return
         }
         AppLog.log("bridge: connected")
+        DispatchQueue.main.async { [weak self] in self?.panel.setBootStage("Booting the firmware") }
         lock.lock(); socketFD = fd; lock.unlock()
         defer {
             writeQueue.sync {
@@ -416,6 +562,21 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         DispatchQueue.main.async { [weak self] in self?.renderLatest() }
     }
 
+    var screenSeen = false
+
+    /// True when a sample of the 800 x 480 BGRX frame has a non-black pixel (every 97th pixel: cheap, and only run
+    /// until the first real screen).
+    static func hasContent(_ pixels: Data) -> Bool {
+        pixels.withUnsafeBytes { raw in
+            var offset = 0
+            while offset + 3 < raw.count {
+                if raw[offset] | raw[offset + 1] | raw[offset + 2] != 0 { return true }
+                offset += 97 * 4
+            }
+            return false
+        }
+    }
+
     func makeImage(_ pixels: Data) -> CGImage? {
         guard let provider = CGDataProvider(data: pixels as CFData) else { return nil }
         return CGImage(width: 800, height: 480, bitsPerComponent: 8, bitsPerPixel: 32,
@@ -433,6 +594,15 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         visiblePending.removeAll()
         lock.unlock()
         guard let pixels = pixels, let image = makeImage(pixels) else { return }
+        if !screenSeen {
+            // The firmware sends black frames while it boots: keep the boot overlay until a frame has something on it.
+            guard Self.hasContent(pixels) else {
+                panel.setBootStage("Waiting for the firmware's first screen")
+                frameCount += 1
+                return
+            }
+            screenSeen = true
+        }
         panel.setLCD(image)
         frameCount += 1
         updateStatus()
@@ -455,13 +625,16 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     func metrics() -> [String: Any] {
+        // Read before taking `lock`: the main thread takes it in renderLatest, so a main.sync under it could deadlock.
+        let redraw = Thread.isMainThread ? panel.redrawStats.json : DispatchQueue.main.sync { panel.redrawStats.json }
         lock.lock(); defer { lock.unlock() }
         return ["frames": frameCount, "uptime_seconds": ProcessInfo.processInfo.systemUptime - started,
                 "ack_ms": ackSamples.summary(), "visible_ms": visibleSamples.summary(),
                 "input_results": ["ok": resultCounts[0], "unsupported": resultCounts[1],
                                    "failed": resultCounts[2], "invalid": resultCounts[3]],
                 "pending_controls": controlTimes.count, "lamps_live": lampsLive,
-                "feedback_generation": feedbackGeneration, "guest": guestStats]
+                "feedback_generation": feedbackGeneration, "guest": guestStats,
+                "panel_redraw": redraw]
             .merging(audioSink.map { ["audio": $0.snapshot()] } ?? [:]) { first, _ in first }
     }
 
@@ -632,6 +805,30 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 }
             }
             return ok ? "{\"ok\":true}" : "{\"error\":\"panelshot failed\"}"
+        case "lcd-backlight":
+            // Host-side hook for the firmware's LCD brightness (percent 0-100), until the guest reports it.
+            guard let percent = int("percent"), (0...100).contains(percent) else { return "{\"error\":\"lcd-backlight needs percent 0-100\"}" }
+            DispatchQueue.main.sync { self.panel.lcdBacklight = CGFloat(percent) / 100 }
+            return "{\"ok\":true}"
+        case "power-on":
+            // Same as the menu without the confirmation: mode normal|test|update.
+            guard let name = command["mode"] as? String, let mode = PowerOn(rawValue: name) else {
+                return "{\"error\":\"power-on needs mode normal|test|update\"}"
+            }
+            var note = ""
+            DispatchQueue.main.sync { note = self.powerOn(mode) }
+            return "{\"ok\":true,\"note\":\"\(note)\"}"
+        case "view":
+            // View toggles for screenshots: rear on|off, glow on|off.
+            guard let name = command["name"] as? String, ["rear", "glow", "skin"].contains(name),
+                  let on = command["on"] as? Bool else { return "{\"error\":\"view needs name rear|glow|skin and on true|false\"}" }
+            DispatchQueue.main.sync { switch name {
+                case "rear": self.panel.showRear = on
+                case "skin": self.panel.showSkin = on && self.panel.hasSkin
+                default: self.panel.lampBloom = on
+                }
+            }
+            return "{\"ok\":true}"
         case "period":
             guard let ms = int("ms"), (1...50).contains(ms) else { return "{\"error\":\"period needs ms 1-50\"}" }
             sendBody([Kind.research, 5, UInt8(ms)]); return "{\"ok\":true}"
@@ -687,6 +884,12 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             guard let data = try? JSONSerialization.data(withJSONObject: reply, options: [.sortedKeys]),
                   let text = String(data: data, encoding: .utf8) else { return "{\"error\":\"firmware\"}" }
             return text
+        case "redraw-bench":
+            // Mean ms of a whole-view repaint (what every update would cost without dirty rects), for comparison
+            // with panel_redraw in `metrics`.
+            var ms = 0.0
+            DispatchQueue.main.sync { ms = self.panel.benchmarkFullRedraw(count: min(500, max(1, int("count") ?? 60))) }
+            return "{\"ok\":true,\"full_redraw_ms\":\(ms)}"
         case "metrics":
             guard let data = try? JSONSerialization.data(withJSONObject: metrics(), options: [.sortedKeys]),
                   let text = String(data: data, encoding: .utf8) else { return "{\"error\":\"metrics\"}" }
@@ -850,6 +1053,21 @@ func attachDevOverlay(_ config: Configuration, folder: String?) -> Configuration
                          firmwareName: (config.firmwareName ?? "") + " + developer overlay", devOverlay: path)
 }
 
+/// Adds `sp16.app=TOKEN` to the kernel command line (the guest's init reads it) for `--app-arg`, research builds only.
+func appArgument(_ arguments: [String], research: Bool) -> [String] {
+    guard let token = launchAppArg else { return arguments }
+    guard research, let index = arguments.firstIndex(of: "-append"), index + 1 < arguments.count else {
+        AppLog.log("--app-arg \(token) ignored: it needs a research build")
+        launchAppArg = nil
+        return arguments
+    }
+    var result = arguments
+    let kept = result[index + 1].split(separator: " ").filter { !$0.hasPrefix("sp16.app=") }.joined(separator: " ")
+    result[index + 1] = kept + " sp16.app=" + token
+    AppLog.log("launch: the firmware app starts with the argument \(token)")
+    return result
+}
+
 func configuration() -> Configuration? {
     var arguments = CommandLine.arguments
     let ephemeral = arguments.contains("--ephemeral")
@@ -860,6 +1078,15 @@ func configuration() -> Configuration? {
     arguments.removeAll { $0 == "--no-audio-files" }
     var requestedFirmware: String? = nil
     var devOverlay: String? = nil
+    // Research builds: boot the guest with this app argument (Power On With Keys Held > Test Mode relaunches with it).
+    if let index = arguments.firstIndex(of: "--app-arg") {
+        guard index + 1 < arguments.count,
+              arguments[index + 1].range(of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) != nil else {
+            refuse("--app-arg needs 1 to 32 characters of a-z, 0-9, _ and -")
+        }
+        launchAppArg = arguments[index + 1]
+        arguments.removeSubrange(index...(index + 1))
+    }
     if let index = arguments.firstIndex(of: "--dev-overlay") {
         guard index + 1 < arguments.count else { refuse("--dev-overlay needs a folder") }
         devOverlay = arguments[index + 1]
@@ -915,7 +1142,8 @@ func configuration() -> Configuration? {
         AppLog.attach(session: session)
         let socket = socketDirectory + "/ui.sock"
         let config = attachData(Configuration(qemu: defaults.qemu,
-                                   arguments: defaults.arguments.map { $0.replacingOccurrences(of: defaults.socket, with: socket) },
+                                   arguments: appArgument(defaults.arguments.map { $0.replacingOccurrences(of: defaults.socket, with: socket) },
+                                                          research: defaults.research == true),
                                    session: session, socket: socket, variant: defaults.variant,
                                    profile: defaults.profile, research: defaults.research, data: defaults.data,
                                    audio: defaults.audio, firmware: defaults.firmware, firmwareID: defaults.firmwareID,
