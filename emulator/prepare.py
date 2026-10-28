@@ -10,12 +10,41 @@ import tarfile
 REPO = Path(__file__).resolve().parents[1]
 
 
+def worktree_of(path):
+    """(working tree root, common git directory) of the repository holding `path`, from git itself, or None. Asking git
+    is what tells a sibling worktree of this repository apart from another repository that merely looks like one."""
+    start = path if path.is_dir() else path.parent
+    while not start.is_dir():
+        if start == start.parent:
+            return None
+        start = start.parent
+    try:
+        result = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = result.stdout.splitlines()
+    if result.returncode or len(lines) != 2:
+        return None
+    common = Path(lines[1])
+    return Path(lines[0]), (common if common.is_absolute() else start / common)
+
+
 def private_path(value, *, fresh=False):
+    """A build workspace or output path inside this repository, or inside another worktree of it (a worktree build
+    reuses the main checkout's firmware library and QEMU). It must be Git-ignored there and free of symlink parents."""
     path = Path(os.path.abspath(value))
-    if not path.is_relative_to(REPO) or any(p.is_symlink() for p in (path, *path.parents)):
+    if any(p.is_symlink() for p in (path, *path.parents)):
         raise ValueError("workspace/output must be inside the repository without symlink parents")
+    here = worktree_of(REPO)
+    elsewhere = None if path.is_relative_to(REPO) else worktree_of(path)
+    if elsewhere:
+        if not here or os.path.realpath(elsewhere[1]) != os.path.realpath(here[1]):
+            raise ValueError("workspace/output must be inside this repository or a worktree of it")
+    elif not path.is_relative_to(REPO):
+        raise ValueError("workspace/output must be inside this repository or a worktree of it")
     ignored = subprocess.run(
-        ["git", "check-ignore", "-q", "--", str(path)], cwd=REPO,
+        ["git", "check-ignore", "-q", "--", str(path)], cwd=elsewhere[0] if elsewhere else REPO,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     if ignored.returncode:
