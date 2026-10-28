@@ -54,6 +54,10 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private var clockSource: String = "internal"          // "internal" or the decimal ID of a source
     private var nominalBPM: Double = 120.0
 
+    /// Serializes the clock-send path: the clock thread reads `outputPort` and `clockDestinations` while the main
+    /// thread swaps and disposes those ports in `rebuildClockRouting()` and mutates `settings` in `setConfig`/`reload()`.
+    private let routingLock = NSLock()
+
     // Clock-recovery readout (a second-order DLL, the same loop as emulator/midi/clock.py).
     private var centre: Double?
     private var period: Double = 60.0 / (120.0 * 24.0)    // 120 BPM at 24 PPQN
@@ -104,8 +108,14 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     deinit {
         readoutTimer?.invalidate()
         stopClock()
-        if inputPort != 0 { MIDIPortDispose(inputPort) }
-        if outputPort != 0 { MIDIPortDispose(outputPort) }
+        routingLock.lock()
+        let inPort = inputPort
+        let outPort = outputPort
+        inputPort = 0
+        outputPort = 0
+        routingLock.unlock()
+        if inPort != 0 { MIDIPortDispose(inPort) }
+        if outPort != 0 { MIDIPortDispose(outPort) }
         MIDIClientDispose(client)
         if MidiRoutingPreferences.active === self { MidiRoutingPreferences.active = nil }
     }
@@ -195,12 +205,14 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
             dst.append(MidiEndpoint(ref: ref, name: endpointName(ref, uniqueID: &id), uniqueID: id, isSource: false))
         }
         // Remembered ports keep their settings across a replug by unique ID; a brand-new port starts off.
+        routingLock.lock()
         for endpoint in src + dst where settings[key(endpoint)] == nil {
             settings[key(endpoint)] = blank(endpoint)
         }
         sources = src
         destinations = dst
         rows = src + dst
+        routingLock.unlock()
         tableView.reloadData()
         rebuildClockPicker()
         rebuildClockRouting()
@@ -218,7 +230,9 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     }
 
     private func setConfig(_ value: MidiRoutingConfig.PortConfig, for endpoint: MidiEndpoint) {
+        routingLock.lock()
         settings[key(endpoint)] = value
+        routingLock.unlock()
         persist()
     }
 
@@ -252,7 +266,13 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
     private func clockPeriodSeconds(_ bpm: Double) -> Double { 60.0 / (bpm * 24.0) }
 
     private func sendClockByte() {
-        guard outputPort != 0, !clockDestinations.isEmpty else { return }
+        // Take a snapshot of the port and the destination list under the same lock that rebuildClockRouting() uses to
+        // swap and dispose ports, and hold it across MIDISend so a send can never race a MIDIPortDispose on the old port.
+        routingLock.lock()
+        defer { routingLock.unlock() }
+        let port = outputPort
+        let destinations = clockDestinations
+        guard port != 0, !destinations.isEmpty else { return }
         var clock = [UInt8(0xF8)]
         var buffer = [UInt8](repeating: 0, count: 256)
         let list = buffer.withUnsafeMutableBytes { raw -> MIDIPacketList in
@@ -262,28 +282,36 @@ final class MidiRoutingPreferences: NSWindowController, NSTableViewDataSource, N
             return listPtr.pointee
         }
         var copy = list
-        for endpoint in clockDestinations {
-            MIDISend(outputPort, endpoint.ref, &copy)
+        for endpoint in destinations {
+            MIDISend(port, endpoint.ref, &copy)
         }
     }
 
     private func rebuildClockRouting() {
-        if inputPort != 0 { MIDIPortDispose(inputPort); inputPort = 0 }
-        if outputPort != 0 { MIDIPortDispose(outputPort); outputPort = 0 }
+        routingLock.lock()
+        let oldInputPort = inputPort
+        let oldOutputPort = outputPort
+        inputPort = 0
+        outputPort = 0
         MIDIOutputPortCreate(client, "SP-16 Clock Out" as CFString, &outputPort)
-        guard let source = clockSourceEndpoint else { return }
-        MIDIInputPortCreateWithBlock(client, "SP-16 Clock In" as CFString, &inputPort) { [weak self] list, _ in
-            guard let self = self else { return }
-            for packet in list.unsafeSequence() {
-                let length = Int(packet.pointee.length)
-                let start = UnsafeRawPointer(packet) + MemoryLayout<MIDIPacket>.offset(of: \.data)!
-                let data = Array(UnsafeBufferPointer(start: start.assumingMemoryBound(to: UInt8.self), count: length))
-                for byte in data where byte == 0xF8 {
-                    self.onClockByte(at: ProcessInfo.processInfo.systemUptime)
+        if let source = clockSourceEndpoint {
+            MIDIInputPortCreateWithBlock(client, "SP-16 Clock In" as CFString, &inputPort) { [weak self] list, _ in
+                guard let self = self else { return }
+                for packet in list.unsafeSequence() {
+                    let length = Int(packet.pointee.length)
+                    let start = UnsafeRawPointer(packet) + MemoryLayout<MIDIPacket>.offset(of: \.data)!
+                    let data = Array(UnsafeBufferPointer(start: start.assumingMemoryBound(to: UInt8.self), count: length))
+                    for byte in data where byte == 0xF8 {
+                        self.onClockByte(at: ProcessInfo.processInfo.systemUptime)
+                    }
                 }
             }
+            MIDIPortConnectSource(inputPort, source.ref, nil)
         }
-        MIDIPortConnectSource(inputPort, source.ref, nil)
+        routingLock.unlock()
+        // Dispose the old ports only after the swap, so no send (which runs under the lock) can still use them.
+        if oldInputPort != 0 { MIDIPortDispose(oldInputPort) }
+        if oldOutputPort != 0 { MIDIPortDispose(oldOutputPort) }
     }
 
     private func onClockByte(at t: Double) {
