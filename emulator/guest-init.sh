@@ -539,7 +539,7 @@ fi
       fi
       mkdir -p /tmp/sp16-root/proc
       mount -t proc proc /tmp/sp16-root/proc 2>/dev/null || :
-      (timeout 10 env SP16_APP_CWD=$sp16_app_cwd python3 /opt/sp16/enter.py /tmp/sp16-root /qemu-arm-static -cpu $sp16_cpu \
+      (timeout -k 2 10 env SP16_APP_CWD=$sp16_app_cwd python3 /opt/sp16/enter.py /tmp/sp16-root /qemu-arm-static -cpu $sp16_cpu \
          -E LD_LIBRARY_PATH=$sp16_ldpath /bin/busybox sh -c "$sp16_hook" 2>&1; echo "rc=$?") \
         | sed -u 's/^/SP16_APL_HOOK /' > /dev/console
       umount /tmp/sp16-root/proc 2>/dev/null || :

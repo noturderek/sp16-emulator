@@ -153,7 +153,7 @@ SP16_APL_HOOK rc=0
 
 - The line must be one printable-ASCII line of at most 240 bytes; anything else is refused (`SP16_APL_HOOK_ERROR`).
   Without the marker nothing runs and no `SP16_APL_HOOK` line appears.
-- `rc=124` means the 10 second limit stopped it; a syntax error in the script gives `rc=2` and the app still starts
+- `rc=124` means the 10 second limit stopped it (`rc=137`: it ignored the stop signal and was killed 2 seconds later); a syntax error in the script gives `rc=2` and the app still starts
   (keep the `( … )` subshell so a broken script cannot stop the line itself).
 - Child programs (`cp`, `rm`, `sleep`) work: the guest registers a `binfmt_misc` handler for ARM ELF files the first
   time a hook runs. It needs a guest image from this version (rebuild in place as above).
