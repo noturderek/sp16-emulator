@@ -180,5 +180,41 @@ class ModVerificationTests(unittest.TestCase):
         self.assertIn("file=/u,format=raw,if=none,id=sp16upd,readonly=on", args)
 
 
+class AplHookTests(unittest.TestCase):
+    """The one line a firmware's apl_start carries after `# SP16_APL_HOOK` (a mod loaded from the data volume)."""
+    HOOK = b"[ -f /root/data/mod.sh ] && (. /root/data/mod.sh)"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def script(self, *lines):
+        path = self.dir / "apl_start"
+        path.write_bytes(b"\n".join(lines) + b"\n")
+        return path
+
+    def test_returns_only_the_line_after_the_marker(self):
+        path = self.script(b"#!/bin/sh", b"echo before", b"# SP16_APL_HOOK", self.HOOK, b"echo after")
+        self.assertEqual(guest.apl_hook_line(path), self.HOOK.decode())
+
+    def test_no_marker_or_nothing_after_it_is_no_hook(self):
+        self.assertIsNone(guest.apl_hook_line(self.script(b"#!/bin/sh", self.HOOK)))
+        path = self.dir / "apl_start"
+        path.write_bytes(b"echo x\n# SP16_APL_HOOK")
+        self.assertIsNone(guest.apl_hook_line(path))
+        self.assertIsNone(guest.apl_hook_line(self.dir / "missing"))
+
+    def test_unusable_hook_lines_are_refused(self):
+        for bad in (b"", b"   ", b"x" * 241, "echo é".encode(), b"echo \x01"):
+            with self.subTest(bad=bad[:12]):
+                with self.assertRaises(ValueError):
+                    guest.apl_hook_line(self.script(b"# SP16_APL_HOOK", bad))
+
+    def test_crlf_and_tabs_are_tolerated(self):
+        path = self.dir / "apl_start"
+        path.write_bytes(b"# SP16_APL_HOOK\r\n\t" + self.HOOK + b"\r\n")
+        self.assertEqual(guest.apl_hook_line(path), "\t" + self.HOOK.decode())
+
+
 if __name__ == "__main__":
     unittest.main()

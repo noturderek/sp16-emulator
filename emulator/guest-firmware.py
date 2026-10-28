@@ -707,6 +707,31 @@ def dev_apply(params, share=DEV_SHARE, root=ROOT, lower=FW_LOWER, state=DEV_STAT
     print(":".join(preload))
 
 
+APL_HOOK_MARKER = b"# SP16_APL_HOOK"
+APL_HOOK_MAX = 240
+
+
+def apl_hook_line(apl_start):
+    """The one shell line the firmware's apl_start carries right after a `# SP16_APL_HOOK` line, or None.
+
+    The emulator never runs the firmware's apl_start, but a firmware that loads a mod from the data volume does it with
+    one line placed just before the app starts (for example `[ -f /root/data/mod.sh ] && (. /root/data/mod.sh)`). The
+    init runs only that line, so such a mod is exercised the way the unit would. The line must be a single printable
+    ASCII line of at most APL_HOOK_MAX bytes; anything else is refused."""
+    try:
+        lines = Path(apl_start).read_bytes().split(b"\n")
+    except OSError:
+        return None
+    for index, line in enumerate(lines[:-1]):
+        if line.strip() != APL_HOOK_MARKER:
+            continue
+        hook = lines[index + 1].rstrip(b"\r")
+        if not hook.strip() or len(hook) > APL_HOOK_MAX or any(byte < 32 or byte > 126 for byte in hook if byte != 9):
+            raise ValueError("the apl_start hook line is empty, longer than 240 bytes or not printable ASCII")
+        return hook.decode("ascii")
+    return None
+
+
 def main():
     params = cmdline()
     command = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -729,8 +754,16 @@ def main():
         except ValueError as error:
             print(f"SP16_FIRMWARE_ERROR {error}", file=sys.stderr, flush=True)
             sys.exit(3)
+    elif command == "apl-hook":
+        try:
+            hook = apl_hook_line(sys.argv[2]) if len(sys.argv) > 2 else None
+        except ValueError as error:
+            print(f"SP16_APL_HOOK_ERROR {error}", file=sys.stderr, flush=True)
+            sys.exit(3)
+        if hook:
+            print(hook)
     else:
-        raise SystemExit("usage: guest-firmware.py import|package|attach|dev-apply")
+        raise SystemExit("usage: guest-firmware.py import|package|attach|dev-apply|apl-hook")
 
 
 if __name__ == "__main__":

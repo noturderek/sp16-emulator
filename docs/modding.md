@@ -129,6 +129,40 @@ share not visible to the app` when the bind failed. Without a developer overlay 
   in the app within a moment (the mount does not cache), so a watcher thread can poll a small command file.
 - The app can read everything in the mod folder, including `files/` and `recipes/`. Keep it to the mod itself.
 
+### A launch hook: loading a mod from the data volume
+
+The emulator does not run the firmware's `apl_start`. A firmware that loads a mod from the data volume (`/root/data`,
+which lives on the persistent eMMC image, outside the size-limited boot archives) does it with one shell line that
+`apl_start` runs just before it starts the app. To exercise that line, mark it: put a comment line
+`# SP16_APL_HOOK` directly above it in `apl_start`, for example
+
+```sh
+# SP16_APL_HOOK
+[ -f /root/data/mod.sh ] && (. /root/data/mod.sh)
+```
+
+Before each app start the guest runs only that one line, in the app's root, under the firmware's own `busybox sh`,
+after the developer overlay is applied. It is limited to 10 seconds and can never keep the app from starting. The
+console shows what happened:
+
+```text
+SP16_APL_HOOK run: [ -f /root/data/mod.sh ] && (. /root/data/mod.sh)
+SP16_APL_HOOK <whatever the script printed>
+SP16_APL_HOOK rc=0
+```
+
+- The line must be one printable-ASCII line of at most 240 bytes; anything else is refused (`SP16_APL_HOOK_ERROR`).
+  Without the marker nothing runs and no `SP16_APL_HOOK` line appears.
+- `rc=124` means the 10 second limit stopped it (`rc=137`: it ignored the stop signal and was killed 2 seconds later); a syntax error in the script gives `rc=2` and the app still starts
+  (keep the `( … )` subshell so a broken script cannot stop the line itself).
+- Child programs (`cp`, `rm`, `sleep`) work: the guest registers a `binfmt_misc` handler for ARM ELF files the first
+  time a hook runs. It needs a guest image from this version (rebuild in place as above).
+- A script that is written into `/root/data` through `files/` stays in the data image after the session ends, because
+  the overlay's record of what it wrote is kept in the guest's RAM. Remove it from the script itself or rebuild the
+  data image, or the next session finds it again.
+- Put the marker and the hook line in your own `files/root/pdj/apl_start`, which is a modified copy of a firmware
+  file: keep it in your private mod folder and never commit it.
+
 ## Package a mod
 
 ```sh

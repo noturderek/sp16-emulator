@@ -8,9 +8,10 @@ RUN apt-get update \
  dmsetup squashfs-tools xorriso \
  && rm -rf /var/lib/apt/lists/*
 # Kept modules: virtio (console, blk), VFAT/NLS (data and USB images), dm-crypt and the kernel crypto modules (import and
-# repack), ISO9660 (update payload), squashfs + overlayfs (firmware image), 9p (developer overlay).
+# repack), ISO9660 (update payload), squashfs + overlayfs (firmware image), 9p (developer overlay), binfmt_misc (a
+# firmware's apl_start hook that runs child programs, see guest-init.sh).
 RUN find /lib/modules -type f -name '*.ko*' ! -path '*/drivers/virtio/*' ! -name virtio_console.ko \
- ! -name 'virtio_blk.ko*' ! -name 'virtio_net.ko*' ! -name 'net_failover.ko*' ! -name 'failover.ko*' ! -path '*/fs/fat/*' ! -path '*/fs/nls/*' \
+ ! -name 'virtio_blk.ko*' ! -name 'binfmt_misc.ko*' ! -name 'virtio_net.ko*' ! -name 'net_failover.ko*' ! -name 'failover.ko*' ! -path '*/fs/fat/*' ! -path '*/fs/nls/*' \
  ! -path '*/drivers/md/*' ! -path '*/drivers/dax/*' ! -path '*/drivers/cdrom/*' ! -path '*/crypto/*' ! -path '*/fs/isofs/*' ! -path '*/fs/squashfs/*' \
  ! -path '*/fs/overlayfs/*' ! -path '*/fs/9p/*' ! -path '*/net/9p/*' ! -path '*/fs/netfs/*' ! -path '*/fs/fscache/*' \
  ! -path '*/kernel/lib/*' -delete \
