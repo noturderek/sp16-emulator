@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 from pathlib import Path
 import struct
 import sys
@@ -272,6 +273,22 @@ class FixtureTests(unittest.TestCase):
             self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()),
                              (2, 2, 44100, 6 * 44100))
         self.assertEqual(wavs, hwsuite.fixture_wavs())  # deterministic
+
+    def test_each_fixture_measures_the_level_its_name_states(self):
+        """A fixture named for a level has to measure that level: the OVER probe's control plays the -30 dBFS one, so a
+        fixture that actually peaks 6.7 dB lower sends the reader hunting in the wrong file (the played-back level
+        also carries the track volume, which is the probe's business, not the fixture's)."""
+        import wave
+        wavs = hwsuite.fixture_wavs()
+        for name, stated in (("hw-tone-full.wav", 0.0), ("hw-tone440.wav", -6.0), ("hw-tone-m30.wav", -30.0)):
+            with self.subTest(name=name):
+                with wave.open(io.BytesIO(wavs[name])) as w:
+                    frames = w.readframes(w.getnframes())
+                peak = max(abs(value) for value in struct.unpack(f"<{len(frames) // 2}h", frames))
+                self.assertGreater(peak, 0)
+                measured = 20 * math.log10(peak / 32767.0)
+                self.assertAlmostEqual(measured, stated, delta=0.1,
+                                       msg=f"{name} peaks at {peak} ({measured:.2f} dBFS), not {stated:g} dBFS")
 
     def test_fat32_round_trip_and_dirty_flag(self):
         files = {"hw-a.wav": b"x" * 1500, "B.TXT": b"", "long name file.wav": bytes(range(256)) * 9}

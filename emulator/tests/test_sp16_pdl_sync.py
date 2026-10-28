@@ -99,6 +99,31 @@ class CarabinerTests(unittest.TestCase):
         self.assertIsNone(link.sock)  # the refused socket is dropped, so a later send retries the connect
         link.close()
 
+    def test_an_outage_after_a_recovery_warns_once_more(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        link = pdl.CarabinerLink(port=port)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(link.set_tempo(130.56))  # nothing listening: one diagnostic, the latch is set
+            server = socket.create_server(("127.0.0.1", port))
+            try:
+                self.assertTrue(link.set_tempo(130.56))  # Carabiner came up: the latch must clear
+                conn, _ = server.accept()
+                conn.close()
+                server.close()  # Carabiner quit again
+                link._drop()  # the dead socket is what the next send would find
+                self.assertFalse(link.set_tempo(131.0))  # so the second outage warns rather than going silent
+            finally:
+                server.close()
+                link.close()
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)  # one per outage, not one per run
+        for line in lines:
+            self.assertIn(f"127.0.0.1:{port}", line)
+
     def test_tempo_is_sent_when_a_carabiner_listens(self):
         server = socket.create_server(("127.0.0.1", 0))
         try:

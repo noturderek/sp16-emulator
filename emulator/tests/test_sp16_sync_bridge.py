@@ -2,9 +2,11 @@
 import socket
 import statistics
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
@@ -80,6 +82,26 @@ class ClockEmitterTests(unittest.TestCase):
         emitter.stop()
         self.assertGreater(len(sent), 20)   # 120 BPM = 48 pulses/s, so ~29 in 0.6 s
         self.assertLess(len(sent), 45)      # two threads would give ~58
+
+    def test_a_worker_that_died_lets_start_emit_again(self):
+        sent = []
+
+        def send(byte):
+            sent.append(byte)
+            if len(sent) == 1:
+                raise OSError("the MIDI sink went away")
+
+        emitter = bridge.ClockEmitter(send)
+        emitter.set_bpm(120.0)
+        with mock.patch.object(threading, "excepthook", lambda args: None):  # the worker's death is the point
+            emitter.start()
+            emitter._thread.join(timeout=2.0)  # the sink raised on the first pulse, so the worker is gone
+            self.assertFalse(emitter._thread.is_alive())
+            self.assertEqual(sent, [0xF8])
+            emitter.start()  # a dead worker must not be mistaken for a running one
+            time.sleep(0.5)
+            emitter.stop()
+        self.assertGreater(len(sent), 10)  # 120 BPM = 48 pulses/s, so ~24 more in 0.5 s
 
 
 class RunTests(unittest.TestCase):
