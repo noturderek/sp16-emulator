@@ -663,7 +663,8 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
                                       s->name,access,access_label(access),result);
     return result;
 }
-/* The AK4452 codec driver of the SP-16 kernel declares S16_LE, S24_LE and S20_3LE only (its DAI stream tables); the
+/* The AK4458 master codec advertises S16_LE only. The AK4452 codec driver declares S16_LE, S24_LE and S20_3LE
+ * (its DAI stream tables); the
  * null plugin also takes FLOAT_LE, which the app's format search tries first, so without a restriction the board
  * streams run a sample path the unit never runs. The shim therefore refuses the formats the codec lacks by default, so
  * the app settles on S24_LE as on the unit. S20_3LE (three packed bytes) is refused too: the board model's sample
@@ -671,8 +672,10 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
  * buffers untouched. SP16_PCM_ANY_FORMAT=1 (research) restores the null plugin's answer. */
 static int codec_refuses(const struct pcm_state *s,int format) {
     const char *any=getenv("SP16_PCM_ANY_FORMAT");
-    if (!s || (any && !strcmp(any,"1")) || strncmp(s->name,"hw:ak4452audio,",15)) return 0;
-    return format!=2 && format!=6;
+    if (!s || (any && !strcmp(any,"1"))) return 0;
+    if (!strcmp(s->name,"hw:ak4458audio,0")) return format!=2;
+    if (!strncmp(s->name,"hw:ak4452audio,",15)) return format!=2 && format!=6;
+    return 0;
 }
 /* The codec master clock is 1024 x 44.1 kHz and has no other setting (service manual clock tree), so every board PCM
  * accepts 44100 Hz only. set_rate refuses anything else as a driver restricted to one rate would; set_rate_near
