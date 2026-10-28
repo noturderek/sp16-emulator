@@ -69,6 +69,46 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(heat.getpixel((90, 40))[0], heat.getpixel((90, 40))[2])  # unchanged: grey
 
 
+class ThresholdTests(unittest.TestCase):
+    """A threshold outside its range would switch the comparison off without a word, so it is an error."""
+
+    def test_tolerance_is_a_whole_number_from_0_to_254(self):
+        for good in (0, 1, shotdiff.DEFAULT_TOLERANCE, 254):
+            self.assertEqual(shotdiff.check_tolerance(good), good)
+        for bad in (-1, 255, 256, 1000, 8.5, "8", None, True, float("nan")):
+            with self.assertRaises(shotdiff.ShotError, msg=repr(bad)) as caught:
+                shotdiff.check_tolerance(bad)
+            self.assertIn("0 to 254", str(caught.exception))
+
+    def test_share_is_a_number_from_0_up_to_but_not_including_1(self):
+        for good in (0, 0.0, 0.001, 0.5, 0.999999):
+            self.assertEqual(shotdiff.check_share(good), good)
+        for bad in (-0.1, 1, 1.0, 1.5, 2, float("nan"), float("inf"), "0.5", None, True):
+            with self.assertRaises(shotdiff.ShotError, msg=repr(bad)) as caught:
+                shotdiff.check_share(bad)
+            self.assertIn("not including, 1", str(caught.exception))
+
+    @unittest.skipIf(Image is None, "needs pillow and numpy")
+    def test_no_entry_point_takes_a_tolerance_that_calls_every_pixel_equal(self):
+        black, white = solid((0, 0, 0)), solid((255, 255, 255))
+        # The largest difference two 8-bit channels can have is 255: a tolerance of 254 still sees it, 255 would not.
+        self.assertEqual(shotdiff.compare(black, white, tolerance=254)["changed"], 5000)
+        for tolerance in (255, 256):
+            with self.assertRaises(shotdiff.ShotError, msg=f"compare {tolerance}"):
+                shotdiff.compare(black, white, tolerance=tolerance)
+            with self.assertRaises(shotdiff.ShotError, msg=f"heat_map {tolerance}"):
+                shotdiff.heat_map(black, white, tolerance=tolerance)
+            with self.assertRaises(shotdiff.ShotError, msg=f"ShotStore {tolerance}"):
+                shotdiff.ShotStore("refs", "out", "compare", tolerance=tolerance)
+
+    def test_the_store_refuses_a_share_that_would_let_a_changed_capture_pass(self):
+        for share in (1, 1.0, 3):
+            with self.assertRaises(shotdiff.ShotError, msg=repr(share)):
+                shotdiff.ShotStore("refs", "out", "compare", max_fraction=share)
+        store = shotdiff.ShotStore("refs", "out", "compare", tolerance=0, max_fraction=0.5)
+        self.assertEqual((store.tolerance, store.max_fraction), (0, 0.5))
+
+
 class RegionTests(unittest.TestCase):
     def test_parse_accepts_commas_and_spaces(self):
         self.assertEqual(shotdiff.Region.parse("0.1, 0.2, 0.3, 0.4"), shotdiff.Region(0.1, 0.2, 0.3, 0.4))

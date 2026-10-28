@@ -1,6 +1,8 @@
 """Pixel comparison of two captures of one screen, for the hardware suite's screenshot regression layer.
 
-A pixel differs when any colour channel differs by more than the tolerance. Regions that always move (the level meters,
+A pixel differs when any colour channel differs by more than the tolerance. The tolerance (a whole number from 0 to 254)
+and the share of changed pixels a capture may have (from 0 up to, but not including, 1) are checked: a value outside
+them would switch the comparison off, so it is an error. Regions that always move (the level meters,
 the clock, a playhead) are masked out; a mask is a rectangle in fractions of the image, so it survives a window resize.
 The references are the suite's own earlier captures, kept in a folder outside the repository (they show the firmware's
 screen, which is never committed); nothing here knows or reads any manufacturer image.
@@ -17,13 +19,33 @@ map), written again here for Pillow and numpy.
 from pathlib import Path
 import re
 
-DEFAULT_TOLERANCE = 8          # per channel, 0..255: absorbs resampling and colour-management noise, not a recolour
+DEFAULT_TOLERANCE = 8          # per channel, 0..254: absorbs resampling and colour-management noise, not a recolour
 DEFAULT_MAX_FRACTION = 0.0     # share of compared pixels allowed to differ before a capture counts as changed
+# Two 8-bit channels differ by at most 255, and a pixel is changed only when its difference is above the tolerance, so a
+# tolerance of 255 or more would call every pixel equal and switch the comparison off without a word.
+MAX_TOLERANCE = 254
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class ShotError(ValueError):
-    """A capture or reference that cannot be compared: a bad name, a bad mask line or two sizes that differ."""
+    """A capture, reference or setting that cannot be used: a bad name, a bad mask line, two sizes that differ, a
+    threshold outside its range."""
+
+
+def check_tolerance(value):
+    """`value` as a per-channel tolerance: a whole number from 0 to 254 (see MAX_TOLERANCE). Returns it."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_TOLERANCE:
+        raise ShotError(f"tolerance {value!r} is not a whole number from 0 to {MAX_TOLERANCE}: 255 and above would count "
+                        f"every pixel as equal")
+    return value
+
+
+def check_share(value):
+    """`value` as the allowed share of changed pixels: a number from 0 up to, but not including, 1. Returns it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
+        raise ShotError(f"allowed share {value!r} is not a number from 0 up to, but not including, 1: a share of 1 would "
+                        f"let a completely changed capture pass")
+    return value
 
 
 class Region:
@@ -95,6 +117,7 @@ def as_array(image):
 
 def changed_pixels(reference, actual, tolerance=DEFAULT_TOLERANCE, masks=(), region=None):
     """(changed boolean array, keep boolean array) of two same-size PIL images."""
+    check_tolerance(tolerance)
     import numpy as np
     if reference.size != actual.size:
         raise ShotError(f"the sizes differ: reference {reference.size[0]}x{reference.size[1]}, "
@@ -146,7 +169,7 @@ class ShotStore:
         if mode not in ("record", "compare"):
             raise ShotError(f"unknown mode {mode!r}")
         self.folder, self.out, self.mode = Path(folder), Path(out), mode
-        self.tolerance, self.max_fraction = tolerance, max_fraction
+        self.tolerance, self.max_fraction = check_tolerance(tolerance), check_share(max_fraction)
         self.entries = []
 
     def reference(self, name):

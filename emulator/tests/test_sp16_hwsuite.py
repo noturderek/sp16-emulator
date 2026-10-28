@@ -1,6 +1,8 @@
 """Hardware conformance suite runner (hwsuite.py): pure logic only, no VM, no firmware, synthetic data."""
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import struct
@@ -687,6 +689,29 @@ class ProcessTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def rejected(self, *argv):
+        """(exit code, stderr) of a command line the parser refuses."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            hwsuite.main(list(argv))
+        return caught.exception.code, stderr.getvalue()
+
+    def test_screenshot_thresholds_outside_their_range_are_rejected_by_the_parser(self):
+        for option, bad in (("--shots-tolerance", "256"), ("--shots-tolerance", "255"), ("--shots-tolerance", "-1"),
+                            ("--shots-tolerance", "8.5"), ("--shots-tolerance", "abc"),
+                            ("--shots-share", "1"), ("--shots-share", "1.0"), ("--shots-share", "-0.1"),
+                            ("--shots-share", "nan"), ("--shots-share", "many")):
+            code, message = self.rejected("--shots", "compare", option, bad)
+            self.assertEqual(code, 2, (option, bad))
+            self.assertIn(f"argument {option}:", message)
+
+    def test_screenshot_thresholds_inside_their_range_get_past_the_parser(self):
+        self.assertEqual((hwsuite.shots_tolerance_arg("0"), hwsuite.shots_tolerance_arg("254")), (0, 254))
+        self.assertEqual((hwsuite.shots_share_arg("0"), hwsuite.shots_share_arg("0.999")), (0, 0.999))
+        with mock.patch("sys.stderr"):   # accepted, so it goes on to the next usage error: no profile or build
+            code = hwsuite.main(["--shots", "compare", "--shots-tolerance", "254", "--shots-share", "0.5"])
+        self.assertEqual(code, hwsuite.EXIT_ENV)
+
     def test_usage_errors_exit_3(self):
         with mock.patch("sys.stderr"):
             self.assertEqual(hwsuite.main(["--tier", "full"]), hwsuite.EXIT_ENV)

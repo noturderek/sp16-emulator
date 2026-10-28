@@ -4364,6 +4364,28 @@ def mark_verified(profile_path, result, result_path, result_sha256):
     return profile["verification"]
 
 
+def shots_tolerance_arg(text):
+    """argparse type of --shots-tolerance: a whole number the comparison accepts (0 to 254), else a usage error."""
+    import shotdiff
+    try:
+        return shotdiff.check_tolerance(int(text))
+    except shotdiff.ShotError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number from 0 to {shotdiff.MAX_TOLERANCE}") from None
+
+
+def shots_share_arg(text):
+    """argparse type of --shots-share: a share from 0 up to, but not including, 1, else a usage error."""
+    import shotdiff
+    try:
+        return shotdiff.check_share(float(text))
+    except shotdiff.ShotError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number from 0 up to, but not including, 1") from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--runtime", help="runtime.json of a running research session (--audio file) to use as the "
@@ -4376,16 +4398,18 @@ def main(argv=None):
                                                  "(HW-48..HW-51, extra tier)")
     parser.add_argument("--testmode-skip", default="", help="comma-separated controls HW-49 leaves unpressed: the "
                                                             "negative control, which must make that check fail")
-    parser.add_argument("--shots", choices=("record", "compare"), help="screenshot regression: record this run's LCD and "
-                                                                       "panel captures as the references, or compare "
-                                                                       "them with the references (a missing one is "
-                                                                       "recorded)")
+    parser.add_argument("--shots", choices=("record", "compare"), help="screenshot regression: record stages this run's "
+                                                                       "LCD and panel captures and keeps those of checks "
+                                                                       "that passed as the references; compare checks "
+                                                                       "them against the references (a missing one "
+                                                                       "blocks its check)")
     parser.add_argument("--shots-dir", help="folder of reference captures (default private/hwsuite-shots/<firmware "
                                             "version>, git-ignored: the captures show the firmware's screen)")
-    parser.add_argument("--shots-tolerance", type=int, default=None, help="largest per-channel difference that still "
-                                                                          "counts as equal (default 8)")
-    parser.add_argument("--shots-share", type=float, default=None, help="share of compared pixels allowed to differ "
-                                                                        "(default 0)")
+    parser.add_argument("--shots-tolerance", type=shots_tolerance_arg, default=None,
+                        help="largest per-channel difference that still counts as equal, a whole number from 0 to 254 "
+                             "(default 8)")
+    parser.add_argument("--shots-share", type=shots_share_arg, default=None,
+                        help="share of compared pixels allowed to differ, from 0 up to but not including 1 (default 0)")
     parser.add_argument("--fixtures", help="fixture directory (default <out>/fixtures)")
     parser.add_argument("--out", help="output directory (default <build>/hwsuite/<run id>)")
     parser.add_argument("--tier", choices=list(TIERS), default="full")
