@@ -27,7 +27,62 @@ _Static_assert(SNDRV_SEQ_IOCTL_CREATE_PORT==0xc0a45320,"ARM sequencer create por
 _Static_assert(SNDRV_SEQ_IOCTL_DELETE_PORT==0x40a45321,"ARM sequencer delete port ioctl");
 _Static_assert(SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT==0x40505330,"ARM sequencer subscribe ioctl");
 
+/* A full listen backlog makes the guest's nonblocking connect fail (EAGAIN; an in-flight attempt reports EINPROGRESS)
+ * before the proxy accepts. Treating either as a connected socket hands the app an fd whose first write fails and drops
+ * the proxy client, so the open waits for the connection instead (pt-i44.81). Old code failed the open here. */
+static void connect_retry_case(void) {
+    const char *path="/tmp/sp16-seq-backlog.sock";
+    unlink(path);
+    int listener=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
+    CHECK(listener>=0);
+    struct sockaddr_un address={.sun_family=AF_UNIX};
+    strcpy(address.sun_path,path);
+    CHECK(bind(listener,(void *)&address,sizeof address)==0);
+    CHECK(listen(listener,1)==0);
+    int fillers[4], filled=0, full=0;
+    while (filled<4 && !full) { /* fill the backlog, and prove it is full rather than assuming it */
+        int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
+        CHECK(fd>=0);
+        if (connect(fd,(void *)&address,sizeof address)==0) fillers[filled++]=fd;
+        else { CHECK(errno==EAGAIN); close(fd); full=1; }
+    }
+    CHECK(full);
+    int started[2];
+    CHECK(pipe(started)==0);
+    pid_t child=fork();
+    CHECK(child>=0);
+    if (!child) { /* stands in for the app: open the sequencer and send one event as the first thing it does */
+        CHECK(setenv("SP16_SEQ_PROXY",path,1)==0);
+        CHECK(write(started[1],"x",1)==1); /* the parent must not free the backlog before this connect */
+        int fd=open("/dev/snd/seq",O_RDWR|O_NONBLOCK);
+        if (fd<0) _exit(3);
+        struct snd_seq_event event={.type=SNDRV_SEQ_EVENT_NOTEOFF};
+        if (write(fd,&event,sizeof event)!=sizeof event) _exit(4);
+        _exit(0);
+    }
+    close(started[1]);
+    char ready_byte;
+    CHECK(read(started[0],&ready_byte,1)==1);
+    close(started[0]);
+    usleep(150000); /* the guest is inside its connect by now, and its first attempt sees the full backlog */
+    /* Accept after the guest is inside its wait: each accepted filler frees one backlog slot until its own connect
+     * completes. The accepted sockets stay open so the guest's write still has a live peer. */
+    int peers[8], count=0;
+    for (int round=0; round<400 && count<filled+1; round++) {
+        int peer=accept4(listener,NULL,NULL,SOCK_CLOEXEC|SOCK_NONBLOCK);
+        if (peer>=0) { if (count<8) peers[count++]=peer; else close(peer); }
+        else usleep(5000);
+    }
+    int status;
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+    for (int i=0;i<count;i++) close(peers[i]);
+    for (int i=0;i<filled;i++) close(fillers[i]);
+    close(listener);
+    unlink(path);
+}
+
 int main(void) {
+    connect_retry_case();
     const char *path="/tmp/sp16-seq-contract.sock";
     const char *mode_path="/tmp/sp16-seq-usb-enabled";
     unlink(path);
@@ -63,6 +118,9 @@ int main(void) {
         struct snd_seq_event outgoing;
         memcpy(&outgoing,packet+1,sizeof outgoing);
         CHECK(outgoing.type==SNDRV_SEQ_EVENT_NOTEOFF && outgoing.data.note.note==0);
+        /* The event reaches the proxy addressed to the port the guest subscribed to (DIN 128:0), unchanged: a write
+         * path that lost or moved the destination would still carry the right type (pt-i44.81). */
+        CHECK(outgoing.dest.client==128 && outgoing.dest.port==0);
         CHECK(recv(peer,command,sizeof command,0)==sizeof command && command[0]=='U' && command[1]==130 && command[2]==1);
         incoming.source.client=129; incoming.dest.port=1;
         CHECK(send(peer,&incoming,sizeof incoming,0)==sizeof incoming);
@@ -108,11 +166,16 @@ int main(void) {
     CHECK(poll(&pfd,1,1000)==1 && (pfd.revents&POLLIN));
     struct snd_seq_event event={0};
     CHECK(read(fd,&event,sizeof event)==sizeof event && event.type==SNDRV_SEQ_EVENT_NOTEON);
+    /* The DIN dest rewrite the proxy does: the event arrives addressed to this client and the input port it registered
+     * ('I' 130 0 above) from the DIN source, not to the address the wire carried (pt-i44.81). */
+    CHECK(event.dest.client==client && event.dest.port==0);
+    CHECK(event.source.client==128 && event.source.port==0);
     CHECK(ioctl(fd,SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT,&sub)==0);
     CHECK(ioctl(fd,SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT,&sub)==0);
     sub.sender.client=client; sub.dest.client=128;
     CHECK(ioctl(fd,SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT,&sub)==0);
     event.type=SNDRV_SEQ_EVENT_NOTEOFF; event.data.note.note=0;
+    event.dest.client=128; event.dest.port=0; /* the DIN port this client subscribed to */
     CHECK(write(fd,&event,sizeof event)==sizeof event);
     sub.sender.client=129; sub.dest.client=client; sub.dest.port=1;
     CHECK(ioctl(fd,SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT,&sub)==0);

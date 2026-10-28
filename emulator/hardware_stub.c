@@ -208,6 +208,33 @@ static int idle_socket(enum device kind) {
 
 /* The native DIN bridge owns ALSA and the UART. The ARM process keeps a real
  * pollable socket fd; fixed-size 32-bit sequencer events cross it unchanged. */
+/* Wait, bounded, for a nonblocking connect to settle. EINPROGRESS means the attempt is in flight (POLLOUT reports
+ * completion, SO_ERROR the outcome); EAGAIN means the listener's backlog is full and nothing is in flight, so the
+ * connect itself is retried. Returning early on either hands the app a socket whose first write fails, which drops
+ * the proxy client; the bound keeps a wedged bridge from hanging the sequencer open. */
+static int connect_wait(int fd,const struct sockaddr *address,socklen_t length) {
+    uint64_t deadline=mono_ns()+1000000000ULL;
+    int state;
+    for (;;) {
+        if (connect(fd,address,length)==0) return 0;
+        state=errno;
+        if (state!=EAGAIN) break;
+        if (mono_ns()>=deadline) { errno=EAGAIN; return -1; }
+        struct timespec pause={.tv_sec=0,.tv_nsec=1000000};
+        nanosleep(&pause,NULL);
+    }
+    if (state!=EINPROGRESS) { errno=state; return -1; }
+    struct pollfd waiting={ .fd=fd, .events=POLLOUT };
+    int ready;
+    do { ready=poll(&waiting,1,1000); } while (ready<0 && errno==EINTR);
+    if (ready<0) return -1;
+    if (ready==0) { errno=ETIMEDOUT; return -1; }
+    int error=0;
+    socklen_t size=sizeof error;
+    if (getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&size)<0) return -1;
+    if (error) { errno=error; return -1; }
+    return 0;
+}
 static int sequencer_socket(void) {
     const char *path=getenv("SP16_SEQ_PROXY");
     if (!path) path="/dev/sp16-seq-proxy";
@@ -217,7 +244,7 @@ static int sequencer_socket(void) {
     if (fd>=MAX_FDS) { original_close(fd); errno=EMFILE; return -1; }
     struct sockaddr_un address={.sun_family=AF_UNIX};
     strcpy(address.sun_path,path);
-    if (connect(fd,(struct sockaddr *)&address,sizeof address)<0 && errno!=EINPROGRESS) {
+    if (connect_wait(fd,(struct sockaddr *)&address,sizeof address)<0) {
         int error=errno; original_close(fd); errno=error; return -1;
     }
     devices[fd]=(struct state){.kind=SEQUENCER,.peer=-1};

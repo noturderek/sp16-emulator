@@ -6,13 +6,35 @@ These are virtual CoreMIDI endpoints; they do not create a physical USB device.
 import argparse
 from contextlib import suppress
 from pathlib import Path
-from queue import Full, Queue
+from queue import Empty, Full, Queue
 import socket
 import sys
 import threading
+import time
 
 from midi.din import Messages, connect, session_socket
 from midi_bridge.midi import Port, hex_line
+
+
+def signal_stop(pending, timeout=1.0):
+    """Put the shutdown sentinel on the bounded input queue, making room for it if the queue is full.
+
+    The queue drops a message when it is full, which is right for MIDI bytes that the link no longer needs and wrong
+    for the sentinel: a lost sentinel leaves ``send_input`` blocked in ``pending.get()`` for good, so ``join`` on the
+    input thread expires with that thread still alive. Once the link is closing no producer can add anything, so
+    discarding the oldest queued message cannot race; returns False only if the queue stayed full for ``timeout``.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            pending.put_nowait(None)
+            return True
+        except Full:
+            try:
+                pending.get_nowait()
+            except Empty:
+                if time.monotonic() >= deadline:
+                    return False
 
 
 def bridge(path, build_dir=None, name="SP-16 USB"):
@@ -61,8 +83,7 @@ def bridge(path, build_dir=None, name="SP-16 USB"):
         closed.set()
         with suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
-        with suppress(Full):
-            pending.put_nowait(None)
+        signal_stop(pending)
         worker.join(timeout=1)
         if port is not None:
             port.close()
