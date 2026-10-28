@@ -86,6 +86,13 @@ class ProfileFieldTests(unittest.TestCase):
         self.assertEqual(hwsuite.absent_reason(profile, "usb_stop_lamp"), "no lamp on this version")
         self.assertIsNone(hwsuite.absent_reason(profile, "strip"))
 
+    def test_known_failing(self):
+        profile = {"hardware": {"known_failing": [{"check": "HW-35", "reason": "r", "owner": "owner",
+                                                    "date": "2026-10-28", "gap": "g"}]}}
+        self.assertEqual(hwsuite.known_failing(profile, "HW-35")["reason"], "r")
+        self.assertIsNone(hwsuite.known_failing(profile, "HW-36"))
+        self.assertIsNone(hwsuite.known_failing({}, "HW-35"))
+
 
 class VerdictTests(unittest.TestCase):
     def test_na_needs_a_reason(self):
@@ -93,6 +100,8 @@ class VerdictTests(unittest.TestCase):
             hwsuite.verdict("HW-30", "N/A")
         with self.assertRaises(ValueError):
             hwsuite.verdict("HW-30", "MAYBE")
+        with self.assertRaises(ValueError):
+            hwsuite.verdict("HW-35", "KNOWN-FAIL")
 
     def test_aggregation(self):
         ok, bad = hwsuite.sub("a", True), hwsuite.sub("b", False, "lost a detent")
@@ -124,6 +133,14 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(hwsuite.exit_code(blocked + [hwsuite.verdict("HW-03", "FAIL", "x")]), hwsuite.EXIT_FAIL)
         self.assertEqual(hwsuite.exit_code(all_pass(), session_lost=True), hwsuite.EXIT_LOST)
 
+    def test_known_fail_is_expected_so_does_not_block_or_fail(self):
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r")
+        summary = hwsuite.summarize(verdicts, "full")
+        self.assertTrue(summary["verified_eligible"])
+        self.assertEqual(summary["counts"]["KNOWN-FAIL"], 1)
+        self.assertEqual(hwsuite.exit_code(verdicts), hwsuite.EXIT_OK)
+
     def test_report_lists_failures_and_na(self):
         verdicts = all_pass()
         verdicts[17] = hwsuite.from_subresults("HW-18", [hwsuite.sub("wrap", False, "16 -> 2")])
@@ -136,6 +153,45 @@ class VerdictTests(unittest.TestCase):
         self.assertIn("## HW-18 FAIL", text)
         self.assertIn("- HW-30: analog-only", text)
         self.assertEqual(text.count("| HW-"), len(verdicts))
+
+    def test_report_lists_known_fail_with_its_reason(self):
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r; measured gap: g",
+                                       subresults=[hwsuite.sub("full-scale tone reaches the output", False, "peak 17352")])
+        result = {"suite": {"version": "1", "checks_hash": "0" * 64,
+                            "hardware_fingerprint": {"sha256": "1" * 64, "hardware_epoch": 1}},
+                  "run": {"id": "r", "tier": "full", "start": "s", "end": "e", "firmware_version": "1.60"},
+                  "verdicts": verdicts, "summary": hwsuite.summarize(verdicts)}
+        text = hwsuite.render_report(result)
+        self.assertIn("## HW-35 KNOWN-FAIL", text)
+        self.assertIn("known-failing (owner, 2026-10-28)", text)
+
+
+class KnownFailingRecordTests(unittest.TestCase):
+    def runner(self, profile):
+        path = TOOLS / "profiles" / "sp16-1.60.json"
+        return hwsuite.Runner(profile, path, None, None, TOOLS, TOOLS, "full")
+
+    def test_a_declared_failure_is_relabelled_known_fail_and_keeps_the_measurement(self):
+        profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())
+        runner = self.runner(profile)
+        observed = "peak 17352 (-5.52 dBFS)"
+        runner.record("HW-35", lambda: hwsuite.verdict("HW-35", "FAIL", "",
+                                                       subresults=[hwsuite.sub("full-scale tone reaches the output",
+                                                                                False, observed)]))
+        result = runner.verdicts["HW-35"]
+        self.assertEqual(result["status"], "KNOWN-FAIL")
+        self.assertIn("known-failing (owner, 2026-10-28)", result["reason"])
+        self.assertIn("measured gap", result["reason"])
+        self.assertEqual(result["subresults"][0]["observed"], observed)
+        self.assertEqual(result["evidence"], ["known-failing"])
+
+    def test_an_undeclared_failure_stays_fail(self):
+        profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())
+        profile["hardware"]["known_failing"] = []
+        runner = self.runner(profile)
+        runner.record("HW-36", lambda: hwsuite.verdict("HW-36", "FAIL", "x"))
+        self.assertEqual(runner.verdicts["HW-36"]["status"], "FAIL")
 
 
 class FrameTests(unittest.TestCase):
@@ -978,6 +1034,26 @@ class MarkVerifiedTests(unittest.TestCase):
         na[29] = hwsuite.verdict("HW-30", "N/A", "not declared anywhere")
         with self.assertRaises(hwsuite.EnvError):
             hwsuite.mark_verified(self.path, self.result(na), "r", "c")
+        self.assertEqual(json.loads(self.path.read_text())["status"], self.profile["status"])
+
+    def declare_known_failing(self):
+        self.profile.setdefault("hardware", {})["known_failing"] = [
+            {"check": "HW-35", "reason": "r", "owner": "owner", "date": "2026-10-28"}]
+        self.path.write_text(json.dumps(self.profile, indent=2) + "\n")
+
+    def test_marks_a_declared_known_fail(self):
+        self.declare_known_failing()
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r")
+        block = hwsuite.mark_verified(self.path, self.result(verdicts), "/x/hwsuite-result.json", "c" * 64)
+        self.assertEqual(block["counts"]["KNOWN-FAIL"], 1)
+        self.assertEqual(json.loads(self.path.read_text())["status"], "verified")
+
+    def test_refuses_an_undeclared_known_fail(self):
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "x")
+        with self.assertRaises(hwsuite.EnvError):
+            hwsuite.mark_verified(self.path, self.result(verdicts), "r", "c")
         self.assertEqual(json.loads(self.path.read_text())["status"], self.profile["status"])
 
 

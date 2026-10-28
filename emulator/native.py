@@ -32,7 +32,8 @@ BASE_GUEST_FILES = ("Dockerfile.native-base", "hardware_stub.c", "guest-init.sh"
                     "prepare.py", "guest-firmware.py", "midi/seq-bridge.c", "profiles/sp16-1.60.json",
                     "profiles/products/sp16.json")
 SWIFT_SOURCES = ("native-window.swift", "panel-view.swift", "data-image.swift", "audio-sink.swift",
-                "audio-output.swift", "firmware-library.swift", "firmware-window.swift", "app-diagnostics.swift")
+                "audio-output.swift", "firmware-library.swift", "firmware-window.swift", "app-diagnostics.swift",
+                "midi-routing.swift")
 ICON_TOOL = "make-icon.swift"
 # Vendor logo files and the old icon name. The public copy never ships them: the distribution scan (native.py
 # firmware audit) refuses their names and, if any is present, their content.

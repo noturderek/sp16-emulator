@@ -314,6 +314,8 @@ class ProfileValidationTests(unittest.TestCase):
         self.check_invalid(lambda p: p.update(verification={"result": "fail"}))
         self.check_invalid(lambda p: p.update(ioctl_set=["0x4010700"]))
         self.check_invalid(lambda p: p.update(hardware={"absent": [{"capability": "fx2"}]}))
+        self.check_invalid(lambda p: p.update(hardware={"known_failing": [{"check": "HW-35"}]}))
+        self.check_invalid(lambda p: p.update(hardware={"known_failing": [{"reason": "r", "owner": "o", "date": "d"}]}))
         self.check_invalid(lambda p: p.update(recipes=["not", "a", "dict"]))
         self.check_invalid(lambda p: p["panel"].update(selector_window_frames=0))
         self.check_invalid(lambda p: p["calibration"].update(default=600))

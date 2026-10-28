@@ -35,7 +35,7 @@ tool (`emulator/layout_overlay.py`), `pillow` is required: `python3 -m pip insta
 ./sp16 --dry-run build --audio file # show the commands without running them
 ./sp16 build --audio file           # silent build that records WAV output
 ./sp16 run                          # launch the default build
-./sp16 run --midi                   # launch with CoreMIDI DIN bridge enabled
+./sp16 run --midi                   # launch with the CoreMIDI DIN and USB bridges enabled
 ./sp16 midi ports                   # list CoreMIDI input and output endpoints
 ./sp16 midi learn --in "Pads"       # learn a MIDI controller profile
 ./sp16 ctl snapshot screen.png      # drive a running research session

@@ -7,7 +7,8 @@ import time
 import unittest
 import uuid
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Full, Queue
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from midi.usb import bridge, signal_stop  # noqa: E402
@@ -47,6 +48,18 @@ class SignalStopTests(unittest.TestCase):
         worker.join(1)
         self.assertFalse(worker.is_alive())
         self.assertEqual(received, [])  # the message the queue dropped, never a silent hang
+
+    def test_a_queue_that_stays_full_times_out_with_backoff_not_a_spin(self):
+        # A full queue whose next message is drained between the put and the get (a race): the sentinel cannot be
+        # delivered, so signal_stop must back off rather than busy-spin and return False at the deadline.
+        pending = mock.Mock()
+        pending.put_nowait = mock.Mock(side_effect=Full)
+        pending.get_nowait = mock.Mock(side_effect=Empty)
+        sleeps = []
+        with mock.patch.object(time, "sleep", side_effect=sleeps.append), \
+                mock.patch.object(time, "monotonic", side_effect=[0.0, 0.001, 1.0]):
+            self.assertFalse(signal_stop(pending, timeout=1.0))
+        self.assertTrue(sleeps, "signal_stop spun without sleeping")
 
 
 class USBMidiTests(unittest.TestCase):
