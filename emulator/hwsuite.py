@@ -3341,14 +3341,17 @@ class Runner:
         records, left, start, to_time = self.over_window(3, "hw-tone-full.wav")
         loud = [i for i in range(len(left)) if abs(int(left[i])) >= 0.89 * 32767] if peak(left) >= 0.89 * 32767 else []
         lit_times = [t for t, d in records if self.lamp(d, role)[0]]
+        # The peak is reported in dBFS too: whether the emulator's level path reached the lamp's threshold is the first
+        # thing to read when this check fails (emulator/probes/over_led.py measures the same figures over a volume sweep).
+        level = f"peak {peak(left)}" + (f" ({round(20 * math.log10(peak(left) / 32767), 2)} dBFS)" if peak(left) else "")
         if not loud:
-            subs.append(sub("full-scale tone reaches the output", False, f"peak {peak(left)}"))
+            subs.append(sub("full-scale tone reaches the output", False, level))
         else:
             t_first, t_last = to_time(start + loud[0]), to_time(start + loud[-1])
             on = next((t for t in lit_times if t >= t_first - 0.05), None)
             off = next((t for t, d in records if t > t_last and not self.lamp(d, role)[0]), None)
             subs.append(sub("OVER lit within 50 ms of the first near-full-scale sample",
-                            on is not None and on - t_first <= 0.05, f"{on and round(on - t_first, 3)} s"))
+                            on is not None and on - t_first <= 0.05, f"{on and round(on - t_first, 3)} s, {level}"))
             subs.append(sub("OVER off within 1 s of the last", off is not None and off - t_last <= 1.0,
                             f"{off and round(off - t_last, 3)} s"))
         records, left, _, _ = self.over_window(4, "hw-tone-m30.wav")
