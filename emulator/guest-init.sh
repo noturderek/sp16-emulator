@@ -37,6 +37,7 @@ for sp16_port in /sys/class/virtio-ports/*; do
    sp16.ctl) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-ctl ;;
    sp16.pcm) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-pcm ;;
    sp16.din) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-din ;;
+   sp16.usb-midi) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-usb-midi ;;
    sp16.gdb) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-gdb ;;
   esac
 done
@@ -162,6 +163,9 @@ if [ "$sp16_devlayer" = 1 ]; then
 fi
 : > /tmp/sp16-root/dev/null
 : > /tmp/sp16-root/dev/full
+# The app's USB gadget shell requests toggle this marker through the shim. Its
+# sequencer enumeration sees g_midi only while MIDI mode is active.
+: > /tmp/sp16-root/dev/sp16-usb-midi-enabled
 # Publish the DIN sequencer client before the app probes its ALSA endpoints. The proc node is opened through
 # the preload shim, which reports the bridge's current queue capacity.
 if modprobe snd_seq; then
