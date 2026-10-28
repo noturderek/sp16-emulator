@@ -805,6 +805,11 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 }
             }
             return ok ? "{\"ok\":true}" : "{\"error\":\"panelshot failed\"}"
+        case "lcd-backlight":
+            // Host-side hook for the firmware's LCD brightness (percent 0-100), until the guest reports it.
+            guard let percent = int("percent"), (0...100).contains(percent) else { return "{\"error\":\"lcd-backlight needs percent 0-100\"}" }
+            DispatchQueue.main.sync { self.panel.lcdBacklight = CGFloat(percent) / 100 }
+            return "{\"ok\":true}"
         case "power-on":
             // Same as the menu without the confirmation: mode normal|test|update.
             guard let name = command["mode"] as? String, let mode = PowerOn(rawValue: name) else {

@@ -244,6 +244,7 @@ struct PanelRenderState {
     var debugOverlay = false
     var bootStage = "Starting the virtual machine"   // shown on the dark LCD until the first firmware frame
     var bootSeconds = 0
+    var lcdBrightness: CGFloat = 1      // the firmware's LCD backlight level, 0...1 (1 = full, as before)
     var bloom = true                    // additive glow around lit keys, buttons and LEDs
 
     func look(_ id: UInt8) -> LampLook {
@@ -1045,6 +1046,11 @@ final class PanelRenderer {
             drawBootOverlay(ctx, in: r, stage: state.bootStage, seconds: state.bootSeconds)
         }
         ctx.restoreGState()
+        if state.lcdImage != nil, state.lcdBrightness < 1 {
+            // A dimmed backlight: a black veil over the glass, never fully dark so the screen stays readable.
+            ctx.setFillColor(hexColor(0, 1 - max(0.2, state.lcdBrightness)))
+            ctx.fill(r)
+        }
     }
 
     /// Shown on the dark LCD until the firmware's first frame arrives: what the emulator is doing and for how long, with an
@@ -1636,6 +1642,13 @@ final class PanelView: NSView, NSViewToolTipOwner {
         state.lamps = lamps
         state.feedbackLive = live
         if liveChanged { needsDisplay = true } else { invalidate(changed) }
+    }
+
+    /// The firmware's LCD backlight level, 0...1. Host side only for now: nothing feeds it from the guest yet
+    /// (docs/changes/l1-panel-ui.md, cross-lane requests); the research op `lcd-backlight` sets it.
+    var lcdBacklight: CGFloat {
+        get { state.lcdBrightness }
+        set { state.lcdBrightness = min(1, max(0, newValue)); setNeedsDisplay(lcdFrame) }
     }
 
     /// What the guest is doing before the first LCD frame (host-side knowledge only: VM started, bridge connected, ...).
