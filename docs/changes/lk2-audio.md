@@ -15,43 +15,56 @@ author:
 
 # Lane LK2-audio hand-back
 
-Branch `lane/lk2-audio`, cut from `emu/2026-10-28` (`7058eed`). One code commit plus this file. Three builds
-were made in this worktree: `build/lk2-audio` (`--research --audio file`), `build/lk2-audio-tap` (`--research
---audio file --trace pcmtap --app-arg testmode`), and (not needed in the end) the gdb build was not made.
+Branch `lane/lk2-audio`, cut from `emu/2026-10-28` (`7058eed`). Two code commits plus this file. Two builds were
+made in this worktree: `build/lk2-audio` (`--research --audio file`) and `build/lk2-audio-tap` (`--research
+--audio file --trace pcmtap --app-arg testmode`); the gdb build was not needed and was not made.
 
 ## Per task
 
-### 1. `pt-i44.77` — the ~5 dB is upstream of the shim: `2cc93cf`
+### 1. `pt-i44.77` — the ~5 dB is upstream of the shim: `2cc93cf`, verdict fixed by `4282cd1`
 
 `emulator/probes/over_led.py`, `emulator/tests/test_sp16_over_led.py`.
 
 The four named candidates — MAIN OUT law, input limiter, 16-channel send, S24 conversion — are all **transparent**
-for the master stream, so the ~5 dB is the firmware's own output, not the emulator's level path. The probe now
-captures the evidence that settles this per pass: it samples the shim's board model (`guest.board.analog_levels`)
-and reports `main_out_gain` and the shim's own MAIN-pair output peak alongside the sink WAV peak.
+for the master stream, so the ~5 dB is the firmware's own output, not the emulator's level path. The probe samples
+the shim's board model (`guest.board.analog_levels`) and reports `main_out_gain` and the shim's own MAIN-pair
+output peak alongside the sink WAV peak, so each pass can say where a level shortfall would be.
 
-A live sweep on build `lk2-audio` (firmware 1.60, `app_sha256_verified=yes`, SHA `3d1392a61323e73e…`):
+The first version's verdict claimed "the measured level is the firmware's" from `main_out_gain == 1.0` alone, and
+its `shim_out_peak` was the maximum over the whole window, so the volume-102 pass read the 127 pass's carried-over
+1.0. `4282cd1` fixes both: the verdict now requires, per pass, a neutral gain **and** a shim peak equal to that
+pass's own WAV peak within one S16 LSB (the shim prints `out_peak` to four decimals, so it is rounded back to the
+nearest sample before the one-LSB comparison), and the shim peak is bracketed to the pass — the probe records the
+peak carried over from before the strike and `board_evidence` discards readings equal to it, so no value carries
+from one pass to the next.
+
+A live sweep on build `lk2-audio` (firmware 1.60, `app_sha256_verified=yes`, SHA `3d1392a61323e73e…`, run folder
+`build/lk2-audio/over-led/20261028-151205`):
 
 | pass | WAV peak | dBFS | `main_out_gain` | shim `out_peak` | mono 34 |
 |---|---|---|---|---|---|
-| volume 127 (settled) | 32767 | 0.0 | 1.0 | 1.0 | dark |
-| volume 102 | 17352 | -5.52 | 1.0 | 1.0 (window peak from the 127 pass) | dark |
-| -30 dBFS control | 549 | -35.5 | 1.0 | — | dark |
+| volume 127 | 0 (no audio: first-pass settle) | — | — | — | dark |
+| volume 110 | 21600 | -3.62 | 1.0 | 0.6592 | dark |
+| volume 102 | 17352 | -5.52 | 1.0 | 0.5295 | dark |
+| volume 96 | 15100 | -6.73 | 1.0 | 0.4608 | dark |
+| -30 dBFS control | 478 | -36.72 | 1.0 | 0.0146 | dark |
 
-`main_out_gain` stays 1.0 (the MAIN OUT law never moved off neutral), and the shim's meter peaks at 1.0 exactly
-where the WAV peaks at 32767 — the shim copied the firmware's S16 samples byte-for-byte (no limiter on the output
-path, no S24 conversion on the S16 master, no 16-channel-send gain). The measured -5.52 dBFS at track volume 102 is
-therefore the firmware's own track-volume→master gain law. The 2026-10-12 E14 figure (-0.65 dBFS at "volume 102")
-was taken before the hwsuite, the `volume_knob` recipe and the encoder-window fixes existed, with a sweep method
-whose "volume" did not correspond to the firmware's OCR-confirmed track volume the way this probe's does; the
-firmware binary and the knob model (counters, pad_curve) are unchanged since `c215d32` (2026-10-12), so the two
-figures cannot both be the firmware's law.
+The carried-over peak is gone: volume 102 now reads `shim_out_peak` 0.5295, matching its WAV peak 17352 within one
+LSB (and 110 and 96 match theirs). The volume-127 pass produced no audio on its first strike — the same first-pass
+settle the first sweep worked around — so that pass has no shim evidence in this run and the full-scale pass was not
+re-measured. Every pass that produced audio meets the rule (neutral gain, shim peak equal to the WAV peak within one
+LSB), so for those passes the measured level is the firmware's own track-volume→master gain law; the shim stays
+proven transparent at full scale by the first sweep's settled 127 pass (WAV 32767, shim 1.0). The 2026-10-12 E14
+figure (-0.65 dBFS at "volume 102") was taken before the hwsuite, the `volume_knob` recipe and the encoder-window
+fixes existed, with a sweep method whose "volume" did not correspond to the firmware's OCR-confirmed track volume
+the way this probe's does; the firmware binary and the knob model (counters, pad_curve) are unchanged since
+`c215d32` (2026-10-12), so the two figures cannot both be the firmware's law.
 
 The stage is named with evidence and HW-35 stays known-failing. Note for the owner: the deeper observation is that
 mono 34 stays **dark even at 0.0 dBFS** (volume 127, full scale), so restoring the 5 dB would not by itself light
 the lamp — the firmware does not raise `LED_CLIP` for a full-scale sampler playback in this emulator at all.
 
-- `python3 -m unittest emulator.tests.test_sp16_over_led` — **9/9** (`OK`, five new).
+- `python3 -m unittest emulator.tests.test_sp16_over_led` — **18/18** (`OK`, nine new in the fix round).
 - Quick set (14 modules) — **452/452** (`OK`).
 
 ### 2. `pt-i44.61` — AK4458 transport words re-run with the fixed page guard
