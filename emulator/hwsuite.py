@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-47 checks (HW-01..HW-47; HW-47 is an extra outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
+51 checks (HW-01..HW-51; HW-47..HW-51 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
@@ -134,10 +134,18 @@ CHECKS = [
           ["panel.lamp_roles"], ["HW-01"]),
     Check("HW-47", "Power", "Standby: the power key enters it (stick unmounted, saves blocked, UI alive); a restart leaves it",
           "X", ["button_effects.power", "recipes.save_project", "usb.sample_dir", "panel.lamp_roles"], ["HW-01"]),
+    # Factory test pages, graded against the service manual's pass lines. They run in a build made with
+    # `--app-arg testmode` (--testmode-build), where the app starts in the factory test instead of the firmware UI.
+    Check("HW-48", "Factory test", "Pages 1 and 2: every pad and step lamp shows red, green, blue and white; all off, LCD black", "X"),
+    Check("HW-49", "Factory test", "Page 4: every button counts once (48 with a lamp, MODE and SHIFT: 50 of 50)", "X"),
+    Check("HW-50", "Factory test", "Page 5: MASTER, DSF DRIVE and DSF HIGHPASS span 0-1023 and the strip 0-127", "X"),
+    Check("HW-51", "Factory test", "Page 6: the six encoders and the push encoder count and report their state", "X"),
 ]
+TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51")
+EXTRA_IDS = ("HW-47",) + TESTMODE_IDS
 CHECK_BY_ID = {check.id: check for check in CHECKS}
 SMOKE_IDS = tuple(c.id for c in CHECKS if c.tier == "S")
-assert len(CHECKS) == 47 and len(SMOKE_IDS) == 16
+assert len(CHECKS) == 51 and len(SMOKE_IDS) == 16
 
 
 def checks_hash():
@@ -771,7 +779,8 @@ ACTIONS = {"release": 0, "press": 1, "delta": 2, "value": 3}
 class Session:
     """One research session: socket client plus its files. Never touches anything outside its session directory."""
 
-    def __init__(self, runtime_path, connect_timeout=20):
+    def __init__(self, runtime_path, connect_timeout=20, call_timeout=40):
+        self.call_timeout = call_timeout
         self.runtime_path = Path(runtime_path)
         self.runtime = json.loads(self.runtime_path.read_text())
         if not self.runtime.get("control_socket"):
@@ -788,7 +797,7 @@ class Session:
         deadline = time.monotonic() + connect_timeout
         while True:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(40)
+            sock.settimeout(self.call_timeout)
             try:
                 sock.connect(self.runtime["control_socket"])
                 break
@@ -1132,6 +1141,101 @@ def wait_settled(session, stable=1.0, timeout=30.0, box=None):
     return None, image
 
 
+# ------------------------------------------------------------------------------------------- factory test pages
+# The factory test mode (a build made with --app-arg testmode) steps through numbered pages with HOME (next) and BACK
+# (previous), wrapping at both ends. Pages 1 and 2 have no title: the LCD is all white (LED test, all on) and all black
+# (all off).
+TESTMODE_PAGES = 13
+TESTMODE_TITLE_BOX = (0, 0, 800, 50)
+TESTMODE_PAGE = re.compile(r"PAGE\s*(\d{1,2})\s*[:;.]", re.I)
+
+
+def testmode_page_of(image):
+    """The test page an LCD image shows, or None while it is half drawn: the title's number, or 1 for an all-white and
+    2 for an all-black screen."""
+    import numpy as np
+    pixels = np.asarray(image.convert("L"))
+    # A stray row or two at the edge (the snapshot is one row short of the LCD) must not hide a plain screen.
+    if (pixels < 245).mean() < 0.01:
+        return 1
+    if (pixels > 10).mean() < 0.01:
+        return 2
+    match = TESTMODE_PAGE.search(norm(ocr(image, TESTMODE_TITLE_BOX, psm=7, scale=2)))
+    page = int(match.group(1)) if match else None
+    return page if page is not None and page < TESTMODE_PAGES else None
+
+
+def testmode_page(session, timeout=60.0):
+    """The settled test page now (None if the screen never settles on a readable one within `timeout`)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _, image = wait_settled(session, 1.5, max(5.0, deadline - time.monotonic()))
+        page = testmode_page_of(image) if image is not None else None
+        if page is not None:
+            return page
+    return None
+
+
+def testmode_goto(session, page, timeout=120.0):
+    """Step to a test page by the shorter way round; returns whether it got there. One key at a time: the app takes
+    seconds to draw a page on a loaded host, and keys sent meanwhile pile up and overshoot."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = testmode_page(session, min(60.0, deadline - time.monotonic()))
+        if current == page:
+            return True
+        if current is None:
+            continue
+        session.press("home" if (page - current) % TESTMODE_PAGES <= TESTMODE_PAGES // 2 else "back", 0.3)
+        time.sleep(1.0)
+    return False
+
+
+# Page 4 (button test): controls with a lamp (pads, steps and 16 more buttons) count towards LED-BUTTON n/48; MODE and
+# SHIFT have no lamp; RESULT counts all 50. Selector push, BACK and HOME are not counted (BACK and HOME step the pages).
+TESTMODE_LED_BUTTONS = ([f"pad{n}" for n in range(1, 17)] + [f"step{n}" for n in range(1, 17)] +
+                        ["track", "mute", "slice", "scale", "rec", "stop", "play", "hold", "scene", "pattern",
+                         "bar1", "bar2", "bar3", "bar4", "active", "usb_stop"])
+TESTMODE_PLAIN_BUTTONS = ["mode", "shift"]
+TESTMODE_LED_ROW, TESTMODE_RESULT_ROW = (400, 62, 800, 100), (400, 170, 800, 206)
+# Page 5 (AD test): gauge rows (a bar that fills left to right, its value inside it) and a red OK once both limits
+# were reached; the box is the gauge, the OK sits right of it.
+TESTMODE_GAUGES = {"main_out": (64, 96, 1023), "drive": (100, 132, 1023), "hp_cutoff": (136, 168, 1023),
+                   "strip": (172, 204, 127)}
+TESTMODE_GAUGE_X, TESTMODE_OK_X = (502, 657), (662, 800)
+# Page 6 (encoder test): value column x >= 365; row centres.
+TESTMODE_ENCODER_ROWS = {"selector": 80, "selector_state": 116, **{f"knob{n}": 188 + 36 * (n - 1) for n in range(1, 7)}}
+
+
+def testmode_counter(image, row, total):
+    """n of `LABEL(n/total)` in a page 4 row, or None."""
+    match = re.search(r"\((\d+)\s*/\s*%d\)" % total, ocr(image, row, psm=7, scale=3))
+    return int(match.group(1)) if match else None
+
+
+def testmode_gauge(image, name):
+    """Page 5: (fill fraction 0..1, OK shown) of one gauge row, measured from pixels: the bar is light blue, the OK red."""
+    import numpy as np
+    top, bottom, _ = TESTMODE_GAUGES[name]
+    bar = np.asarray(image.convert("RGB").crop((TESTMODE_GAUGE_X[0], top + 3, TESTMODE_GAUGE_X[1], bottom - 3))).astype(int)
+    columns = np.nonzero((bar[..., 2] - bar[..., 0] > 20).any(axis=0))[0]
+    fraction = 0.0 if len(columns) == 0 else (columns.max() + 1) / bar.shape[1]
+    ok = np.asarray(image.convert("RGB").crop((TESTMODE_OK_X[0], top, TESTMODE_OK_X[1], bottom))).astype(int)
+    shown = int(((ok[..., 0] > 200) & (ok[..., 1] < 90) & (ok[..., 2] < 90)).sum()) > 30
+    return round(float(fraction), 3), shown
+
+
+def testmode_encoder(image, name):
+    """Page 6: the integer or state word right of a label (None when unreadable)."""
+    centre = TESTMODE_ENCODER_ROWS[name]
+    text = norm(ocr(image, (368, centre - 16, 760, centre + 16), psm=7, scale=3))
+    if name == "selector_state":
+        match = re.search(r"\b(ON|OFF)\b", text)
+        return match.group(1) if match else None
+    value = signed_value(text)
+    return None if value is None else int(value) & 0xFFFF
+
+
 def run_recipe(session, steps, params=None, log=None):
     """Execute a profile recipe: an ordered list of single-key steps (see the profile schema). Raises RecipeError
     with the failing step when an expectation does not hold. Parameters fill "{name}" placeholders in strings."""
@@ -1321,10 +1425,12 @@ class Runner:
     stick and uncalibrated-control sessions the spec's section 5.4 describes."""
 
     def __init__(self, profile, profile_path, build, firmware_id, out, fixtures, tier="full", only=None,
-                 control_build=None, runtime=None):
+                 control_build=None, runtime=None, testmode_build=None, testmode_skip=()):
         self.p, self.profile_path = profile, Path(profile_path)
         self.build = Path(build) if build else None
         self.control_build = Path(control_build) if control_build else None
+        self.testmode_build = Path(testmode_build) if testmode_build else None
+        self.testmode_skip = tuple(testmode_skip)   # controls HW-49 leaves unpressed: its negative control
         self.firmware_id = firmware_id
         self.out, self.fixtures = Path(out), Path(fixtures)
         self.tier, self.only = tier, only
@@ -3466,6 +3572,188 @@ class Runner:
                 stop(self.build, self.pid)
         return from_subresults("HW-47", subs, {"flag_seen": first is not None})
 
+    # ------------------------------------------------------------------ HW-48..HW-51 factory test pages
+    def testmode_checks(self):
+        """HW-48..51 in one session of the testmode build (the main session is already stopped)."""
+        wanted = [hw for hw in TESTMODE_IDS if self.need(hw)]
+        if not wanted:
+            return
+        if not self.testmode_build:
+            for hw in wanted:
+                self.verdicts[hw] = verdict(hw, "N/A", "precondition: no --testmode-build (a build made with --app-arg testmode)")
+            return
+        checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51}
+        pid = None
+        try:
+            pid, self.runtime_path, _ = launch(self.testmode_build, self.firmware_id, None, ephemeral=True)
+            self.pid = pid
+            # Many presses and snapshots: a loaded host can stall one answer for a minute, so wait longer than usual.
+            self.session = Session(self.runtime_path, call_timeout=150)
+            self.session.txlog(True)
+            if self.session.runtime.get("audio") != "file":
+                raise EnvError("the testmode session must be built with --audio file")
+            for hw in wanted:
+                self.record(hw, checks[hw])
+        except (EnvError, SessionLost, OSError) as error:
+            for hw in wanted:
+                self.verdicts.setdefault(hw, verdict(hw, "BLOCKED", f"testmode session: {error}"))
+        finally:
+            if self.session:
+                self.session.close()
+            if pid is not None:
+                stop(self.testmode_build, pid, timeout=90)
+
+    def testmode_page_is(self, page, why):
+        got = testmode_goto(self.session, page)
+        return sub(f"stepped to page {page} ({why})", got, "" if got else "the page never showed")
+
+    def lamps_until(self, wanted, timeout=8.0):
+        """Poll TX lamps until `wanted(decoded)` holds; (ok, last decoded)."""
+        deadline, last = time.monotonic() + timeout, None
+        while True:
+            last = self.now(0.4)
+            if wanted(last) or time.monotonic() > deadline:
+                return wanted(last), last
+            time.sleep(.2)
+
+    def hw48(self):
+        s, full = self.session, self.session.panel_map.RGB_FULL
+        subs = [self.testmode_page_is(1, "LED test, all on")]
+        if subs[-1]["status"] == "PASS":
+            image = s.image("page1")
+            import numpy as np
+            subs.append(sub("the LCD is white", testmode_page_of(image) == 1, f"darkest {np.asarray(image.convert('L')).min()}"))
+            for key, name, colour in (("track", "red", (full, 0, 0)), ("mute", "green", (0, full, 0)),
+                                      ("slice", "blue", (0, 0, full)), ("scale", "white", (full, full, full))):
+                s.press(key, 0.4)
+                ok, lamps = self.lamps_until(lambda d: all(v == colour for v in d["rgb"].values()))
+                odd = sorted({v for v in lamps["rgb"].values() if v != colour})
+                subs.append(sub(f"{key.upper()} turns all 32 pad and step lamps {name}", ok, f"others {odd[:3]}"))
+            ok, lamps = self.lamps_until(lambda d: all(on for on, _ in d["mono"].values()))
+            off = [ch for ch, (on, _) in lamps["mono"].items() if not on]
+            subs.append(sub("every single-colour lamp channel is on", ok, f"dark channels {off}"))
+        subs.append(self.testmode_page_is(2, "LED test, all off"))
+        if subs[-1]["status"] == "PASS":
+            image = s.image("page2")
+            subs.append(sub("the LCD is black", testmode_page_of(image) == 2, ""))
+            ok, lamps = self.lamps_until(lambda d: not any(any(v) for v in d["rgb"].values()) and not any(on for on, _ in d["mono"].values()))
+            lit = [ch for ch, v in lamps["rgb"].items() if any(v)] + [f"m{ch}" for ch, (on, _) in lamps["mono"].items() if on]
+            subs.append(sub("every lamp is off", ok, f"lit {lit[:8]}"))
+        return from_subresults("HW-48", subs)
+
+    def hw49(self):
+        s = self.session
+        subs = [self.testmode_page_is(4, "button test")]
+        if subs[-1]["status"] != "PASS":
+            return from_subresults("HW-49", subs)
+        skip = set(self.testmode_skip)
+        for _ in range(4):          # the page can be half drawn when it first settles on a loaded host
+            wait_settled(s, 1.5, 40)
+            image = s.image("p4")
+            count = testmode_counter(image, TESTMODE_RESULT_ROW, 50)
+            if count is not None:
+                break
+        subs.append(sub("RESULT starts at 0 of 50", count == 0,
+                        f"read {count} from {ocr(image, TESTMODE_RESULT_ROW, psm=7, scale=3)!r}"))
+        if count is None:
+            return from_subresults("HW-49", subs)
+        missed = []
+        for name in TESTMODE_LED_BUTTONS + TESTMODE_PLAIN_BUTTONS:
+            if name in skip:
+                continue
+            before = count
+            s.press(name, 0.4)
+            deadline = time.monotonic() + 20
+            while True:
+                wait_settled(s, 1.0, 20)
+                count = testmode_counter(s.image("p4"), TESTMODE_RESULT_ROW, 50)
+                if count is not None and count != before or time.monotonic() > deadline:
+                    break
+            if count != (before or 0) + 1:
+                missed.append(f"{name} ({before} -> {count})")
+                count = count if count is not None else before
+        subs.append(sub("every control moved RESULT up by exactly one", not missed, "; ".join(missed[:6])))
+        s.press("selector", 0.4)
+        wait_settled(s, 1.5, 20)
+        image = s.image("p4")
+        subs.append(sub("the selector push is not counted", testmode_counter(image, TESTMODE_RESULT_ROW, 50) == count, f"read {testmode_counter(image, TESTMODE_RESULT_ROW, 50)}"))
+        led = testmode_counter(image, TESTMODE_LED_ROW, 48)
+        subs.append(sub("LED-BUTTON reaches 48 of 48", led == 48, f"read {led}"))
+        subs.append(sub("RESULT reaches 50 of 50", testmode_counter(image, TESTMODE_RESULT_ROW, 50) == 50,
+                        f"read {testmode_counter(image, TESTMODE_RESULT_ROW, 50)}"))
+        for label, row in (("LED-BUTTON", TESTMODE_LED_ROW), ("RESULT", TESTMODE_RESULT_ROW)):
+            text = norm(ocr(image, row, psm=7, scale=3))
+            subs.append(sub(f"{label} shows OK", re.search(r"\bOK\b", text) is not None, text))
+        return from_subresults("HW-49", subs, {"skipped": sorted(skip)})
+
+    def gauge_at(self, name, set_value, expected, tolerance=0.03, timeout=30.0):
+        """Set a control and read its gauge. The page follows the ADC words with a lag that a loaded host stretches, and
+        an unchanged bar is no proof it has settled (it may not have moved yet), so read until the bar is where the
+        control put it, or the time is up; the last reading is returned either way and the check judges it."""
+        set_value()
+        deadline = time.monotonic() + timeout
+        while True:
+            time.sleep(1.0)
+            reading = testmode_gauge(self.session.image("p5"), name)
+            if abs(reading[0] - expected) <= tolerance or time.monotonic() > deadline:
+                return reading
+
+    def hw50(self):
+        s = self.session
+        subs = [self.testmode_page_is(5, "AD test")]
+        if subs[-1]["status"] != "PASS":
+            return from_subresults("HW-50", subs)
+        for name in ("main_out", "drive", "hp_cutoff", "strip"):
+            top, bottom, full_scale = TESTMODE_GAUGES[name]
+            if name == "strip":
+                def put(value):
+                    return lambda: s.event("strip", "press", value)
+            else:
+                def put(value, name=name):
+                    return lambda: s.event(name, "value", value)
+            reads = {value: self.gauge_at(name, put(value), value / 1000) for value in (0, 1000, 500, 0, 1000)}
+            label = "Y-PAD (strip)" if name == "strip" else name.upper()
+            subs.append(sub(f"{label}: 0 reads the bottom of 0-{full_scale}", reads[0][0] <= 0.02, str(reads[0][0])))
+            subs.append(sub(f"{label}: 1000 reads the top of 0-{full_scale}", reads[1000][0] >= 0.98, str(reads[1000][0])))
+            subs.append(sub(f"{label}: the middle reads about half", abs(reads[500][0] - 0.5) <= 0.03, str(reads[500][0])))
+            subs.append(sub(f"{label}: OK shows after both limits", reads[1000][1], f"after the top limit: {reads[1000][1]}"))
+        s.event("strip", "release", 0)
+        return from_subresults("HW-50", subs)
+
+    def hw51(self):
+        s = self.session
+        subs = [self.testmode_page_is(6, "encoder test")]
+        if subs[-1]["status"] != "PASS":
+            return from_subresults("HW-51", subs)
+
+        def read(name, expected, timeout=40.0):
+            """The page follows the panel frames with a lag a loaded host stretches: read until the value is the expected
+            one or the time is up (the last reading is returned and the check judges it)."""
+            deadline = time.monotonic() + timeout
+            while True:
+                time.sleep(1.0)
+                value = testmode_encoder(s.image("p6"), name)
+                if value == expected or time.monotonic() > deadline:
+                    return value
+        for n in range(1, 7):
+            knob = f"knob{n}"
+            s.turn(knob, 3, 0.4)
+            up = read(knob, 3)
+            s.turn(knob, -5, 0.4)
+            down = read(knob, 0xFFFE)
+            # The page prints the counter as an unsigned 16-bit number: -2 shows as 65534.
+            subs.append(sub(f"6 ENCODER ({n}): +3 reads 3, then -5 reads -2 (65534)",
+                            (up, down) == (3, 0xFFFE), f"{up}, {down}"))
+        s.turn("selector", 2, 0.8)
+        count = read("selector", 2)
+        subs.append(sub("PUSH ENCODER counts the selector's detents", count == 2, f"read {count}"))
+        s.event("selector", "press", 100)
+        on = read("selector_state", "ON")
+        s.event("selector", "release", 0)
+        off = read("selector_state", "OFF")
+        subs.append(sub("PUSH ENCODER STATUS is ON while pushed and OFF after", (on, off) == ("ON", "OFF"), f"{on}, {off}"))
+        return from_subresults("HW-51", subs)
+
     # ------------------------------------------------------------------ HW-42, HW-44, HW-45, HW-24
     def library_files(self):
         """Other firmware entries' data images and other builds' app and QEMU (must not change during the run)."""
@@ -3703,7 +3991,7 @@ class Runner:
         """Start from a new firmware project (profile recipe new_project): the firmware reopens the last saved project
         at boot, so state an earlier run saved (a pan, a time stretch, samples) would otherwise leak into this run."""
         steps = (self.p.get("recipes") or {}).get("new_project")
-        if not authored(steps) or self.lost:
+        if not authored(steps) or self.lost or not self.session:
             return
         try:
             run_recipe(self.session, steps)
@@ -3738,16 +4026,26 @@ class Runner:
         if self.session.runtime.get("audio") != "file":
             raise EnvError("the session must be built with --audio file (refusing any other audio mode)")
         self.firmware_id = self.firmware_id or self.session.runtime.get("firmware")
+        self.check_firmware("the session's")
+
+    def check_firmware(self, whose):
+        """The firmware under test (its library manifest) must be the profile's: same application SHA-256."""
         library = Path(json.loads((self.build / "assets.json").read_text())["library"])
         manifest = json.loads((library / self.firmware_id / "manifest.json").read_text())
         if manifest.get("app_sha256") != self.p["firmware"]["app_sha256"]:
-            raise EnvError("the session's firmware does not match the profile (application SHA-256)")
+            raise EnvError(f"{whose} firmware does not match the profile (application SHA-256)")
         self.notes["manifest"] = {k: manifest.get(k) for k in ("id", "app_sha256", "update", "image")}
         self.notes["manifest"]["sha256"] = sha256_file(library / self.firmware_id / "manifest.json")
 
     def run(self):
         others_before = {str(p): sha256_file(p) for p in self.library_files()} if self.need("HW-42") else {}
-        self.main_session()
+        # Extras start their own throwaway sessions: with only those selected there is no main session to boot.
+        if not all(hw in EXTRA_IDS for hw in self.selected) or self.given_runtime:
+            self.main_session()
+        else:
+            library = Path(json.loads((self.build / "assets.json").read_text())["library"])
+            self.firmware_id = self.firmware_id or json.loads((library / "selected.json").read_text())["id"]
+            self.check_firmware("the library's selected")
         order = [("HW-01", self.hw01), ("HW-31", self.hw31), ("HW-05", self.hw05), ("HW-06", self.hw06),
                  ("HW-07", self.hw07), ("HW-36", self.hw36), ("HW-24", lambda: self.partial.setdefault("HW-24", self.hw24_calibrated()) and None),
                  ("HW-02", self.hw02), ("HW-03", self.hw03), ("HW-04", self.hw04), ("HW-20", self.hw20),
@@ -3780,6 +4078,8 @@ class Runner:
             self.record("HW-39", self.hw39)
         if not self.lost and self.need("HW-47"):
             self.record("HW-47", self.hw47)
+        if not self.lost and any(self.need(hw) for hw in TESTMODE_IDS):
+            self.testmode_checks()
         if "HW-24" in self.partial or self.need("HW-24"):
             subs = self.partial.pop("HW-24", []) or []
             try:
@@ -3878,6 +4178,10 @@ def main(argv=None):
     parser.add_argument("--build-dir", help="research build directory (relaunches; and the main session if no --runtime)")
     parser.add_argument("--firmware", help="firmware id in the build's library (default: the session's)")
     parser.add_argument("--control-build", help="build made with --uncalibrated sharing the library (HW-24 control)")
+    parser.add_argument("--testmode-build", help="build made with --app-arg testmode, for the factory test page checks "
+                                                 "(HW-48..HW-51, extra tier)")
+    parser.add_argument("--testmode-skip", default="", help="comma-separated controls HW-49 leaves unpressed: the "
+                                                            "negative control, which must make that check fail")
     parser.add_argument("--fixtures", help="fixture directory (default <out>/fixtures)")
     parser.add_argument("--out", help="output directory (default <build>/hwsuite/<run id>)")
     parser.add_argument("--tier", choices=list(TIERS), default="full")
@@ -3926,7 +4230,8 @@ def main(argv=None):
         out.mkdir(mode=0o700, parents=True, exist_ok=True)
         fixtures = Path(args.fixtures) if args.fixtures else out / "fixtures"
         runner = Runner(profile, args.profile, build, args.firmware, out, fixtures, args.tier, only,
-                        args.control_build, args.runtime)
+                        args.control_build, args.runtime, args.testmode_build,
+                        [x.strip() for x in args.testmode_skip.split(",") if x.strip()])
         runner.run_id = run_id
         runner.fixture_hashes = make_fixtures(fixtures, (profile.get("usb") or {}).get("sample_dir")
                                               or "PIONEER DJ SAMPLER/Samples")

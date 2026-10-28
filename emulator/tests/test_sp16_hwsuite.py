@@ -24,10 +24,10 @@ def all_pass(ids=None):
 
 class CheckTableTests(unittest.TestCase):
     def test_table_matches_the_spec(self):
-        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 48)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 52)])
         self.assertEqual(list(hwsuite.SMOKE_IDS), SPEC_SMOKE)
         self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "L"], ["HW-44"])
-        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], ["HW-47"])
+        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 52)])
 
     def test_tiers_and_only(self):
         self.assertEqual(hwsuite.select_checks("smoke"), SPEC_SMOKE)
@@ -37,7 +37,7 @@ class CheckTableTests(unittest.TestCase):
         self.assertEqual(hwsuite.select_checks("smoke", ["HW-02", "HW-05"]), ["HW-05"])
         # Extras stay out of full and core, and run by tier or by name.
         self.assertNotIn("HW-47", hwsuite.select_checks("full"))
-        self.assertEqual(hwsuite.select_checks("extra"), ["HW-47"])
+        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 52)])
         self.assertEqual(hwsuite.select_checks("full", ["HW-47", "HW-05"]), ["HW-05", "HW-47"])
         with self.assertRaises(ValueError):
             hwsuite.select_checks("full", ["HW-99"])
@@ -311,6 +311,114 @@ class ImageTests(unittest.TestCase):
         ImageDraw.Draw(listing).rectangle((0, 30, 99, 44), fill=(225, 225, 230))
         self.assertEqual(hwsuite.highlighted_band(listing, (0, 0, 100, 60)), (30, 45))
         self.assertIsNone(hwsuite.highlighted_band(base, (0, 0, 100, 60)))
+
+
+class TestmodePageTests(unittest.TestCase):
+    """The factory test page readers and the checks' gating, on synthetic LCD images."""
+
+    def gauge_image(self, fills):
+        """Page 5 look: a light-blue bar from the gauge's left edge to `fill` of its width, and a red OK where asked."""
+        from PIL import Image, ImageDraw
+        image = Image.new("RGB", (800, 480), (255, 255, 255))
+        draw = ImageDraw.Draw(image)
+        for name, (fill, ok) in fills.items():
+            top, bottom, _ = hwsuite.TESTMODE_GAUGES[name]
+            left, right = hwsuite.TESTMODE_GAUGE_X
+            draw.rectangle((left, top, right, bottom), outline=(200, 200, 200))
+            if fill:
+                draw.rectangle((left + 1, top + 1, left + 1 + round(fill * (right - left - 2)), bottom - 1),
+                               fill=(208, 208, 255))
+            if ok:
+                draw.rectangle((670, top + 8, 700, bottom - 8), fill=(255, 0, 0))
+        return image
+
+    def test_a_plain_white_or_black_lcd_is_page_1_or_2_even_with_a_stray_row(self):
+        from PIL import Image
+        white = Image.new("RGB", (800, 480), (255, 255, 255))
+        black = Image.new("RGB", (800, 480), (0, 0, 0))
+        black.paste((255, 255, 255), (0, 479, 800, 480))                 # the snapshot's one bright edge row
+        self.assertEqual(hwsuite.testmode_page_of(white), 1)
+        self.assertEqual(hwsuite.testmode_page_of(black), 2)
+
+    def test_gauge_fill_and_ok_are_measured_from_pixels(self):
+        image = self.gauge_image({"main_out": (0.5, False), "drive": (1.0, True), "hp_cutoff": (0.0, False),
+                                  "strip": (64 / 127, False)})
+        fraction, ok = hwsuite.testmode_gauge(image, "main_out")
+        self.assertAlmostEqual(fraction, 0.5, delta=0.02)
+        self.assertFalse(ok)
+        self.assertEqual(hwsuite.testmode_gauge(image, "drive"), (1.0, True))
+        self.assertEqual(hwsuite.testmode_gauge(image, "hp_cutoff"), (0.0, False))
+        self.assertAlmostEqual(hwsuite.testmode_gauge(image, "strip")[0], 64 / 127, delta=0.02)
+
+    def test_the_button_test_covers_fifty_distinct_controls(self):
+        controls = hwsuite.TESTMODE_LED_BUTTONS + hwsuite.TESTMODE_PLAIN_BUTTONS
+        self.assertEqual((len(hwsuite.TESTMODE_LED_BUTTONS), len(controls), len(set(controls))), (48, 50, 50))
+        import panel_map
+        self.assertTrue(all(name in panel_map.CONTROL_IDS for name in controls))
+        self.assertFalse({"selector", "back", "home"} & set(controls))
+
+    def test_extras_without_a_testmode_build_are_n_a_with_a_precondition(self):
+        profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = hwsuite.Runner(profile, TOOLS / "profiles" / "sp16-1.60.json", tmp, None, tmp, tmp,
+                                    "extra", list(hwsuite.TESTMODE_IDS))
+            runner.testmode_checks()
+        self.assertEqual({hw: v["status"] for hw, v in runner.verdicts.items()}, {hw: "N/A" for hw in hwsuite.TESTMODE_IDS})
+        self.assertTrue(all(v["reason"].startswith("precondition:") for v in runner.verdicts.values()))
+
+    def test_a_testmode_session_that_cannot_start_blocks_the_checks_and_stops_nothing_else(self):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        profile = json.loads(profile_path.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = hwsuite.Runner(profile, profile_path, tmp, None, tmp, tmp, "extra", list(hwsuite.TESTMODE_IDS),
+                                    testmode_build=tmp)
+            with mock.patch.object(hwsuite, "launch", side_effect=hwsuite.EnvError("a session is already running")), \
+                    mock.patch.object(hwsuite, "stop") as stopped:
+                runner.testmode_checks()
+            stopped.assert_not_called()
+        self.assertEqual({v["status"] for v in runner.verdicts.values()}, {"BLOCKED"})
+        self.assertIn("already running", runner.verdicts["HW-49"]["reason"])
+
+    def test_a_testmode_session_that_started_is_always_stopped_by_its_pid(self):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        profile = json.loads(profile_path.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = hwsuite.Runner(profile, profile_path, tmp, None, tmp, tmp, "extra", list(hwsuite.TESTMODE_IDS),
+                                    testmode_build=tmp)
+            with mock.patch.object(hwsuite, "launch", return_value=(4242, Path(tmp) / "runtime.json", 1.0)), \
+                    mock.patch.object(hwsuite, "Session", side_effect=hwsuite.SessionLost("control socket unavailable")), \
+                    mock.patch.object(hwsuite, "stop") as stopped:
+                runner.testmode_checks()
+            stopped.assert_called_once_with(Path(tmp), 4242, timeout=90)
+        self.assertEqual({v["status"] for v in runner.verdicts.values()}, {"BLOCKED"})
+
+    def test_only_extras_selected_means_no_main_session(self):
+        self.assertTrue(all(hw in hwsuite.EXTRA_IDS for hw in hwsuite.select_checks("extra")))
+
+    def library(self, root, app_sha):
+        """A build with a one-firmware library whose manifest carries `app_sha`; returns the build folder."""
+        (root / "lib" / "fw-1").mkdir(parents=True)
+        (root / "lib" / "selected.json").write_text(json.dumps({"id": "fw-1"}))
+        (root / "lib" / "fw-1" / "manifest.json").write_text(json.dumps({"id": "fw-1", "app_sha256": app_sha}))
+        (root / "build").mkdir()
+        (root / "build" / "assets.json").write_text(json.dumps({"library": str(root / "lib"), "research": True, "audio": "file"}))
+        return root / "build"
+
+    def test_an_extras_only_run_still_checks_the_selected_firmware_against_the_profile(self):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        profile = json.loads(profile_path.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            build = self.library(Path(tmp), profile["firmware"]["app_sha256"])
+            runner = hwsuite.Runner(profile, profile_path, build, None, tmp, tmp, "extra", ["HW-47"])
+            with mock.patch.object(hwsuite.Runner, "hw47", return_value=hwsuite.verdict("HW-47", "PASS")):
+                verdicts = runner.run()
+            self.assertEqual((runner.firmware_id, verdicts[0]["status"]), ("fw-1", "PASS"))
+            self.assertEqual(runner.notes["manifest"]["app_sha256"], profile["firmware"]["app_sha256"])
+        with tempfile.TemporaryDirectory() as tmp:
+            build = self.library(Path(tmp), "0" * 64)
+            runner = hwsuite.Runner(profile, profile_path, build, None, tmp, tmp, "extra", ["HW-47"])
+            with self.assertRaises(hwsuite.EnvError):
+                runner.run()
 
 
 class MarkVerifiedTests(unittest.TestCase):
