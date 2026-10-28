@@ -117,3 +117,35 @@ None.
 
 - None blocking. The owner may want the output-monitor menu entries greyed (rather than just hidden) in file-only
   builds, but the menu is already disabled when no sink exists.
+
+## Review round 1
+
+Two blocking review findings fixed, one commit each, on top of the six task commits.
+
+### R1.1. `pt-i44.29` — standby and fault clobbered each other's panel state
+
+- **Commit:** `82d4fbe` — `emulator/native-window.swift`
+- **What:** `applyStandby` and `setFault` shared the one `PowerState` enum, so standby during a fault overwrote
+  `.fault` (a later fault-off was ignored and the WAKE UP blink stuck) and a fault during standby overwrote `.off`
+  (a later wake was ignored and the panel stayed dark). Standby and fault are now two independent flags
+  (`standby`, `faultActive`); the panel already derives the drawn state from `panelDark` and `fault` together (the
+  fault blink wins over the steady WAKE UP, and both darken the LCD), so every order of fault on/off and standby/wake
+  ends in the same drawn state. `PowerState` shrank to BOOT → RUN.
+- **Check:** `xcrun swiftc -typecheck -parse-as-library` (exit 0, only pre-existing deprecation warnings), the
+  14-module quick set (403 tests, OK) and `python3 -m unittest emulator.tests.test_sp16_sessionctl` (26 tests, OK).
+  The four fault/standby orders (fault→standby→fault-off, fault→standby→wake, standby→fault→fault-off,
+  standby→fault→wake, plus the full cycle) were exercised in a throwaway `xcrun swift` script against the panel's
+  derivation; all ended in the right state.
+- **Did not run:** a live-session panelshot of each order (no emulator session in this round; the derivation is the
+  same code path the live panelshots for tasks 3 and 4 exercised).
+
+### R1.2. `pt-i44.18` — USB hot attach swapped the stick without an eject confirmation
+
+- **Commit:** `f0901c2` — `emulator/native-window.swift`
+- **What:** `hotAttachUSB` used `if let` for the `usb-eject` control reply, so a nil reply (no confirmation, e.g. a
+  timeout) fell through to the QMP `device_del` and block swap, yanking a still-mounted stick out from under the
+  guest. Now a guard-let (like the plain attach path) refuses the swap unless the guest answered `usb-ejected`, with
+  an explicit error; the `usb-busy` refusal is unchanged.
+- **Check:** `xcrun swiftc -typecheck -parse-as-library` (exit 0, only pre-existing deprecation warnings).
+- **Did not run:** a live `ctl usb attach` against a silent guest (needs a running emulator); the guard-let mirrors
+  the already-exercised plain attach path.
