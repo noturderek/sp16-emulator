@@ -51,7 +51,10 @@ class ProtocolTests(unittest.TestCase):
     def test_research_operations_are_bounded(self):
         self.assertEqual(protocol.decode_research(bytes([1, 0x3c, 0xaa])), ("raw", 0x3c, b"\xaa"))
         self.assertEqual(protocol.decode_research(bytes([2, 1, 2, 3, 4]))[0], "cdc")
-        for bad in (b"", bytes([1, 127, 1, 2]), bytes([2, 1]), bytes([4, 2]), bytes([9])):
+        self.assertEqual(protocol.decode_research(bytes([6, 0])), ("usb-oc", 0, b""))
+        self.assertEqual(protocol.decode_research(bytes([6, 1])), ("usb-oc", 1, b""))
+        for bad in (b"", bytes([1, 127, 1, 2]), bytes([2, 1]), bytes([4, 2]),
+                    bytes([6]), bytes([6, 2]), bytes([6, 0, 1]), bytes([9])):
             with self.assertRaises(ValueError):
                 protocol.decode_research(bad)
 

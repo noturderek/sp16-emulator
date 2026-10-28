@@ -15,7 +15,7 @@ FEEDBACK: >IBH generation/flags/count then count x (>BBBB lamp id, r, g, b). Fla
   live firmware output has been decoded; entries only cover lamps with a proven mapping.
 RESEARCH: one-byte operation then payload (host research socket only). 1 = raw frame
   bytes (offset, data), 2 = raw CDC bytes (4), 3 = clear raw overrides, 4 = TX log on/off,
-  5 = RX frame period in milliseconds (1..50).
+  5 = RX frame period in milliseconds (1..50), 6 = USB over-current input (0 idle, 1 asserted).
 TX_FRAME: >BBB then up to 128 bytes: multi/part id/part count of an OEM panel TX frame
   (guest -> host, research logging only).
 STATS: UTF-8 JSON object of guest panel counters (guest -> host, about 1 Hz).
@@ -130,6 +130,8 @@ def decode_research(payload):
         return "txlog", data[0], b""
     if operation == 5 and len(data) == 1 and 1 <= data[0] <= 50:
         return "period", data[0], b""
+    if operation == 6 and len(data) == 1 and data[0] in (0, 1):
+        return "usb-oc", data[0], b""
     raise ValueError("invalid research operation")
 
 

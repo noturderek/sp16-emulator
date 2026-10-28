@@ -188,6 +188,9 @@ class Session:
             command["path"] = path
         return self.call(**command)
 
+    def usb_oc(self, on):
+        return self.call(op="usb-oc", on=on)
+
     def pressure(self, pad, raw):
         """Hold a pad's raw pressure word (0..1023) until it is set to 0: the AD value the factory test's pad
         calibration page shows, not a velocity. `pad` is 1..16 or a name such as pad3."""
@@ -276,7 +279,7 @@ def main():
     parser.add_argument("command", choices=["event", "press", "turn", "touch", "raw", "clear",
                                             "snapshot", "metrics", "txlog", "period", "panelshot", "resize", "adc", "usb",
                                             "app-restart", "firmware", "power", "standby", "pressure", "calibrate",
-                                            "fault", "monitor"])
+                                            "fault", "monitor", "usb-oc"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=None,
                         help=f"seconds to wait for each reply (default SP16_CONTROL_TIMEOUT or {DEFAULT_TIMEOUT:g})")
@@ -320,6 +323,10 @@ def run_command(session, command, a):
     elif command == "usb":
         action = a[0] if a else "eject"
         result = session.usb(action, a[1] if len(a) > 1 else None)
+    elif command == "usb-oc":
+        if a != ["on"] and a != ["off"]:
+            raise RuntimeError("usb-oc needs on|off")
+        result = session.usb_oc(a[0] == "on")
     elif command == "adc":
         result = session.adc()
     elif command == "pressure":

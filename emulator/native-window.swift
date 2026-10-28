@@ -1181,6 +1181,9 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         case "period":
             guard let ms = int("ms"), (1...50).contains(ms) else { return "{\"error\":\"period needs ms 1-50\"}" }
             sendBody([Kind.research, 5, UInt8(ms)]); return "{\"ok\":true}"
+        case "usb-oc":
+            guard let on = command["on"] as? Bool else { return "{\"error\":\"usb-oc needs on|off\"}" }
+            sendBody([Kind.research, 6, on ? 1 : 0]); return "{\"ok\":true}"
         case "snapshot":
             guard let name = command["name"] as? String, snapshot(named: name) else { return "{\"error\":\"snapshot failed\"}" }
             return "{\"ok\":true}"

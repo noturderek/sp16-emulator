@@ -191,6 +191,12 @@ int main(void) {
     assert(g>=0 && h>=0);
     uint8_t level=9;
     assert(lseek(g,3*32+14,SEEK_SET)==3*32+14 && read(g,&level,1)==1 && level==1);
+    int oc=open("/tmp/run/usb-oc",O_WRONLY|O_CREAT|O_TRUNC,0600);
+    assert(oc>=0 && write(oc,"0",1)==1 && close(oc)==0);
+    assert(lseek(g,3*32+14,SEEK_SET)==3*32+14 && read(g,&level,1)==1 && level==0);
+    oc=open("/tmp/run/usb-oc",O_WRONLY|O_TRUNC);
+    assert(oc>=0 && write(oc,"1",1)==1 && close(oc)==0);
+    assert(lseek(g,3*32+14,SEEK_SET)==3*32+14 && read(g,&level,1)==1 && level==1);
     level=0;
     assert(lseek(g,4*32+5,SEEK_SET)==4*32+5 && write(g,&level,1)==1);
     level=9;

@@ -1099,7 +1099,7 @@ def plan_mod(ctx, args, tail):
 # ---------------------------------------------------------------------------------------------------- ctl
 CTL_COMMANDS = ("event", "press", "turn", "touch", "raw", "clear", "snapshot", "metrics", "txlog", "period",
                 "panelshot", "resize", "adc", "usb", "app-restart", "firmware", "power", "standby", "pressure",
-                "calibrate", "fault", "monitor")
+                "calibrate", "fault", "monitor", "usb-oc")
 CTL_OPTS = [
     Opt("--build", "The research build whose newest running session to drive (default: build/sp16-dev, else the "
         "only research build).", "NAME", emit=False),
@@ -2952,6 +2952,7 @@ def help_ctl_lines():
         "resize WIDTH HEIGHT          resize the panel window",
         "metrics | adc | txlog [off] | period MS    counters, analog words, panel traffic, frame period",
         "usb eject|attach             eject or reattach the virtual USB stick",
+        "usb-oc on|off                assert or release the USB over-current input",
         "power [SECONDS] | standby yes  press the power key into standby, or leave standby (reads the TX standby flag)",
         "pressure PAD 0..1023        hold a pad at a raw pressure word (0 lets go)",
         "calibrate PAD [RAW]          hold a pad and make the three factory-test calibration passes",

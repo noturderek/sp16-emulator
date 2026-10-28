@@ -249,12 +249,30 @@ static int gpio_open(void) {
     devices[pair[0]]=(struct state){ .kind=GPIO,.peer=pair[1] };
     return pair[0];
 }
+static uint8_t usb_oc_level(void) {
+    const char *path=getenv("SP16_USB_OC_PATH");
+    if (!path || !*path) return 1;
+    int fd=original_open(path,O_RDONLY|O_CLOEXEC);
+    if (fd<0) return 1;
+    char value=0;
+    ssize_t count=original_read(fd,&value,1);
+    original_close(fd);
+    return count==1 && value=='0' ? 0 : 1;
+}
 static ssize_t gpio_io(struct state *s,void *buffer,size_t count,int writing) {
     uint8_t *b=buffer;
     size_t n=0;
     for (;n<count && s->offset<GPIO_LINES;n++,s->offset++) {
         unsigned line=s->offset;
-        if (!writing) { b[n]=gpio_level[line]; continue; }
+        if (!writing) {
+            if (line==3*32+14) {
+                uint8_t level=usb_oc_level();
+                if (__atomic_exchange_n(&gpio_level[line],level,__ATOMIC_ACQ_REL)!=level)
+                    fprintf(stderr,"[sp16-ui-stub] gpio GPIO4_IO14=%u USBPWR_OC\n",level);
+            }
+            b[n]=__atomic_load_n(&gpio_level[line],__ATOMIC_ACQUIRE);
+            continue;
+        }
         uint8_t level=b[n]&1;
         __atomic_add_fetch(&gpio_writes,1,__ATOMIC_RELAXED);
         int first=!__atomic_exchange_n(&gpio_written[line],1,__ATOMIC_ACQ_REL);
