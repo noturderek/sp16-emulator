@@ -41,9 +41,10 @@ class RecipeTests(unittest.TestCase):
 
     def test_set_row_opens_utility_and_returns_home(self):
         steps = recipes.set_row("X", "Y")
-        self.assertEqual(steps[0], {"press": "home"})
-        self.assertEqual(steps[2], {"tap": recipes.UTILITY_TAP})
-        self.assertEqual(steps[5], {"press": "selector"})
+        self.assertEqual(steps[0], {"settle": 1.0})
+        self.assertEqual(steps[1], {"press": "home"})
+        self.assertEqual(steps[3], {"tap": recipes.UTILITY_TAP})
+        self.assertEqual(steps[6], {"press": "selector"})
         self.assertEqual(steps[-2], {"press": "home"})
         self.assertEqual(steps[-1], {"expect_title": "HOME"})
 

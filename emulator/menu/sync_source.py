@@ -39,6 +39,7 @@ def set_row(setting, value, value_detents=1):
     `value_detents` is the number of selector detents from the setting's current value to `value` (the recipe's
     `focus_row` then confirms the label by OCR rather than trusting the count)."""
     return [
+        {"settle": 1.0},
         {"press": "home"},
         {"expect_title": "HOME"},
         {"tap": UTILITY_TAP},

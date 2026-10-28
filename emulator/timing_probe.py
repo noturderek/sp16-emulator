@@ -356,6 +356,8 @@ def run(args):
         session.txlog(True)
         if args.net:
             import menu.sync_source as sync_recipes
+            time.sleep(8.0)  # the firmware's touch panel lags SP16_NATIVE_READY; wait before the first tap
+            hwsuite.wait_settled(session, stable=1.0, timeout=30.0)
             sync_recipes.run(session, sync_recipes.SYNC_SOURCE_PDL)
             time.sleep(4.0)  # let the firmware acquire the master tempo before PLAY
         bpm = profile["audio"]["default_bpm"]
