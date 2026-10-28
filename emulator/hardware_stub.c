@@ -1060,7 +1060,8 @@ static float bm_log2(float x) { /* log2 for x > 0, error < 1e-4: exponent from t
     return (float)e+2.8853901f*t*(1+t2/3*(1+t2*3/5*(1+t2*5/7)));
 }
 /* Level scale (grade I, not measured on a unit): the converters' full scale is the rated maximum level of the jacks,
- * +16 dBu (input and output). The dBu readouts in the metrics are dBFS + 16. */
+ * +16 dBu (input and output). The dBu readouts in the metrics are peak-equivalent (dBFS + 16 from the peak level);
+ * dBu proper is an RMS unit, so the fields are named *_dbu_peak to keep peak and RMS distinct. */
 #define FS_DBU 16.0f
 static float to_dbu(float peak) { return peak>1e-6f?FS_DBU+6.0205999f*bm_log2(peak):-99.0f; }
 
@@ -1394,7 +1395,7 @@ static void meter_report(uint64_t now,int force) {
     static const char *const names[]={"off","tone","wav"};
     float in=meter_in_peak, out=meter_out_peak;
     meter_report_ns=now; meter_limiter_logged=lim;
-    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu=%.1f out_peak=%.4f out_dbu=%.1f limited=%lu "
+    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu_peak=%.1f out_peak=%.4f out_dbu_peak=%.1f limited=%lu "
             "main_out_gain=%.4f input_gain=%.4f source=%s\n",lim,(double)in,(double)to_dbu(in),(double)out,(double)to_dbu(out),
             meter_limited,(double)a.main_gain,(double)a.input_gain,names[meter_source]);
     meter_in_peak=meter_out_peak=0; meter_limited=0;

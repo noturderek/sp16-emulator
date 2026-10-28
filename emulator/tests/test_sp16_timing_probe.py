@@ -212,7 +212,7 @@ class LinkTimingTests(unittest.TestCase):
         link.arrival(0.0); link.write(1_536_000, 0.1, 0.1); link.report(5.0)
         for line in ("[sp16-ui-stub] dac hpf word=0x1abc ctrl=1 code=2748 writes=7",
                      "[sp16-ui-stub] filter loop send_peak=0.5000 return_peak=0.2500 frames=44100 underruns=0 drops=0 lp_hz=1000 hp=dac",
-                     "[sp16-ui-stub] analog levels limiter=1 in_peak=0.9770 in_dbu=15.8 out_peak=0.2500 out_dbu=4.0 limited=412 "
+                     "[sp16-ui-stub] analog levels limiter=1 in_peak=0.9770 in_dbu_peak=15.8 out_peak=0.2500 out_dbu_peak=4.0 limited=412 "
                      "main_out_gain=0.2500 input_gain=1.0000 source=wav",
                      "[sp16-ui-stub] gpio GPIO5_IO05=1 SEL_xTHRU/DSF", "[sp16-ui-stub] gpio GPIO5_IO06=1 LMT_xOFF/ON",
                      "[sp16-ui-stub] panel TX frames dropped=1048576 errno=11"):
