@@ -17,6 +17,7 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
@@ -94,19 +95,14 @@ GOLDEN_LAMP_ROLES = {
 }
 
 
-def decode_strip(b0, b1):
-    """E5: value = (0x7f - b0) | b1 << 8; position = value & 0x7f, contact = bit 15 (byte 1 bit 7)."""
-    word = (0x7f - b0) | b1 << 8
-    return word & 0x7f, word >> 15 & 1
-
-
 def rx_frame(parts):
-    """A 128-byte RX frame built from literal bytes: `parts` maps a frame offset to the bytes written there."""
+    """A complete 128-byte RX frame built from literal bytes: `parts` maps a frame offset to the bytes written there.
+    The header and the CRC-16 are the production ones, so this is the frame the panel puts on the wire."""
     frame = bytearray(128)
     frame[0] = 0x01
     for offset, data in parts.items():
         frame[offset:offset + len(data)] = data
-    return bytes(frame)
+    return panel.finish(frame)
 
 
 def tx_frame(parts):
@@ -122,10 +118,6 @@ def tx_frame(parts):
 # ---------------------------------------------------------------------------------------------------------------------
 # Self-consistency helpers (layer 3).
 # ---------------------------------------------------------------------------------------------------------------------
-
-def counter(frame, offset):
-    return struct.unpack_from(">H", frame, offset)[0]
-
 
 def settle(model):
     for _ in range(SETTLE_STEPS):
@@ -149,28 +141,26 @@ def button_round_trip(name, encode_bits, decode_bits):
 def pad_round_trip(name):
     """Pressure (A) and contact (B) words of one pad, written on press and cleared on release."""
     index = int(name[3:]) - 1
-    a_offset, b_offset = panel_map.PAD_A_OFFSET + 2 * index, panel_map.PAD_B_OFFSET + 2 * index
+    want_a, want_b = panel_map.PAD_CURVE(PAD_VELOCITY)
     model = panel.PanelModel()
     if model.apply(ID[name], "press", PAD_VELOCITY) != protocol.INPUT_OK:
         return False
     model.step()
-    frame = model.frame()
-    want_a, want_b = panel_map.PAD_CURVE(PAD_VELOCITY)
-    pressed = counter(frame, a_offset) == want_a and counter(frame, b_offset) == want_b
+    pressed = panel.decode_rx(model.frame())["pads"][index]
     model.apply(ID[name], "release")
-    frame = settle(model)
-    return pressed and counter(frame, a_offset) == 0 and counter(frame, b_offset) == 0
+    released = panel.decode_rx(settle(model))["pads"][index]
+    return pressed == {"pressure": want_a, "contact": want_b} and released == {"pressure": 0, "contact": 0}
 
 
 def counter_round_trip(name):
     """One detent on an int16 counter: the decoded counter moves by the table's sign."""
     offset, sign = panel_map.COUNTERS[name]
     model = panel.PanelModel()
-    before = counter(model.frame(), offset)
+    before = panel.decode_rx(model.frame())["counters"][name]
     if model.apply(ID[name], "delta", 1) != protocol.INPUT_OK:
         return False
     model.step()
-    return counter(model.frame(), offset) == (before + sign) & 0xffff
+    return panel.decode_rx(model.frame())["counters"][name] == (before + sign) & 0xffff
 
 
 def analog_round_trip(name, value=750):
@@ -180,11 +170,7 @@ def analog_round_trip(name, value=750):
         return False
     ok = True
     if name in panel_map.ANALOG_WORDS:
-        offset, inverted = panel_map.ANALOG_WORDS[name]
-        word = counter(model.frame(), offset)
-        if inverted:
-            word = panel_map.ANALOG_FULL_SCALE - word
-        ok = ok and abs(round(word * 1000 / panel_map.ANALOG_FULL_SCALE) - value) <= 1
+        ok = abs(panel.decode_rx(model.frame())["analog"][name] - value) <= 1
     if name in panel_map.HOST_ANALOG:
         # Host-only state (not a panel protocol field, grade U): u16 slots at 12 + 2 * index, FILTER TONE after the tone.
         index = panel_map.HOST_ANALOG.index(name)
@@ -198,10 +184,10 @@ def strip_round_trip(value=500):
     model = panel.PanelModel()
     if model.apply(ID["strip"], "value", value) != protocol.INPUT_OK:
         return False
-    position, contact = decode_strip(*model.cdc_bytes()[:2])
+    position, contact = panel.decode_strip(*model.cdc_bytes()[:2])
     touched = position == round(value * 127 / 1000) and contact == 1
     model.apply(ID["strip"], "release")
-    return touched and decode_strip(*model.cdc_bytes()[:2])[1] == 0
+    return touched and panel.decode_strip(*model.cdc_bytes()[:2])[1] == 0
 
 
 def lamp_frame(role, lit):
@@ -273,16 +259,13 @@ class GoldenTableTests(unittest.TestCase):
                 self.assertEqual((placed, placed_bit), (byte, bit))
 
     def test_lamp_roles_match_the_reference(self):
-        canonical = {role: spec for role, spec in panel_map.LAMP_ROLES.items() if role != "shift"}
-        self.assertEqual(canonical, GOLDEN_LAMP_ROLES)
+        self.assertEqual(panel_map.LAMP_ROLES, GOLDEN_LAMP_ROLES)
 
-    @unittest.expectedFailure
     def test_shift_has_no_lamp_role(self):
-        """Known discrepancy, cross-lane request: the reference (E15) says mono 4 drives no physical LED, yet
-        panel_map.LAMP_ROLES maps a shift lamp to it. panel_map.py is held by another lane, so this stays an expected
-        failure until that file drops the role. When it is fixed, this unexpected pass fails the module: remove the
-        decorator then."""
+        """E15: mono 4 drives no physical LED (the manual's matrix has none on SHIFT or MODE), so the role is gone
+        from the lamp table. The channel itself stays decoded and is declared unassigned in the profiles."""
         self.assertNotIn("shift", panel_map.LAMP_ROLES)
+        self.assertIn(4, panel_map.MONO_CHANNELS)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -301,22 +284,44 @@ class RawFrameFixtureTests(unittest.TestCase):
         ]
         for parts, expected in fixtures:
             with self.subTest(expected=sorted(expected)):
-                frame = rx_frame(parts)
-                decoded = {name for name, (byte, bit) in GOLDEN_BUTTONS.items() if frame[byte] >> bit & 1}
-                self.assertEqual(decoded, expected)
+                held = panel.decode_rx(rx_frame(parts))["buttons"]
+                self.assertEqual({name for name, down in held.items() if down}, expected)
 
     def test_rx_counter_and_pad_words_are_big_endian(self):
-        frame = rx_frame({0x30: b"\x00\x05", 0x06: b"\x02\xae", 0x3f: b"\x02\x00"})
-        self.assertEqual(counter(frame, GOLDEN_COUNTERS["knob1"][0]), 5)
-        self.assertEqual(counter(frame, GOLDEN_PAD_PRESSURE_BASE), 0x02ae)
-        self.assertEqual(counter(frame, GOLDEN_PAD_CONTACT_BASE), 0x0200)
+        state = panel.decode_rx(rx_frame({0x30: b"\x00\x05", 0x06: b"\x02\xae", 0x3f: b"\x02\x00"}))
+        self.assertEqual(state["counters"]["knob1"], 5)
+        self.assertEqual((state["pads"][0]["pressure"], state["pads"][0]["contact"]), (0x02ae, 0x0200))
+        self.assertEqual(state["pads"][1], {"pressure": 0, "contact": 0})
+        self.assertEqual(panel.signed_detents(0xffff), -1)
 
     def test_rx_analog_words_are_inverted_where_the_reference_says(self):
-        frame = rx_frame({0x28: b"\x03\xff", 0x2a: b"\x03\xff"})
-        full = GOLDEN_ANALOG_FULL_SCALE
-        main = round(counter(frame, 0x28) * 1000 / full)
-        hp = round((full - counter(frame, 0x2a)) * 1000 / full)
-        self.assertEqual((main, hp), (1000, 0))
+        state = panel.decode_rx(rx_frame({0x26: b"\x00\x00", 0x28: b"\x03\xff", 0x2a: b"\x03\xff"}))
+        self.assertEqual(state["analog_words"], {"main_out": 0x3ff, "drive": 0, "hp_cutoff": 0x3ff})
+        # MAIN OUT reads the word directly, the two DSF pots are stored as full scale minus the word.
+        self.assertEqual((state["analog"]["main_out"], state["analog"]["drive"], state["analog"]["hp_cutoff"]),
+                         (1000, 1000, 0))
+
+    def test_rx_decoder_rejects_what_is_not_a_frame(self):
+        good = rx_frame({2: b"\x08"})
+        corrupt = bytearray(good)
+        corrupt[2] ^= 0x04
+        self.assertIsNotNone(panel.decode_rx(good))
+        self.assertIsNone(panel.decode_rx(corrupt))          # CRC-16 no longer matches
+        self.assertIsNone(panel.decode_rx(good[:-1]))        # not a full frame
+        self.assertIsNone(panel.decode_rx(b"\x02" + good[1:]))  # a TX header
+
+    def test_mutated_button_and_counter_tables_change_the_same_bytes(self):
+        """Negative case: the fixtures above go through the production tables. Move PLAY onto STOP's bit or move a
+        counter's offset and the same literal bytes decode to a different control, so no fixture can silently keep
+        passing after an RX decoding regression."""
+        frame = rx_frame({2: b"\x08", 0x30: b"\x00\x05"})
+        self.assertEqual({name for name, down in panel.decode_rx(frame)["buttons"].items() if down}, {"play"})
+        swapped = {**panel_map.BUTTON_BITS, "play": panel_map.BUTTON_BITS["stop"],
+                   "stop": panel_map.BUTTON_BITS["play"]}
+        with mock.patch.dict(panel_map.BUTTON_BITS, swapped, clear=True):
+            self.assertEqual({name for name, down in panel.decode_rx(frame)["buttons"].items() if down}, {"stop"})
+        with mock.patch.dict(panel_map.COUNTERS, {"knob1": (0x32, 1)}):
+            self.assertEqual(panel.decode_rx(frame)["counters"]["knob1"], 0)
 
     def test_rx_crc_check_value(self):
         """CRC-16/X-25 (reflected 0x8408, init and final 0xffff) as the reference names it. The check value is the
@@ -324,9 +329,9 @@ class RawFrameFixtureTests(unittest.TestCase):
         self.assertEqual(panel.crc16(b"123456789"), 0x906E)
 
     def test_touch_strip_bytes_decode_to_the_reference_positions(self):
-        self.assertEqual(decode_strip(0x3f, 0x00), (64, 0))  # no contact: centred, E5 and the reference
-        self.assertEqual(decode_strip(0x7f, 0x80), (0, 1))   # contact at position 0
-        self.assertEqual(decode_strip(0x00, 0x80), (127, 1))  # contact at position 127
+        self.assertEqual(panel.decode_strip(0x3f, 0x00), (64, 0))  # no contact: centred, E5 and the reference
+        self.assertEqual(panel.decode_strip(0x7f, 0x80), (0, 1))   # contact at position 0
+        self.assertEqual(panel.decode_strip(0x00, 0x80), (127, 1))  # contact at position 127
 
     def test_tx_step1_colour_bytes_decode_to_the_reference_colour(self):
         frame = tx_frame({0x31: b"\x26\x0b\x4a"})  # step 1 lamp, the NORMAL brightness sample in the reference

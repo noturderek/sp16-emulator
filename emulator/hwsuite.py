@@ -137,7 +137,8 @@ CHECKS = [
     # Factory test pages, graded against the service manual's pass lines. They run in a build made with
     # `--app-arg testmode` (--testmode-build), where the app starts in the factory test instead of the firmware UI.
     Check("HW-48", "Factory test", "Pages 1 and 2: every pad and step lamp shows red, green, blue and white; all off, LCD black", "X"),
-    Check("HW-49", "Factory test", "Page 4: every button counts once (48 with a lamp, MODE and SHIFT: 50 of 50)", "X"),
+    Check("HW-49", "Factory test", "Page 4: every button counts once (48 with a lamp, MODE and SHIFT: 50 of 50) and the "
+          "status line names the pressed control", "X"),
     Check("HW-50", "Factory test", "Page 5: MASTER, DSF DRIVE and DSF HIGHPASS span 0-1023 and the strip 0-127", "X"),
     Check("HW-51", "Factory test", "Page 6: the six encoders and the push encoder count and report their state", "X"),
     Check("HW-52", "Screenshots", "The settled home screen and the panel match the suite's own earlier captures", "X",
@@ -1227,6 +1228,20 @@ def check_testmode_skip(names):
 
 
 TESTMODE_LED_ROW, TESTMODE_RESULT_ROW = (400, 62, 800, 100), (400, 170, 800, 206)
+# Page 4 also has a status cell left of the LED-BUTTON row that names the control the page counted (`PAD 1 : 3`), the
+# page's own attribution of the event. It is read for every press: a swapped mapping still moves RESULT, but it names
+# the other control.
+TESTMODE_STATUS_BOX = (0, 62, 400, 100)
+# The page's spelling of each control as tokens (letters and digits), so `PAD 1` and `BAR 3` match after OCR noise.
+TESTMODE_STATUS_NAMES = {
+    **{f"pad{n}": ("PAD", str(n)) for n in range(1, 17)},
+    **{f"step{n}": ("STEP", str(n)) for n in range(1, 17)},
+    **{f"bar{n}": ("BAR", str(n)) for n in range(1, 5)},
+    "usb_stop": ("USB", "STOP"),
+    **{name: (name.upper(),) for name in ("track", "mute", "slice", "scale", "rec", "stop", "play", "hold",
+                                          "scene", "pattern", "mode", "shift", "active")},
+}
+assert set(TESTMODE_STATUS_NAMES) == set(TESTMODE_CONTROLS), "every control page 4 counts needs its printed name"
 # Page 5 (AD test): gauge rows (a bar that fills left to right, its value inside it) and a red OK once both limits
 # were reached; the box is the gauge, the OK sits right of it.
 TESTMODE_GAUGES = {"main_out": (64, 96, 1023), "drive": (100, 132, 1023), "hp_cutoff": (136, 168, 1023),
@@ -1254,6 +1269,25 @@ def testmode_counter(image, row, total):
     """n of `LABEL(n/total)` in a page 4 row, or None."""
     match = re.search(r"\((\d+)\s*/\s*%d\)" % total, ocr(image, row, psm=7, scale=3))
     return int(match.group(1)) if match else None
+
+
+def testmode_status_controls(text):
+    """The controls whose printed name a page 4 status cell's text starts with. The longest name wins, so `USB STOP`
+    is USB STOP and not STOP; a name only counts as the first tokens of the cell, never as a substring of a value.
+    OCR drops the space of a two-word name (`USBSTOP`), so the joined form matches too."""
+    tokens = tuple(re.findall(r"[A-Z0-9]+", norm(text)))
+    named = [name for name, words in TESTMODE_STATUS_NAMES.items()
+             if tokens[:len(words)] == words or (len(words) > 1 and tokens[:1] == ("".join(words),))]
+    if not named:
+        return set()
+    longest = max(len(TESTMODE_STATUS_NAMES[name]) for name in named)
+    return {name for name in named if len(TESTMODE_STATUS_NAMES[name]) == longest}
+
+
+def testmode_status_name(image):
+    """Page 4: the control the status cell names, or None when it names none or the name is unreadable."""
+    named = testmode_status_controls(ocr(image, TESTMODE_STATUS_BOX, psm=7, scale=3))
+    return named.pop() if len(named) == 1 else None
 
 
 def testmode_gauge(image, name):
@@ -1604,6 +1638,24 @@ class Runner:
             self.session.turn("selector", delta, 0.7)
             time.sleep(1.2)
         return selected_tile(self.session.image("track"), probe) == track
+
+    def on_track(self, track):
+        """Whether the home screen shows `track` selected, re-selecting it once when it does not.
+
+        A track parameter belongs to the selected track: if the selection moved (a knob step or a menu the previous
+        recipe left behind), a VOLUME setting would land on another track while the pad still plays this one, and the
+        level would not change at all. Another screen, or one the probe cannot read, is looked at again on the home
+        screen; an unreadable tile screen is then reported as not selected rather than guessed.
+        Returns (selected, the track the screen showed)."""
+        probe = self.p["selector_probe"]
+        current = selected_tile(self.session.image("track"), probe)
+        if current is None:
+            self.go_home()
+            current = selected_tile(self.session.image("track"), probe)
+        if current is not None and current != track:
+            self.select_track(track)
+            current = selected_tile(self.session.image("track"), probe)
+        return current == track, current
 
     def load_sample(self, track, name):
         """Assign a fixture to a track with the profile's sample_load recipe (once per track and sample)."""
@@ -3178,6 +3230,10 @@ class Runner:
         volume = self.p["recipes"]["volume_knob"]
         self.set_knob("knob1", 100, volume["value_box"], volume["max"])
         self.go_home()
+        selected, shown = self.on_track(1)
+        if not selected:
+            return from_subresults("HW-34", [sub("TRACK 1 is selected before the tone hit", False,
+                                                 f"the home screen showed TRACK {shown}")])
         left, right, data = self.hit_capture("pad1", 100, seconds=7.0, pre=0.5)
         subs = []
         threshold = max(64, peak(left) * 0.05)
@@ -3207,15 +3263,25 @@ class Runner:
         same = peak(right[span[0]:span[1]]) > 0.5 * peak(body)
         subs.append(sub("sound on the declared channels only", not leak and same,
                         f"other channels with the tone {leak}; right peak {peak(right)}"))
-        levels = []
+        levels, lost = [], []
         self.set_knob("knob1", 0, volume["value_box"], volume["max"])
         for _ in range(4):
+            selected, shown = self.on_track(1)
+            if not selected:
+                lost.append(f"before hit {len(levels) + 1}: TRACK {shown}")
+                break
             s.turn("knob1", 8, 0.35)
             time.sleep(1.5)
             value = read_number(ocr(s.image("vol"), tuple(volume["value_box"]), 7, 4))
+            # The knob step itself can move the selection, so check again right before the hit that reads the level.
+            selected, shown = self.on_track(1)
+            if not selected:
+                lost.append(f"after the step of hit {len(levels) + 1}: TRACK {shown}")
+                break
             l, _, _ = self.hit_capture("pad1", 100, seconds=0.5)
             levels.append((value, peak(l)))
             time.sleep(6.0)
+        subs.append(sub("TRACK 1 is selected before every level hit", not lost, "; ".join(lost)))
         ordered = sorted(levels)
         mono = all(b[1] > a[1] for a, b in zip(ordered, ordered[1:])) and len({v for v, _ in levels}) == 4
         subs.append(sub("level follows the track VOLUME knob monotonically (4 settings)", mono, str(levels)))
@@ -3788,22 +3854,35 @@ class Runner:
                         f"read {count} from {ocr(image, TESTMODE_RESULT_ROW, psm=7, scale=3)!r}"))
         if count is None:
             return from_subresults("HW-49", subs)
-        missed = []
+        missed, misnamed, unread = [], [], []
         for name in TESTMODE_LED_BUTTONS + TESTMODE_PLAIN_BUTTONS:
             if name in skip:
                 continue
             before = count
             s.press(name, 0.4)
             deadline = time.monotonic() + 20
+            named = None
             while True:
                 wait_settled(s, 1.0, 20)
-                count = testmode_counter(s.image("p4"), TESTMODE_RESULT_ROW, 50)
+                image = s.image("p4")
+                count = testmode_counter(image, TESTMODE_RESULT_ROW, 50)
+                named = testmode_status_name(image)
                 if count is not None and count != before or time.monotonic() > deadline:
                     break
             if count != (before or 0) + 1:
                 missed.append(f"{name} ({before} -> {count})")
                 count = count if count is not None else before
+            # The status cell names the control the page counted. Two controls with swapped mappings move RESULT the same
+            # way, so the totals alone cannot tell them apart; the page's own name can.
+            if named is None:
+                unread.append(name)
+            elif named != name:
+                misnamed.append(f"{name} -> {named}")
         subs.append(sub("every control moved RESULT up by exactly one", not missed, "; ".join(missed[:6])))
+        subs.append(sub("the status line named the control that was pressed", not misnamed, "; ".join(misnamed[:6])))
+        if unread:
+            subs.append(sub("the status line was readable for every press", False,
+                            f"no name read for {len(unread)} presses: {', '.join(unread[:6])}", na=True))
         s.press("selector", 0.4)
         wait_settled(s, 1.5, 20)
         image = s.image("p4")

@@ -63,6 +63,66 @@ class LayerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a regular file"):
             guest.find_layer(self.images, "/root/pdj/missing")
 
+    def test_a_layer_longer_than_the_units_boot_read_is_refused_at_unpack(self):
+        """The initramfs reads a fixed length per layer, so a layer past its limit would be silently truncated on the
+        unit: unpack refuses it and says how much to cut, while a layer exactly at the limit imports (stock 1.60 is)."""
+        import prepare
+        archive = self.images / "rootfs2.tar.gz"
+        size = archive.stat().st_size
+        self.assertEqual(prepare.check_boot_read(archive, size, "rootfs2.tar.gz"), size)
+        with self.assertRaises(ValueError) as caught:
+            prepare.check_boot_read(archive, size - 1, "rootfs2.tar.gz")
+        message = str(caught.exception)
+        self.assertIn(f"rootfs2.tar.gz is {size} bytes", message)
+        self.assertIn(f"at most {size - 1} bytes", message)
+        self.assertIn("cut 1 byte", message)
+        self.assertNotIn("cut 1 bytes", message)
+        self.assertEqual(prepare.check_boot_read(archive, None), size)          # a layer without a known limit
+        for bad in (0, -1, True, "2422834"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "not a positive byte count"):
+                prepare.check_boot_read(archive, bad, "rootfs2.tar.gz")
+        root = self.dir / "unpacked"
+        root.mkdir()
+        with self.assertRaises(ValueError):
+            prepare.unpack_layer(archive, root, boot_read_limit=size - 1)
+        self.assertEqual(prepare.unpack_layer(archive, root, boot_read_limit=size), 0)
+        self.assertTrue((root / "etc/file2").is_file())
+
+    def test_assembling_an_update_applies_the_limits_only_to_the_enforced_layers(self):
+        import prepare
+        root = self.dir / "assembled"
+        root.mkdir()
+        sizes = {path.name: path.stat().st_size for path in self.images.glob("*.tar.gz")}
+
+        def layout(**limits):
+            return {"tar_layers": [{"file": f"rootfs{n}.tar.gz", "root": "/",
+                                    **({"max_boot_read_bytes": limits[f"rootfs{n}.tar.gz"],
+                                        "enforce_boot_read": True} if f"rootfs{n}.tar.gz" in limits else {})}
+                                   for n in range(1, 5)]}
+        self.assertEqual(prepare.assemble(self.images, root, "extractor", layout()), 0)
+        with self.assertRaises(ValueError):
+            prepare.assemble(self.images, root, "extractor", layout(**{"rootfs2.tar.gz": sizes["rootfs2.tar.gz"] - 1}))
+        # A limit that is recorded but not enforced does not refuse the layer.
+        loose = {"tar_layers": [{"file": "rootfs2.tar.gz", "root": "/",
+                                 "max_boot_read_bytes": sizes["rootfs2.tar.gz"] - 1, "enforce_boot_read": False}]}
+        self.assertEqual(prepare.assemble(self.images, root, "extractor", loose), 0)
+
+    def test_a_repacked_layer_that_grows_past_the_boot_read_is_refused(self):
+        """A repack that grows pdj.tar.gz even by one byte would be truncated on the unit, so the packer refuses it
+        after the rewrite and before the layer replaces the base one."""
+        target = self.dir / "pdj.tar.gz"
+        guest.rewrite_tar_gz(self.images / "pdj.tar.gz", target, {APP: b"appMOD LAB\0"}, ("root",))
+        size = target.stat().st_size
+        layer = {"file": "pdj.tar.gz", "root": "/root", "max_boot_read_bytes": size, "enforce_boot_read": True}
+        self.assertEqual(guest.check_repacked_layer(target, layer), size)
+        with self.assertRaises(ValueError) as caught:
+            guest.check_repacked_layer(target, {**layer, "max_boot_read_bytes": size - 1})
+        self.assertIn(f"pdj.tar.gz is {size} bytes", str(caught.exception))
+        self.assertIn("cut 1 byte", str(caught.exception))
+        self.assertEqual(guest.check_repacked_layer(target, {**layer, "max_boot_read_bytes": size - 1,
+                                                              "enforce_boot_read": False}), size)
+        self.assertEqual(guest.check_repacked_layer(target, {"file": "pdj.tar.gz"}), size)
+
     def test_rewrite_is_deterministic_and_keeps_other_members(self):
         new = b"appMOD LAB\0"
         a, b = self.dir / "a.tar.gz", self.dir / "b.tar.gz"
