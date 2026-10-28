@@ -401,7 +401,7 @@ final class AudioSink {
         if let offset = offsetNs { clock["offset_ns"] = offset }
         var result: [String: Any] = ["mode": output == nil ? (writeFiles ? "file" : "counters") : (writeFiles ? "both" : "coreaudio"), "connected": connected, "packets": packets, "bytes": bytes, "seq_gaps": seqGaps,
                 "bad_packets": badPackets, "clock": clock, "latency_ms": latency.summary(), "late_over_20ms": late20,
-                "late_log": lateLog, "streams": out]
+                "late_log": lateLog, "monitor": monitorJack.rawValue, "streams": out]
         if let output = output { result["output"] = output.snapshot() }
         return result
     }
