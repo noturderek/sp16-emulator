@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-53 checks (HW-01..HW-53; HW-47..HW-53 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
+53 checks (HW-01..HW-54; HW-47..HW-54 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
@@ -145,12 +145,13 @@ CHECKS = [
           ["home.title_regex"], ["HW-01"]),
     Check("HW-53", "Factory test", "Page 3: three WAKE UP passes record a held pad's calibration, only inside the valid range", "X",
           ["calibration.pads", "calibration.range", "calibration.default"]),
+    Check("HW-54", "Factory test", "Page 8: the MIDI CHECK touch button runs the DIN MIDI loopback to OK", "X"),
 ]
-TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51", "HW-53")
+TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51", "HW-53", "HW-54")
 EXTRA_IDS = ("HW-47",) + TESTMODE_IDS + ("HW-52",)
 CHECK_BY_ID = {check.id: check for check in CHECKS}
 SMOKE_IDS = tuple(c.id for c in CHECKS if c.tier == "S")
-assert len(CHECKS) == 53 and len(SMOKE_IDS) == 16
+assert len(CHECKS) == 54 and len(SMOKE_IDS) == 16
 
 
 def checks_hash():
@@ -1202,6 +1203,26 @@ def testmode_goto(session, page, timeout=120.0):
         session.press("home" if (page - current) % TESTMODE_PAGES <= TESTMODE_PAGES // 2 else "back", 0.3)
         time.sleep(1.0)
     return False
+
+
+# Page 8 (DEVICE TEST): the MIDI CHECK touch button (about (115, 112)) opens /dev/ttymxc1 twice, writes a 4-byte
+# pattern, polls 2 s and reads it back through the DIN MIDI loopback (service manual); the page then shows
+# "MIDI CHECK : OK" (the colon is drawn as a box on some revisions, so the separator is loose).
+MIDI_CHECK_OK = re.compile(r"MIDI\s*CHECK[\s:\[\]=]*OK", re.I)
+
+
+def wait_midi_check(session, timeout=30.0):
+    """Poll page 8's OCR until the MIDI CHECK status reads OK; (ok, last text). The loopback poll alone takes 2 s,
+    and a loaded host stretches the redraw, so the default timeout is generous."""
+    deadline = time.monotonic() + timeout
+    text = ""
+    while True:
+        text = norm(ocr(session.image("midi"), psm=6, scale=3))
+        if MIDI_CHECK_OK.search(text):
+            return True, text
+        if time.monotonic() > deadline:
+            return False, text
+        time.sleep(.5)
 
 
 # Page 4 (button test): controls with a lamp (pads, steps and 16 more buttons) count towards LED-BUTTON n/48; MODE and
@@ -3770,7 +3791,8 @@ class Runner:
             for hw in wanted:
                 self.verdicts[hw] = verdict(hw, "N/A", "precondition: no --testmode-build (a build made with --app-arg testmode)")
             return
-        checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51, "HW-53": self.hw53}
+        checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51,
+              "HW-53": self.hw53, "HW-54": self.hw54}
         pid = None
         try:
             # The firmware this build will boot must be the profile's (a library can hold another one under the same id).
@@ -4032,6 +4054,20 @@ class Runner:
         wait_settled(s, 1.5, 30)
         self.shots_into(subs, "testmode-page3-lcd", s.image("p3"))
         return from_subresults("HW-53", subs)
+
+    def hw54(self):
+        """Test page 8 (DEVICE TEST): tap the MIDI CHECK touch button and expect the DIN MIDI loopback to read OK."""
+        s = self.session
+        subs = [self.testmode_page_is(8, "device test")]
+        if subs[-1]["status"] != "PASS":
+            return from_subresults("HW-54", subs)
+        wait_settled(s, 1.5, 30)
+        s.tap(115, 112)
+        ok, text = wait_midi_check(s)
+        subs.append(sub("tapping the MIDI CHECK button shows MIDI CHECK OK", ok, text))
+        wait_settled(s, 1.5, 30)
+        self.shots_into(subs, "testmode-page8-lcd", s.image("p8"))
+        return from_subresults("HW-54", subs)
 
     # ------------------------------------------------------------------ HW-42, HW-44, HW-45, HW-24
     def library_files(self):
@@ -4522,7 +4558,7 @@ def main(argv=None):
     parser.add_argument("--firmware", help="firmware id in the build's library (default: the session's)")
     parser.add_argument("--control-build", help="build made with --uncalibrated sharing the library (HW-24 control)")
     parser.add_argument("--testmode-build", help="build made with --app-arg testmode, for the factory test page checks "
-                                                 "(HW-48..HW-51 and HW-53, extra tier); its firmware must be the "
+                                                 "(HW-48..HW-51 and HW-53..HW-54, extra tier); its firmware must be the "
                                                  "profile's, or the run is refused")
     parser.add_argument("--testmode-skip", type=testmode_skip_arg, default=[],
                         help="comma-separated controls HW-49 leaves unpressed (pad1..pad16, step1..step16, track, mode, "
