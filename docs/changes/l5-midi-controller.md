@@ -90,7 +90,7 @@ second commit. Files: `emulator/midi_bridge/` (`__init__`, `__main__`, `midi`, `
 `presets`, `bridge`, `coremidi-io.swift`, `tests/test_midi_bridge.py`) and this document. No existing file was edited.
 
 Checks (grade O unless noted):
-- `python3 -m unittest emulator.midi_bridge.tests.test_midi_bridge` -> `Ran 54 tests ... OK`, 54 of 54, including a
+- `python3 -m unittest emulator.midi_bridge.tests.test_midi_bridge` -> `Ran 61 tests ... OK`, 61 of 61, including a
   round trip through a virtual CoreMIDI source and destination (note, CC and the reverse direction), four messages sent
   in one packet list, and a 300-message list run through the helper's receive path (`coremidi-io decode`).
   Review fixes since the first hand-back are covered by tests: a transport tap still pending at exit, `scale` for every

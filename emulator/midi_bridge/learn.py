@@ -4,8 +4,8 @@
 against a CoreMIDI port and against a scripted list in the tests.
 
 A knob is told apart from its encodings by the byte values a turn produces (v = the 7-bit controller value):
-  absolute   many distinct values spread over the range
-  twos       two's complement: +n is n, -n is 128-n        (1, 2 / 127, 126)
+  absolute   many distinct values spread over the range, or distinct values near the top that never repeat
+  twos       two's complement: +n is n, -n is 128-n        (1, 2 / 127, 126; 127, 127, 127 alone)
   signmag    sign and magnitude: +n is n, -n is 64+n       (1, 2 / 65, 66)
   offset     binary offset: +n is 64+n, -n is 64-n         (65, 66 / 63, 62)
 One direction alone cannot always settle it (1,1,1 reads as twos or signmag), so a turn that is still ambiguous asks
@@ -37,17 +37,37 @@ def relative_delta(encoding, value, invert=False):
     return -delta if invert else delta
 
 
+def repeats(values, count=3):
+    """Whether one value comes `count` times in a row. A moving absolute knob never sends the same value twice running,
+    an encoder turned slowly sends the same step again and again."""
+    run = 1
+    for before, now in zip(values, values[1:]):
+        run = run + 1 if now == before else 1
+        if run >= count:
+            return True
+    return False
+
+
 def classify(values):
-    """Controller values seen while one knob turned -> ("absolute", None), ("relative", encoding) or (None, None) when the
-    values do not settle it yet."""
+    """Controller values seen while one knob turned (in the order they came) -> ("absolute", None), ("relative", encoding)
+    or (None, None) when the values do not settle it yet.
+
+    A knob is called relative only on evidence an absolute knob cannot produce: values on both sides of the encoding
+    (some small, some near the top, nothing between), or, for the values near the top alone, the same value repeating.
+    Distinct values near the top that never repeat (127, 126, 125) are an absolute knob turned down."""
+    values = list(values)
     seen = set(values)
     if not seen:
         return None, None
     low, twos, sign, off = (any(v in r for v in seen) for r in (LOW, TWOS_NEG, SIGN_NEG, OFFSET_NEG))
     if seen <= set(LOW) | set(TWOS_NEG) and twos and low:
         return "relative", "twos"
-    if seen <= set(TWOS_NEG) and twos:
-        return "relative", "twos"
+    if seen <= set(TWOS_NEG):
+        if repeats(values):
+            return "relative", "twos"
+        if len(seen) >= 3:
+            return "absolute", None
+        return None, None                           # one or two values: an encoder's -1, -2 or a knob just touched
     if seen <= set(LOW) | set(SIGN_NEG) and sign and low:
         return "relative", "signmag"
     if seen <= set(OFFSET_NEG) | set(SIGN_NEG) and sign and off:

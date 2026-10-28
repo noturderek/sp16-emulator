@@ -79,8 +79,28 @@ class ClassifyTests(unittest.TestCase):
 
     def test_one_direction_can_be_unsettled(self):
         self.assertEqual(learn.classify([1, 1, 2, 1]), (None, None))      # twos or sign-magnitude
-        self.assertEqual(learn.classify([127, 126]), ("relative", "twos"))   # only two's complement goes there
+        self.assertEqual(learn.classify([127, 126]), (None, None))       # an encoder's -1, -2 or an absolute knob: not yet
+        self.assertEqual(learn.classify([1, 1, 1]), (None, None))         # one direction of twos or sign-magnitude
+        self.assertEqual(learn.classify([65, 65, 65]), (None, None))      # positive offset or negative sign-magnitude
         self.assertEqual(learn.classify([]), (None, None))
+
+    def test_absolute_knob_near_the_top_is_not_an_encoder(self):
+        self.assertEqual(learn.classify(list(range(127, 112, -1))), ("absolute", None))   # 127 down to 113
+        self.assertEqual(learn.classify([127, 126, 125]), ("absolute", None))             # a monotonic run
+        self.assertEqual(learn.classify([113, 115, 118, 122, 127]), ("absolute", None))
+        self.assertEqual(learn.classify(list(range(49, 80))), ("absolute", None))        # a sweep across the middle
+
+    def test_two_complement_encoder_is_relative_on_the_evidence(self):
+        self.assertEqual(learn.classify([1, 2, 1, 127, 126, 127]), ("relative", "twos"))  # both directions
+        self.assertEqual(learn.classify([127, 126, 125, 127, 127, 127]), ("relative", "twos"))   # one direction, repeats
+        self.assertEqual(learn.classify([127, 127, 127]), ("relative", "twos"))
+        self.assertEqual(learn.classify([127, 127, 126, 127, 127]), (None, None))         # never three in a row: unsure
+        self.assertEqual(learn.classify([1, 127]), ("relative", "twos"))
+
+    def test_other_encodings_still_classify(self):
+        self.assertEqual(learn.classify([1, 2, 3, 65, 66, 65]), ("relative", "signmag"))
+        self.assertEqual(learn.classify([65, 66, 65, 63, 62, 63]), ("relative", "offset"))
+        self.assertEqual(learn.classify([63, 62, 63, 65, 66]), ("relative", "offset"))
 
     def test_relative_delta(self):
         self.assertEqual([learn.relative_delta("twos", v) for v in (1, 2, 127, 126)], [1, 2, -1, -2])
@@ -121,6 +141,36 @@ class LearnTests(unittest.TestCase):
         self.assertEqual(profile["outputs"]["pad1"]["number"], 40)       # a pad's LED is its own note by default
         self.assertEqual(mapping["lamps"], {"pad1": "pad1"})
         prof.validate_mapping(mapping, profile)
+
+    def learn_knob(self, rounds):
+        """learn_one for a knob that sends `rounds`: lists of values, a pause long enough to end each between them."""
+        script = []
+        for values in rounds:
+            script += [(1.5 if script else 0.2, M("cc", 0, 16, values[0]))]
+            script += [(0.05, M("cc", 0, 16, v)) for v in values[1:]]
+        read, clock = self.reader(script)
+        said = []
+        return learn.learn_one("knob1", read, said.append, timeout=2.0, clock=clock), said
+
+    def test_absolute_knob_turned_down_from_127_learns_as_absolute(self):
+        spec, _ = self.learn_knob([list(range(127, 112, -1))])
+        self.assertEqual((spec["kind"], spec.get("encoding")), ("absolute", None))
+
+    def test_encoder_turned_both_ways_learns_as_relative(self):
+        spec, _ = self.learn_knob([[1, 1, 2, 1], [127, 126, 127]])
+        self.assertEqual((spec["kind"], spec["encoding"]), ("relative", "twos"))
+
+    def test_encoder_streams_in_one_direction_learn_as_relative(self):
+        spec, said = self.learn_knob([[127, 127, 127, 126, 127]])
+        self.assertEqual((spec["kind"], spec["encoding"]), ("relative", "twos"))
+        self.assertEqual(len(said), 1)                                    # settled at once: nothing to ask
+        spec, said = self.learn_knob([[1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]])
+        self.assertEqual((spec["kind"], spec["encoding"]), ("relative", "twos"))
+        self.assertTrue(any("assuming two's complement" in line for line in said), said)   # the guess is said aloud
+
+    def test_offset_encoder_learns_as_offset(self):
+        spec, _ = self.learn_knob([[65, 66, 65, 63, 62, 63]])
+        self.assertEqual((spec["kind"], spec["encoding"]), ("relative", "offset"))
 
     def test_silence_is_skipped(self):
         read, clock = self.reader([])
