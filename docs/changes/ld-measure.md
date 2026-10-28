@@ -2,7 +2,7 @@
 title: "Lane D1: live audio and timing measurements"
 description: "What the live-measurement lane observed in a running emulator: the HW-46 confirming run, the AK4458 transport-word to jack table, the residual panel-frame stall and the filter-send probe, with the commands and recordings behind each number."
 type: report
-status: active
+status: complete
 created: 2026-10-28
 tags: [sp16, emulator, audio, timing, lane-d1]
 author:
@@ -220,3 +220,126 @@ The bridge side needs nothing: its own worst gap stayed under the limit in both 
 Before and after, for the record: 164 ms maximum (20 s run, before that lane) → 76.5 ms (one frame in 4098, after its
 bridge and App Nap fixes) → 21.9 ms with no stall over 40 ms in 4137 frames on a quiet host, and 46.9 ms with three in
 4144 when another emulator shares the machine.
+
+## 4. The Pre/Post FX send: parked at the first boundary it could not cross
+
+`pt-i44.58` asks for the pending and applied filter config, the TrackUnit send predicates and the channel peaks around
+the send mute at `0x1caa54`, read out of the running app, and for a recipe showing enum 1/2, an unmuted send, nonzero
+track channels 4/5 and nonzero send PCM. **This is parked, not done.** What follows is what was measured, and why the
+rest needs a debugger rather than another run.
+
+### What was measured (O)
+
+New tool, `emulator/probes/filter_send.py`. It plays a full-scale tone on a track, samples the send stream
+(`hw:ak4452audio,1`), the master stream and the shim's analog-filter loop counters while the pad sounds, then presses
+ACTIVE and does it again:
+
+```sh
+python3 emulator/probes/filter_send.py run --build ld-measure
+```
+
+Run folder `build/ld-measure/filter-send/20261028-112535`. Both passes, ACTIVE off and ACTIVE on:
+
+| figure | ACTIVE off | ACTIVE on |
+|---|---|---|
+| master stream peak (`hw:ak4458audio,0`) | 1.0 | 1.0 |
+| send stream peak (`hw:ak4452audio,1`) | **0.0** | **0.0** |
+| send stream nonzero frames | **0** | **0** |
+| shim loop `send_peak` | 0.0 | 0.0 |
+| shim loop `return_peak` | 0.0 | 0.0 |
+
+So with a tone at full scale on the master bus and the filter button in either state, the send stream never carries a
+single frame and the shim's loop sees nothing arriving on its send side. This is the same figure HW-46 records
+informationally (`send_peak 0`, "the app left the send playback silent in every insert setting tried") and the same
+one the transport-word measurement found on the master frame (section 2: words 4/5 are only ever written by the factory
+test's MODE1, never by ordinary playback).
+
+**The first silent boundary is therefore at or above the send bus, and it is not the send DAC, the loop or the PCM
+transport:** the factory test's MODE2 drives the very same send DAC and return ADC and comes back with the tone
+(section 2, words 0/2 at 0.0542, dominant 1030 Hz), so the whole analog path beyond the app works. What is silent is
+the app's own writing of the send pair.
+
+### Why it is parked
+
+The remaining half of the acceptance is not reachable from outside the process. `enum 1/2` (+0x61c), the mute mode
+(`*(track+0x130)+0x84`), the selected object's `+0x39` and `+0x24`, `TrackUnit+0x60c` and the manager's
+pending/applied config (`+0xd0`, `+0xe4`, `+0xbc`) are all in the OEM app's heap, and this emulator exposes no way to
+read them short of a debugger: the only runtime window is `--trace gdb` with `emulator/gdb-bridge.py`, which needs a
+new build, an ARM-aware client and a symbol-free probe at those offsets. Two more things also have to be true first,
+and neither was established by this lane:
+
+- The filter has to be **assigned to the track** in the app's UI, which is a menu recipe the 1.60 profile does not
+  carry; `filter_send.py --setup-recipe NAME` is the hook for it. Without that assignment the app may be silent by
+  design, which is exactly the ambiguity the task is about, so the run above cannot by itself distinguish "never
+  assigned" from "assigned and still silent".
+- The `+0x39` predicate's UI meaning is a firmware-reading question, not a measurement (the reading lane left it
+  unresolved too).
+
+There is no emulator-side fix to make here, and the task explicitly forbids a forced callback or unmute patch, so
+nothing was changed. The run was taken once with the tool as committed; a second pass after the refactor gave the same
+zeros.
+
+### What the next attempt needs
+
+1. Build with `--research --trace gdb` and bridge the stub (`emulator/gdb-bridge.py --build NAME`).
+2. Drive the UI to assign the analog filter to a track (this is the missing recipe) with Pre FX, then Post FX, in both
+   ACTIVE states, and record what the profile's `filter_send` recipe would have to press.
+3. Read, per state: manager `+0xd0`/`+0xe4`/`+0xbc`/`+0x104`, `TrackUnit+0x60c`, `TrackUnit+0x61c`, the selected
+   object's `+0x39` and `+0x24`, and `*(track+0x130)+0x84`. Those settle enum 1/2 and the mute directly.
+4. Only then take peaks from `filter_send.py`, which already reports the send stream and the loop from the host side.
+
+## Cross-lane requests
+
+Each needs a file this lane does not own.
+
+1. **`emulator/native-window.swift`: timestamp and write the TX log off the socket-reader thread's lock.** Section 3
+   localises the residual panel-frame stalls to the hop between the bridge's receive and the app's log line: the
+   bridge's worst gap was 36.5 ms with none over 40 ms while the app logged three over 40 ms, worst 46.9 ms. In
+   `writeTxLog` the shared `lock` is taken and the file is written inside it, on the thread that reads the socket, and
+   the timestamp is only taken after the lock is granted, so any other holder of that lock shows up as a stall in the
+   log. Suggested change, in the spirit of that file's own note:
+   - take the timestamp where the message is read, before `handleMessage`, and pass it in;
+   - append to the log on its own serial queue (a small `[String]` buffer drained there, or a `DispatchIO`), so the
+     socket thread never waits on the file;
+   - format the 128 bytes with a table lookup instead of `String(format:)` per byte, which is 128 formats per frame at
+     about 66 frames a second.
+   Then re-run section 3's command; the target is `stalls_over_limit 0` and `stall_hop none` with another emulator
+   running.
+2. **`emulator/hwsuite.py`: HW-35 does not pass on this branch and its first sub-check cannot pass as written.**
+   Section 1: mono lamp 34 (`over_led`) never lights for a full-scale sampler playback in nine seconds of sampled
+   frames, in three runs and both orders, while the audio itself reaches the master channels at 32767. The service
+   manual grades that lamp an app-driven output following the digital master peak, so either the lamp role is wrong or
+   the app never raises its clip detector here. Whoever owns the suite should decide which, and either fix the role or
+   split the check. Nothing in this lane touched the audio path, and the failure reproduces on the untouched tree.
+3. **`emulator/profiles/sp16-1.60.json`: a `filter_send` recipe** that assigns the analog filter to a track and
+   chooses Pre FX / Post FX. Section 4 needs it and cannot proceed without it; this lane could not derive it from the
+   UI without the recipe it is trying to build.
+
+## Hand-back
+
+Checks are run from the repository root. "Quick set" is the brief's list of 14 modules.
+
+| Task | Commit | Files | Checks and results |
+|---|---|---|---|
+| 1. HW-46 with HW-35 | `9f65418` | `docs/changes/ld-measure.md` | `./sp16 hwsuite --build ld-measure --only HW-35,HW-46`: HW-46 **PASS** 20.58 s, five of five sub-checks; the same pair in the other order, HW-46 **PASS** 20.69 s; HW-35 FAIL in both and alone (see cross-lane request 2); quick set, Ran 445 tests, OK |
+| 2. Transport words | `2fefd66` | `probes/ak4458_transport.py`, `tests/test_sp16_ak4458_transport.py`, `docs/changes/ld-measure.md` | `test_sp16_ak4458_transport`: Ran 16, OK; `ak4458_transport.py run --build ld-measure-tap` over four modes, 176400 of 176400 frames usable in each; quick set, OK |
+| 3. Residual stall | `339893d` | `timing_probe.py`, `tests/test_sp16_timing_probe.py`, `docs/changes/ld-measure.md` | `test_sp16_timing_probe`: Ran 22, OK (four new); two 60 s probe runs, 21.9 ms / 0 stalls on a quiet host and 46.9 ms / 3 stalls beside another emulator, hop `bridge-to-app`; quick set plus both new modules, Ran 483, OK |
+| 4. Filter send | this commit | `probes/filter_send.py`, `tests/test_sp16_filter_send.py`, `docs/changes/ld-measure.md` | `test_sp16_filter_send`: Ran 8, OK; two live runs, send stream 0.0 peak and 0 nonzero frames with ACTIVE on and off; **parked** (section 4) |
+
+Side effects: builds made, all under the git-ignored `build/`: `build/ld-measure` (research, `--audio file`) and
+`build/ld-measure-tap` (research, `--audio file`, `--trace pcmtap`, `--app-arg testmode`). Sessions started and stopped
+by exact app PID through `hwsuite.launch`/`hwsuite.stop`: three hwsuite runs, three transport-word runs, two timing
+runs and two filter-send runs, every one of them stopped by its own `finally` block. No process started by another
+lane was touched (another lane's `build/testbench` and `build/ls-midi` emulators were left running).
+
+Not run: `./sp16 test` (owner rule: never the full suite; the brief's quick set and each changed module were run
+instead), the end-to-end smoke test and the Swift type check (no Swift file of this lane's changed — the one Swift
+change this lane asks for is cross-lane request 1), `emulator/arm-contracts.sh` (no shim or contract file changed).
+
+Parked: task 4 (section 4). Cross-lane requests: three, above.
+
+Open questions for the owner: (a) whether HW-35's OVER lamp is meant to follow the master peak on this firmware at all
+(cross-lane request 2); (b) whether the 3 % rise of the tone through the analog loop in MODE2 (1000.01 Hz in, 1030.16
+Hz out) is the shim's loop rate or the firmware's send path — it is a research-hardware question and it makes the send
+path's fidelity, not just its silence, uncertain; (c) whether a normal-playback tap of the send DAC is wanted as a
+permanent suite check, which would have caught the silent send without a debugger.
