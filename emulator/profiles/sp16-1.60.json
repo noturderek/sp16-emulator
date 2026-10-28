@@ -1621,8 +1621,8 @@
     "known_failing": [
       {
         "check": "HW-35",
-        "reason": "the OVER lamp (mono 34) never lights at full-scale playback: the master reaches 0.0 dBFS on both channels, but the firmware's level detector sees about 5 dB less than on 2026-10-12, which keeps the ~-0.9 dBFS threshold out of reach",
-        "gap": "the same 0 dBFS sample at track volume 102 measures -5.52 dBFS now vs -0.65 dBFS on 2026-10-12 (E14)",
+        "reason": "OVER is the firmware's ClipMeter on the DSI drive input (threshold 1.8 = +5.1 dBFS, 500 ms hold): a full-scale master stays 5.1 dB below the threshold, so the lamp correctly stays dark, and no drive-overload test exists yet that pushes the DSI drive input past +5.1 dBFS",
+        "gap": "no check drives the DSI drive input past +5.1 dBFS (a 0 dBFS master peaks at 1.0, below the 1.8 threshold)",
         "owner": "owner",
         "date": "2026-10-28"
       }
