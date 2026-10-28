@@ -673,6 +673,10 @@ RUN_OPTS = [
     Opt("--no-ui-input", "Bench mode for unattended runs: the window ignores clicks, drags, scrolling, keys and "
         "accessibility actions (a badge says so) and opens in the background without taking focus; the research "
         "control socket, LCD snapshots and panelshots work as usual.", flag=True),
+    Opt("--net", "Give the guest a network card (Pro DJ Link): none (default); host (the socket_vmnet host network, "
+        "bridge100 on this Mac); bridged:IF (for example bridged:en0, the real network); mcast[:PORT] (no root: links "
+        "emulators on this Mac only). host and bridged need the socket_vmnet daemon running; each start gets its own MAC.",
+        "MODE"),
     Opt("--no-audio-files", "Audio builds (--audio file or both): keep reading and counting the guest's audio (metrics) "
         "but write no WAV into the session folder, for unattended runs that read no audio (about 28 MB a minute "
         "otherwise).", flag=True),
@@ -2924,9 +2928,10 @@ def make_commands():
         "run", "Build and run", "Launch a built emulator app",
         "Opens build/NAME with `open -n`; close the window to stop the emulator. The first boot of each firmware "
         "creates a 1 GB data image for it in the library; projects and settings persist there.",
-        opts=RUN_OPTS, usage="./sp16 run [--name NAME] [--firmware ID] [--usb-image PATH | --no-usb] [--ephemeral] [--dev-overlay DIR] [--no-ui-input] [--no-audio-files]",
+        opts=RUN_OPTS, usage="./sp16 run [--name NAME] [--firmware ID] [--usb-image PATH | --no-usb] [--ephemeral] [--dev-overlay DIR] [--no-ui-input] [--no-audio-files] [--net MODE]",
         examples=["./sp16 run", "./sp16 run --name sp16-dev --firmware ID",
                   "./sp16 run --usb-image ~/sticks/other.img", "./sp16 run --no-usb", "./sp16 run --ephemeral",
+                  "./sp16 run --net host   # a NIC on the socket_vmnet host network",
                   "./sp16 run --name sp16-dev --ephemeral --no-ui-input   # unattended, scripted through ./sp16 ctl"],
         notes=["If the build does not exist, the error names the `./sp16 build` command that creates it.",
                "When build/stick.img exists (see `./sp16 usb`) it is attached as the virtual USB stick unless you give "

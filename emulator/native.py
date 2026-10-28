@@ -383,7 +383,11 @@ def bundle(output, qemu, guest, variant="stock", profile=None, research=False, t
     (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
     sessions = output / "sessions"
     sessions.mkdir(mode=0o700, exist_ok=True)
-    defaults = {"qemu": str(qemu),
+    # QEMU starts through a small wrapper that adds the NIC `./sp16 run --net` asks for (no-op without it).
+    wrapper = output / NET_WRAPPER
+    shutil.copy2(TOOLS / "net" / NET_WRAPPER, wrapper)
+    wrapper.chmod(0o700)
+    defaults = {"qemu": str(wrapper),
                 "arguments": arguments(qemu, guest, "@SOCKET@", trace, persistent, audio, True, padcal, app_arg),
                 "session": str(sessions), "socket": "@SOCKET@", "variant": variant,
                 "profile": profile or "", "research": research}
@@ -529,11 +533,58 @@ def dev_overlay_path(folder):
     return str(path)
 
 
+NET_WRAPPER = "qemu-net.sh"
+NET_IFACE = re.compile(r"[a-z]{1,8}[0-9]{1,3}")
+NET_MCAST_GROUP = "230.0.0.1"
+NET_MCAST_PORT = 34567
+VMNET_DIRECTORIES = ("/opt/homebrew/var/run", "/usr/local/var/run", "/var/run")
+NET_MODES = "none, host, bridged:IF (for example bridged:en0) or mcast[:PORT]"
+
+
+def vmnet_socket_path(name):
+    """The socket_vmnet daemon socket called `name` (Homebrew's service: <prefix>/var/run/socket_vmnet), or None."""
+    for directory in VMNET_DIRECTORIES:
+        candidate = Path(directory) / name
+        if candidate.is_socket():
+            return str(candidate)
+    return None
+
+
+def net_environment(mode):
+    """`launch --net MODE` -> the environment the QEMU wrapper reads (net/qemu-net.sh), {} for no network.
+    host and bridged:IF need the root socket_vmnet daemon to be running (the user starts it, see docs/changes/l4-network.md);
+    mcast needs nothing and links instances on this Mac only."""
+    if mode in (None, "none"):
+        return {}
+    if mode == "host" or mode.startswith("bridged:"):
+        iface = mode.partition(":")[2]
+        if mode != "host" and not NET_IFACE.fullmatch(iface):
+            raise ValueError("--net bridged:IF needs an interface name such as bridged:en0")
+        name = "socket_vmnet" if mode == "host" else f"socket_vmnet.bridged.{iface}"
+        path = vmnet_socket_path(name)
+        if path is None:
+            raise ValueError(f"--net {mode}: the socket_vmnet daemon is not running (no {name} socket in "
+                             f"{', '.join(VMNET_DIRECTORIES)}). Start it first (see docs/changes/l4-network.md), or use "
+                             "--net mcast, which needs no root and links emulators on this Mac only")
+        if "," in path:
+            raise ValueError("socket_vmnet path must not contain commas")
+        return {"SP16_NET_KIND": "unix", "SP16_NET_TARGET": path}
+    if mode == "mcast" or mode.startswith("mcast:"):
+        port = mode.partition(":")[2] or str(NET_MCAST_PORT)
+        if not port.isdigit() or not 1024 <= int(port) <= 65535:
+            raise ValueError("--net mcast:PORT needs a port from 1024 to 65535")
+        return {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": f"{NET_MCAST_GROUP}:{port}"}
+    raise ValueError(f"--net must be {NET_MODES}")
+
+
 def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overlay=None, no_ui_input=False,
-           no_audio_files=False):
+           no_audio_files=False, net=None):
     host_check()
     output = private_path(output)
     assets = validated_assets(output)
+    net_env = net_environment(net)
+    if net_env and not (output / NET_WRAPPER).is_file():
+        raise ValueError("--net needs a build made by this version; rebuild it with ./sp16 build --rebuild")
     if dev_overlay is not None and not (assets.get("decoupled") is True and assets.get("research")):
         raise ValueError("--dev-overlay needs a decoupled research build")
     if firmware_id is not None:
@@ -556,8 +607,10 @@ def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overla
         + (["--firmware", firmware_id] if firmware_id else []) \
         + (["--dev-overlay", dev_overlay_path(dev_overlay)] if dev_overlay else []) \
         + (["--no-ui-input"] if no_ui_input else []) + (["--no-audio-files"] if no_audio_files else [])
-    run(["open", "-n", *(["-g"] if no_ui_input else []), assets["app_bundle"], *(["--args", *app_args] if app_args else [])])
-    print(json.dumps({"status": "native_app_opened", "app": assets["app_bundle"],
+    env_args = [arg for key, value in net_env.items() for arg in ("--env", f"{key}={value}")]
+    run(["open", "-n", *(["-g"] if no_ui_input else []), *env_args, assets["app_bundle"],
+         *(["--args", *app_args] if app_args else [])])
+    print(json.dumps({"status": "native_app_opened", "app": assets["app_bundle"], **({"net": net} if net_env else {}),
                       "diagnostics": str(output / "sessions"), "runtime_requires_docker": False}))
 
 
@@ -695,6 +748,9 @@ def main():
     launcher.add_argument("--no-ui-input", action="store_true",
                           help="bench mode: the window ignores clicks, drags, scrolling, keys and accessibility actions "
                                "and opens without taking focus (open -g); the research control socket still works")
+    launcher.add_argument("--net", metavar="MODE", default="none",
+                          help="guest network (Pro DJ Link): " + NET_MODES + ". host and bridged need the socket_vmnet "
+                               "daemon; mcast links emulators on this Mac without root. Default: none")
     launcher.add_argument("--no-audio-files", action="store_true",
                           help="audio builds: the sink keeps reading and counting the guest's PCM (metrics) but "
                                "writes no WAV into the session folder")
@@ -732,7 +788,7 @@ def main():
             return diagnostics_command(args)
         else:
             launch(args.output, args.ephemeral, args.usb_image, args.firmware, args.dev_overlay, args.no_ui_input,
-                   args.no_audio_files)
+                   args.no_audio_files, args.net)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"native emulator failed: {exc}\n")
 
