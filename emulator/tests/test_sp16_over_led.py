@@ -1,5 +1,7 @@
 """Tests for emulator/probes/over_led.py: which lamp channels a window lit, and what one pass reports."""
 import argparse
+import contextlib
+import io
 import json
 import shutil
 import sys
@@ -106,6 +108,26 @@ class PassFiguresTest(unittest.TestCase):
         self.assertEqual(figures["peak"], 549)
         self.assertLess(figures["peak_dbfs"], -30)
         self.assertEqual(figures["over_lit"], False)
+
+
+class LabelTests(unittest.TestCase):
+    """What a report line says when there was nothing to measure, as opposed to a measured zero."""
+
+    def test_a_gain_with_no_reading_reads_na(self):
+        self.assertEqual(over_led.gain_label(None, None), "MAIN OUT gain n/a")
+
+    def test_agreeing_gain_bounds_read_as_one_value(self):
+        self.assertEqual(over_led.gain_label(1.0, 1.0), "MAIN OUT gain 1.0")
+
+    def test_a_dip_reads_as_a_range(self):
+        self.assertEqual(over_led.gain_label(0.25, 1.0), "MAIN OUT gain 0.25..1.0")
+
+    def test_a_measured_level_reads_with_its_unit(self):
+        self.assertEqual(over_led.level_label(-36.72), "-36.72 dBFS")
+        self.assertEqual(over_led.level_label(0.0), "0.0 dBFS")  # full scale is a value, not silence
+
+    def test_a_silent_window_reads_silent(self):
+        self.assertEqual(over_led.level_label(None), "silent")
 
 
 class VerdictTest(unittest.TestCase):
@@ -228,13 +250,14 @@ class SweepTests(unittest.TestCase):
     """`run()`'s order: the warm-up strike comes before the first measured pass, and the control is labelled by the
     level it measured."""
 
-    def sweep(self):
+    def sweep(self, quiet_extra=None):
         order = []
         figures = {"peak": 32767, "window_samples": 132000, "nonzero_samples": 132000, "peak_dbfs": 0.0,
                    "near_full_scale_samples": 132000, "over_lit": False, "over_frames": 0,
                    "over_first_s_after_loud_sample": None, "mono_channels_lit": [6, 25], "tx_frames": 60,
                    "main_out_gain_min": 1.0, "main_out_gain_max": 1.0, "shim_out_peak": 1.0}
         quiet = dict(figures, peak=549, peak_dbfs=-35.5, near_full_scale_samples=0, shim_out_peak=0.0168)
+        quiet.update(quiet_extra or {})
 
         class Runner:
             def __init__(self, *args):
@@ -313,26 +336,45 @@ class SweepTests(unittest.TestCase):
                    mock.patch.object(over_led.time, "sleep", lambda seconds: None)]
         for patcher in patches:
             patcher.start()
+        printed = io.StringIO()
         try:
-            return over_led.run(args), order
+            with contextlib.redirect_stdout(printed):
+                report = over_led.run(args)
         finally:
             for patcher in reversed(patches):
                 patcher.stop()
+        return report, order, printed.getvalue()
 
     def test_the_warm_up_strike_runs_before_the_first_measured_pass(self):
-        report, order = self.sweep()
+        report, order, _ = self.sweep()
         self.assertEqual(order[0], ("warm-up", 3))
         self.assertEqual(order[1], ("volume", 127))
         self.assertEqual(order[2], ("window", "hw-tone-full.wav"))
         self.assertEqual(list(report["passes"]), ["full@127", "control"])
 
     def test_the_control_is_labelled_by_the_level_it_measured(self):
-        report, _ = self.sweep()
+        report, _, _ = self.sweep()
         control = report["passes"]["control"]
         self.assertTrue(control["control"])
         self.assertEqual(control["peak_dbfs"], -35.5)
         self.assertEqual(control["label"], "-30 dBFS fixture control (measured -35.5 dBFS)")
         self.assertNotIn("m30", report["passes"])  # no pass is named after the fixture's nominal level
+
+    def test_a_silent_control_is_labelled_silent_not_none(self):
+        # the first strike of a run is silent, so a control that measures nothing is a real outcome, not a missing one
+        report, _, printed = self.sweep(quiet_extra={"peak": 0, "peak_dbfs": None, "nonzero_samples": 0,
+                                                     "main_out_gain_min": None, "main_out_gain_max": None,
+                                                     "shim_out_peak": None})
+        self.assertEqual(report["passes"]["control"]["label"],
+                         "-30 dBFS fixture control (measured silent)")
+        self.assertIn("measured silent", printed)
+        self.assertNotIn("measured None", printed)
+
+    def test_a_pass_with_no_gain_reading_prints_na(self):
+        _, _, printed = self.sweep(quiet_extra={"main_out_gain_min": None, "main_out_gain_max": None,
+                                                "shim_out_peak": None})
+        self.assertIn("main_out_gain=MAIN OUT gain n/a", printed)
+        self.assertNotIn("gain None", printed)
 
 
 if __name__ == "__main__":

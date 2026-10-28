@@ -12,8 +12,10 @@ For each track volume it plays a full-scale tone from a pad strike at velocity 1
 the master stream's peak (the sink WAV, so a real sample value) and every TX frame's mono lamp set. A discarded
 warm-up strike runs first, because the first strike of a run is silently dropped. The last pass plays the -30 dBFS
 fixture as the control that must stay dark, labelled by the level it actually measured. Each pass also records the shim's board-model evidence
-(`main_out_gain`, its own MAIN-pair output peak) so the report can say where a level shortfall is: a neutral
-`main_out_gain` of 1.0 and a shim peak equal to the WAV peak mean the shim copied the firmware's samples byte-for-byte
+(the MAIN OUT law's gain as both bounds, `main_out_gain_min` and `main_out_gain_max`, plus its own MAIN-pair output
+peak) so the report can say where a level shortfall is: a neutral
+`main_out_gain_min` of 1.0 equal to `main_out_gain_max` and a shim peak equal to the WAV peak mean the shim copied the
+firmware's samples byte-for-byte
 and the level is the firmware's own track-volume -> master path, not the emulator's MAIN OUT law, limiter, 16-channel
 send or S24 conversion. The report says per pass whether mono 34 ever lit and which mono channels did, so a role error
 (the wrong channel), a level error (a peak that never reaches the threshold) and a firmware that simply never raises
@@ -49,11 +51,13 @@ def lit_channels(decoded):
 def board_evidence(board, carried=None):
     """The shim's own view of the level path over one window, from the board model's `analog levels` metrics.
 
-    `main_out_gain` is the gain the MAIN OUT law applied (1.0 = neutral, i.e. the control was never moved);
-    `shim_out_peak` is the peak the shim's output meter saw on the MAIN pair, over the same samples the sink WAV
-    holds. A neutral gain and a `shim_out_peak` equal to the WAV peak mean the shim copied the firmware's samples
-    byte-for-byte, so any level shortfall is upstream of the shim (the firmware's own track-volume -> master path),
-    not in the emulator's board model. A gain below 1.0, or an out_peak below the WAV peak, points at the shim.
+    `main_out_gain_min` and `main_out_gain_max` are the two bounds of the gain the MAIN OUT law applied over the
+    window (1.0 = neutral, i.e. the control was never moved; both printed as one label by `gain_label`, and `n/a`
+    when the window carried no gain reading); `shim_out_peak` is the peak the shim's output meter saw on the MAIN
+    pair, over the same samples the sink WAV holds. A neutral pair of bounds and a `shim_out_peak` equal to the WAV
+    peak mean the shim copied the firmware's samples byte-for-byte, so any level shortfall is upstream of the shim
+    (the firmware's own track-volume -> master path), not in the emulator's board model. Bounds below 1.0, or an
+    out_peak below the WAV peak, point at the shim.
 
     The shim's output meter is a peak-hold the bridge reports every ~2 s, so a window can open on the previous
     report's carried-over peak, not this window's. Readings equal to `carried` (the peak read just before the
@@ -149,8 +153,17 @@ def shim_matches(peak, wanted):
 
 
 def gain_label(low, high):
-    """One MAIN OUT gain label for the report: one value when the two bounds agree, a range when the window dipped."""
+    """One MAIN OUT gain label for the report: `n/a` when the window carried no gain reading at all (nothing was
+    measured, which is not a gain of None), one value when the two bounds agree, a range when the window dipped."""
+    if low is None and high is None:
+        return "MAIN OUT gain n/a"
     return f"MAIN OUT gain {low}" if low == high else f"MAIN OUT gain {low}..{high}"
+
+
+def level_label(dbfs):
+    """One measured level for the report: `-36.72 dBFS`, or `silent` for a window whose peak was 0. A silent window
+    measured zero, so the label says so instead of printing `None`, which reads as a missing reading."""
+    return "silent" if dbfs is None else f"{dbfs} dBFS"
 
 
 def divergent_passes(passes):
@@ -228,7 +241,7 @@ def run(args):
             figures = pass_figures(seen)
             figures.update(wanted=wanted, read_back=level)
             passes[f"full@{wanted}"] = figures
-            print(f"volume {wanted} (read back {level}): peak={figures['peak']} ({figures['peak_dbfs']} dBFS) "
+            print(f"volume {wanted} (read back {level}): peak={figures['peak']} ({level_label(figures['peak_dbfs'])}) "
                   f"near-full samples={figures['near_full_scale_samples']} over_lit={figures['over_lit']} "
                   f"over_frames={figures['over_frames']} mono lit={figures['mono_channels_lit']} "
                   f"main_out_gain={gain_label(figures['main_out_gain_min'], figures['main_out_gain_max'])} "
@@ -239,7 +252,7 @@ def run(args):
         # the fixture is -30 dBFS on paper but the measured level is what the report must name
         measured = control["peak_dbfs"]
         control.update(wanted=None, read_back=level, control=True,
-                       label=f"-30 dBFS fixture control (measured {measured} dBFS)")
+                       label=f"-30 dBFS fixture control (measured {level_label(measured)})")
         passes["control"] = control
         print(f"{control['label']}: peak={control['peak']} over_lit={control['over_lit']} "
               f"mono lit={control['mono_channels_lit']} "
