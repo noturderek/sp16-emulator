@@ -18,6 +18,7 @@
 #define DIN_CAPACITY_REQUEST UINT32_MAX
 #define ARM_EVENT_SIZE 28
 #define MAX_PROXY_CLIENTS 8
+#define MAX_CONTROL_CLIENTS 16
 struct bytes { uint8_t data[CAPACITY]; unsigned head, size; };
 struct wire { struct bytes normal, realtime; uint64_t next; unsigned dropped; };
 static int enqueue(struct wire *wire, const uint8_t *data, unsigned size) {
@@ -173,18 +174,26 @@ static int control_listener(void) {
     }
     return fd;
 }
-static void receive_control(int listener,struct wire *wire) {
+static void accept_controls(int listener,int clients[MAX_CONTROL_CLIENTS]) {
     for (int i=0;i<32;i++) {
-        int fd=accept4(listener,NULL,NULL,SOCK_CLOEXEC);
+        int fd=accept4(listener,NULL,NULL,SOCK_CLOEXEC|SOCK_NONBLOCK);
         if (fd<0) break;
-        struct timeval timeout={.tv_sec=0,.tv_usec=100000};
-        (void)setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof timeout);
-        uint32_t request;
-        ssize_t n=recv(fd,&request,sizeof request,0);
-        int32_t result=n==(ssize_t)sizeof request ? din_request(wire,request) : -EINVAL;
-        (void)send(fd,&result,sizeof result,MSG_NOSIGNAL);
-        close(fd);
+        int slot=-1;
+        for (int j=0;j<MAX_CONTROL_CLIENTS;j++) if (clients[j]<0) { slot=j; break; }
+        if (slot<0) { close(fd); continue; }
+        clients[slot]=fd;
     }
+}
+static void receive_control(int *fd,struct wire *wire) {
+    uint32_t request;
+    ssize_t n=recv(*fd,&request,sizeof request,MSG_DONTWAIT);
+    if (n<0 && (errno==EAGAIN || errno==EINTR)) return;
+    if (n>0) {
+        int32_t result=n==(ssize_t)sizeof request ? din_request(wire,request) : -EINVAL;
+        (void)send(*fd,&result,sizeof result,MSG_NOSIGNAL|MSG_DONTWAIT);
+    }
+    close(*fd);
+    *fd=-1;
 }
 static uint64_t mono_ns(void) {
     struct timespec t;
@@ -216,7 +225,7 @@ int main(void) {
     if (proxy<0) { perror("SP16_DIN sequencer proxy"); return 1; }
     int count=snd_seq_poll_descriptors_count(seq,POLLIN);
     if (count<1 || count>15) return 1;
-    struct pollfd pollfds[20+MAX_PROXY_CLIENTS];
+    struct pollfd pollfds[20+MAX_PROXY_CLIENTS+MAX_CONTROL_CLIENTS];
     snd_seq_poll_descriptors(seq,pollfds,count,POLLIN);
     pollfds[count]=(struct pollfd){.fd=serial,.events=POLLIN};
     pollfds[count+1]=(struct pollfd){.fd=control,.events=POLLIN};
@@ -224,6 +233,8 @@ int main(void) {
     pollfds[count+3]=(struct pollfd){.fd=usb,.events=POLLIN};
     struct proxy_client clients[MAX_PROXY_CLIENTS];
     for (int i=0;i<MAX_PROXY_CLIENTS;i++) clients[i]=(struct proxy_client){.fd=-1};
+    int controls[MAX_CONTROL_CLIENTS];
+    for (int i=0;i<MAX_CONTROL_CLIENTS;i++) controls[i]=-1;
     struct wire wire={0};
     struct bytes usb_output={0};
     unsigned long received=0,sent=0;
@@ -236,9 +247,14 @@ int main(void) {
         pollfds[count+3].events=POLLIN|(usb_output.size?POLLOUT:0);
         for (int i=0;i<MAX_PROXY_CLIENTS;i++)
             pollfds[count+4+i]=(struct pollfd){.fd=clients[i].fd,.events=POLLIN};
-        int ready=ppoll(pollfds,count+4+MAX_PROXY_CLIENTS,&timeout,NULL);
+        for (int i=0;i<MAX_CONTROL_CLIENTS;i++)
+            pollfds[count+4+MAX_PROXY_CLIENTS+i]=(struct pollfd){.fd=controls[i],.events=POLLIN};
+        int ready=ppoll(pollfds,count+4+MAX_PROXY_CLIENTS+MAX_CONTROL_CLIENTS,&timeout,NULL);
         if (ready<0) { if (errno==EINTR) continue; break; }
-        if (pollfds[count+1].revents&POLLIN) receive_control(control,&wire);
+        if (pollfds[count+1].revents&POLLIN) accept_controls(control,controls);
+        for (int i=0;i<MAX_CONTROL_CLIENTS;i++)
+            if (controls[i]>=0 && (pollfds[count+4+MAX_PROXY_CLIENTS+i].revents&(POLLIN|POLLHUP|POLLERR)))
+                receive_control(&controls[i],&wire);
         if (pollfds[count+2].revents&POLLIN) accept_proxies(proxy,clients);
         for (int i=0;i<MAX_PROXY_CLIENTS;i++)
             if (clients[i].fd>=0 && (pollfds[count+4+i].revents&(POLLIN|POLLHUP|POLLERR)))
@@ -294,6 +310,7 @@ int main(void) {
     unlink(DIN_CONTROL_PATH);
     unlink(SEQ_PROXY_PATH);
     for (int i=0;i<MAX_PROXY_CLIENTS;i++) if (clients[i].fd>=0) close(clients[i].fd);
+    for (int i=0;i<MAX_CONTROL_CLIENTS;i++) if (controls[i]>=0) close(controls[i]);
     snd_midi_event_free(encoder); snd_midi_event_free(decoder);
     snd_midi_event_free(usb_encoder); snd_seq_close(seq);
     return 1;

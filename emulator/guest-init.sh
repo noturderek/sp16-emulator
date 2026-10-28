@@ -184,8 +184,12 @@ PYDEV
     if [ -S /tmp/sp16-root/dev/sp16-din-control ] && [ -S /tmp/sp16-root/dev/sp16-seq-proxy ]; then sp16_din_ready=1; break; fi
     sleep .1
   done
-  if [ "$sp16_din_ready" != 1 ]; then echo 'SP16_DIN proxy=missing' > /dev/console; fi
-  echo 'SP16_DIN sequencer=started' > /dev/console
+  if [ "$sp16_din_ready" = 1 ]; then
+    echo 'SP16_DIN sequencer=started' > /dev/console
+  else
+    echo 'SP16_DIN proxy=missing' > /dev/console
+    echo 'SP16_DIN sequencer=missing' > /dev/console
+  fi
 else
   echo 'SP16_DIN sequencer=missing' > /dev/console
 fi

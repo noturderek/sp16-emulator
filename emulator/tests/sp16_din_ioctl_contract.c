@@ -19,6 +19,7 @@ int main(void) {
     assert(listener>=0);
     struct sockaddr_un address={.sun_family=AF_UNIX};
     strcpy(address.sun_path,path);
+    assert(unlink(path)==0 || errno==ENOENT);
     assert(bind(listener,(struct sockaddr *)&address,sizeof address)==0);
     assert(listen(listener,4)==0);
     assert(setenv("SP16_DIN_CONTROL",path,1)==0);
