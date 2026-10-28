@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -16,6 +17,7 @@
 #define CAPACITY 8192
 #define DIN_CONTROL_PATH "/tmp/sp16-root/dev/sp16-din-control"
 #define SEQ_PROXY_PATH "/tmp/sp16-root/dev/sp16-seq-proxy"
+#define USB_MODE_MARKER "/tmp/sp16-root/dev/sp16-usb-midi-enabled"
 #define DIN_CAPACITY_REQUEST UINT32_MAX
 #define ARM_EVENT_SIZE 28
 #define MAX_PROXY_CLIENTS 8
@@ -136,6 +138,21 @@ static void disable_usb(int *fd,struct bytes *queue,const char *reason) {
     close(*fd);
     *fd=-1;
     *queue=(struct bytes){0};
+}
+static const char *usb_mode_marker(void) {
+    const char *path=getenv("SP16_USB_MIDI_MODE_PATH");
+    return path && *path ? path : USB_MODE_MARKER;
+}
+/* Publish the g_midi peer before the app registers: on real hardware apl_start's `usb_gadget.sh midi probe` loads the
+ * gadget module and the kernel's seq_midi adapter registers the g_midi client first. The emulator does not run apl_start,
+ * so the bridge creates the mode marker itself once the USB MIDI transport is open; the preload shim advertises g_midi
+ * (client 129) while that marker exists. */
+static void publish_usb_peer(int usb) {
+    if (usb<0) return;
+    const char *path=usb_mode_marker();
+    int marker=open(path,O_CREAT|O_WRONLY|O_CLOEXEC,0600);
+    if (marker<0) fprintf(stderr,"SP16_USB_MIDI peer=failed path=%s errno=%d\n",path,errno);
+    else { close(marker); fprintf(stderr,"SP16_USB_MIDI peer=g_midi\n"); }
 }
 static int proxy_listener(void) {
     if (unlink_stale_socket(SEQ_PROXY_PATH)<0) {
@@ -302,6 +319,7 @@ int main(void) {
     if (serial<0) { perror("SP16_DIN virtio"); return 1; }
     struct bytes usb_output={0};
     int usb=open_usb("/dev/sp16-usb-midi");
+    if (usb>=0) publish_usb_peer(usb);
     snd_midi_event_t *usb_encoder=NULL;
     if (usb>=0 && snd_midi_event_new(4096,&usb_encoder)<0)
         disable_usb(&usb,&usb_output,"encoder-failed");
