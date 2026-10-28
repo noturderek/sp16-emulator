@@ -76,3 +76,90 @@ detector" from "the clip detector's result never reaches TX bit 34" needs the me
 that is the same class of probe as section 4, so it is written up there as an open question rather than guessed here.
 The probe script is `build/over_probe.py` (git-ignored; the checks are the `--only` runs above plus that script's
 `lit mono channel sets seen` line).
+
+## 2. The AK4458 transport words: what the app writes, per AUDIO TEST mode
+
+`pt-i44.61` asked for the sixteen transport words against the eight DAC outputs. The transport half is measured here;
+the DAC half is not decided by anything this emulator can show, and the reasons are below.
+
+### How
+
+The master stream is sixteen `S16_LE` channels per frame, and the host sink keeps only words 12..15 in its WAV, so the
+only way to see all sixteen is the shim's research PCM tap. New tool:
+
+```sh
+./sp16 build --name ld-measure-tap --research --audio file --trace pcmtap --app-arg testmode \
+    --library build/sp16/library --reuse-qemu-from build/qemu-source
+python3 emulator/probes/ak4458_transport.py run --build ld-measure-tap
+```
+
+It steps the factory test to page 11 (AUDIO TEST), sets the shim's input tone to slot 700 (about -18 dBFS, under the
+limiter, knobs left neutral), selects each mode in turn and prints one row per transport word. Run folder:
+`build/ld-measure-tap/ak4458-transport/20261028-101625` (the table is that folder's `ak4458-transport.json`). Each
+mode's capture is 176 400 frames, all usable, taken wholly inside the mode.
+
+Stimulus, as measured in the capture rather than assumed: the words MODE1 drives read a dominant frequency of
+**1000.01 Hz** with **0.9995** of their energy inside 1 kHz ± 150 Hz.
+
+### The table (peak per word, grade O)
+
+| word | pair | `none` (OFF) | MODE1 | MODE2 | MODE3 | driven by |
+|---|---|---|---|---|---|---|
+| 0 | 0 L | 0.0000 | 0.0473 | 0.0542 | 0.0000 | MODE1, MODE2 |
+| 1 | 0 R | 0.0000 | 1.0000 | 1.0000 | 0.0000 | — (full-scale noise) |
+| 2 | 1 L | 0.0000 | 0.0473 | 0.0542 | 0.0000 | MODE1, MODE2 |
+| 3 | 1 R | 0.0000 | 1.0000 | 1.0000 | 0.0000 | — |
+| 4 | 2 L | 0.0000 | 0.0473 | 0.0000 | 0.0000 | MODE1 |
+| 5 | 2 R | 0.0000 | 1.0000 | 0.0000 | 0.0000 | — |
+| 6 | 3 L | 0.0000 | 0.0473 | 0.0000 | 0.0000 | MODE1 |
+| 7 | 3 R | 0.0000 | 1.0000 | 0.0000 | 0.0000 | — |
+| 8 | 4 L | 0.0000 | 0.0473 | 0.0000 | 0.0000 | MODE1 |
+| 9 | 4 R | 0.0000 | 1.0000 | 0.0000 | 0.0000 | — |
+| 10 | 5 L | 0.0000 | 0.0473 | 0.0000 | 0.0000 | MODE1 |
+| 11 | 5 R | 0.0000 | 1.0000 | 0.0000 | 0.0000 | — |
+| 12 | 6 L | 0.0000 | 0.0473 | 0.0000 | **0.0473** | MODE1, MODE3 |
+| 13 | 6 R | 0.0000 | 1.0000 | 0.0000 | 1.0000 | — |
+| 14 | 7 L | 0.0000 | 0.0473 | 0.0000 | **0.0473** | MODE1, MODE3 |
+| 15 | 7 R | 0.0000 | 1.0000 | 0.0000 | 1.0000 | — |
+
+Read the even words only: **MODE1 puts the stimulus on 0, 2, 4, 6, 8, 10, 12 and 14; MODE2 on 0 and 2; MODE3 on 12
+and 14.** The untouched page leaves all sixteen at zero, and the tap does not even arm on it, which is positive
+evidence of silence rather than a missing capture.
+
+An independent cross-check inside the same runs: the shim's own meter on the MAIN pair (words 12 and 14, after MAIN
+OUT) reads 0.0473 in MODE1 and MODE3 and 0.0000 in MODE2, which is what the tap's words 12 and 14 read. The two
+instruments agree word for word.
+
+### The odd words are not silent
+
+Every even word that carries audio has its odd partner reading **exactly 1.0000** with 0.016 to 0.022 of its energy at
+the tone, against 0.9995 to 1.0000 for the tone words — i.e. full-scale noise across the band (the earlier note's
+"full-scale pattern near the top of the band", reproduced). When the even word is zero the odd word is exactly zero
+too, so the odd word is written only for the slots the app is using at that moment. That is a property of the app's
+own frame, not of the codec.
+
+### What this settles, and what stays U
+
+- **O:** which transport words the app writes audio into, per test mode (the table). Words 0/2 are the only pair
+  MODE2 isolates and words 12/14 the only pair MODE3 isolates, so the two pairs the emulator's jack map already
+  grades O are corroborated from the transport side.
+- **I, unchanged:** OUT3-4 on words 8/10 and OUT5-6 on words 4/6. MODE1 drives all four pairs and no mode separates
+  the middle two, so the slot order cannot be read off a mode. This lane adds no evidence either way and does not
+  promote them.
+- **S:** the shipped kernel programs sixteen 16-bit SSI slots per frame with the codec in its 8-channel TDM mode
+  (`docs/research/2026-10-28-sp16-firmware-gates/04-ak4458-pcm.md`, Control6 = `0x8d`), so one frame is eight channel
+  words of two halfwords. Which two slots form which DAC channel, and which half is left, is **not** in the GPL codec
+  driver (`sound/soc/codecs/ak4458.c` carries the register image and nothing about slot order), so it is **U**.
+- **U:** which DAC pin each channel word leaves on, and which jack each pin feeds. Neither is decided by anything the
+  firmware or this emulator contains. So a word-to-DAC-to-jack table cannot be completed from this side: it needs the
+  codec's TDM-to-DAC assignment plus the board's wiring, or a measurement on a unit. **The mapping stays U**, and the
+  emulator's monitor channels 12/14 stay an emulator observation (O for the transport word, U for the jack behind it).
+
+### One new observation on the analog loop
+
+MODE2 comes back through the send DAC and the return ADC, and its word 0 reads a dominant frequency of **1030.16 Hz**
+where MODE1 and MODE3 read 1000.01 Hz: a 3 % rise through the modelled loop, with 0.5835 of the energy left inside
+1 kHz ± 150 Hz and a level of 0.0542 instead of 0.0473. Grade O for the numbers, U for the cause — it is either the
+shim's loop rate or the firmware's send path, and this lane did not separate them. It matters for two things already
+recorded: HW-46's informational headphone levels, and the filter-send probe (section 4), whose return path is the same
+one.
