@@ -266,11 +266,17 @@ def run(args):
             hwsuite.stop(build, pid)
 
 
+def below(value, limit):
+    """True when value is a number under limit. Zero is a measurement (a perfect clock, no stall); None, which is what a
+    report without that figure holds, is not."""
+    return value is not None and value < limit
+
+
 def verdict(report):
     audio, tx = report.get("audio", {}), report.get("tx", {})
-    return {"onset_sigma_below_1ms": (audio.get("jitter_sigma_ms") or 99) < 1.0,
-            "tx_stall_max_below_40ms": (tx.get("stall_max_ms") or 999) < 40.0,
-            "audio_window_clean": not audio.get("gap_frames_in_window") and not audio.get("guest_drops_in_window")}
+    return {"onset_sigma_below_1ms": below(audio.get("jitter_sigma_ms"), 1.0),
+            "tx_stall_max_below_40ms": below(tx.get("stall_max_ms"), 40.0),
+            "audio_window_clean": audio.get("gap_frames_in_window") == 0 and audio.get("guest_drops_in_window") == 0}
 
 
 def main(argv=None):

@@ -136,6 +136,32 @@ class TxTests(unittest.TestCase):
         self.assertEqual(probe.verdict(bad), {"onset_sigma_below_1ms": False, "tx_stall_max_below_40ms": False,
                                               "audio_window_clean": False})
 
+    def test_zero_is_a_measurement_and_a_missing_figure_is_not(self):
+        perfect = {"audio": {"jitter_sigma_ms": 0.0, "gap_frames_in_window": 0, "guest_drops_in_window": 0},
+                   "tx": {"stall_max_ms": 0}}
+        self.assertEqual(probe.verdict(perfect), {"onset_sigma_below_1ms": True, "tx_stall_max_below_40ms": True,
+                                                  "audio_window_clean": True})
+        none_at_all = {"audio": {"error": "too few onsets"}, "tx": {"error": "too few frames"}}
+        self.assertEqual(probe.verdict(none_at_all), {"onset_sigma_below_1ms": False, "tx_stall_max_below_40ms": False,
+                                                      "audio_window_clean": False})
+        self.assertEqual(probe.verdict({}), {"onset_sigma_below_1ms": False, "tx_stall_max_below_40ms": False,
+                                             "audio_window_clean": False})
+
+    def test_the_limits_are_strict(self):
+        at_limit = {"audio": {"jitter_sigma_ms": 1.0, "gap_frames_in_window": 0, "guest_drops_in_window": 0},
+                    "tx": {"stall_max_ms": 40.0}}
+        under = {"audio": {"jitter_sigma_ms": 0.999, "gap_frames_in_window": 0, "guest_drops_in_window": 0},
+                 "tx": {"stall_max_ms": 39.9}}
+        self.assertEqual(probe.verdict(at_limit)["onset_sigma_below_1ms"], False)
+        self.assertEqual(probe.verdict(at_limit)["tx_stall_max_below_40ms"], False)
+        self.assertEqual(probe.verdict(under)["onset_sigma_below_1ms"], True)
+        self.assertEqual(probe.verdict(under)["tx_stall_max_below_40ms"], True)
+
+    def test_a_lost_frame_makes_the_window_unclean_whichever_counter_shows_it(self):
+        base = {"jitter_sigma_ms": 0.0}
+        self.assertFalse(probe.verdict({"audio": {**base, "gap_frames_in_window": 64, "guest_drops_in_window": 0}})["audio_window_clean"])
+        self.assertFalse(probe.verdict({"audio": {**base, "gap_frames_in_window": 0, "guest_drops_in_window": 64}})["audio_window_clean"])
+
 
 def load_bridge():
     """Counters, LinkTiming and board_line from the guest bridge (the module itself needs the guest's libraries)."""
