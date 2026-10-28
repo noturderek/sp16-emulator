@@ -1206,8 +1206,8 @@ def testmode_goto(session, page, timeout=120.0):
 
 
 # Page 8 (DEVICE TEST): the MIDI CHECK touch button (about (115, 112)) opens /dev/ttymxc1 twice, writes a 4-byte
-# pattern, polls 2 s and reads it back through the DIN MIDI loopback (service manual); the page then shows
-# The status sits to the right of the coloured button. OCR of the entire white page misses both button text and
+# pattern, polls 2 s and reads it back through the DIN MIDI loopback (service manual); the page then shows the result
+# to the right of the coloured button. OCR of the entire white page misses both button text and
 # status; the tight status crop reads the actual ---/OK glyphs reliably.
 MIDI_CHECK_STATUS_BOX = (200, 80, 260, 145)
 

@@ -522,20 +522,28 @@ static int rawmidi_write_byte(int fd,uint8_t byte,int nonblock) {
     while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
     uint64_t now=mono_ns();
     uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
-    struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
-    int slept;
-    do { slept=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); } while (slept==EINTR);
-    int error=slept;
-    if (!error) for (;;) {
+    int error=0;
+    if (nonblock) {
+        /* A nonblocking write must not spend the wire slot before it knows the port can take the byte: try it first and
+         * hand back EAGAIN at once, leaving the slot for the byte that does go out. */
         ssize_t wrote=original_write(fd,&byte,1);
-        if (wrote==1) break;
-        error=wrote==0 ? EIO : errno;
-        if (error!=EAGAIN || nonblock) break;
-        struct pollfd ready={ .fd=fd,.events=POLLOUT };
-        if (poll(&ready,1,-1)<0 && errno!=EINTR) { error=errno; break; }
-        error=0;
+        if (wrote!=1) error=wrote==0 ? EIO : errno;
+    } else {
+        struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
+        int slept;
+        do { slept=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); } while (slept==EINTR);
+        error=slept;
+        if (!error) for (;;) {
+            ssize_t wrote=original_write(fd,&byte,1);
+            if (wrote==1) break;
+            error=wrote==0 ? EIO : errno;
+            if (error!=EAGAIN) break;
+            struct pollfd ready={ .fd=fd,.events=POLLOUT };
+            if (poll(&ready,1,-1)<0 && errno!=EINTR) { error=errno; break; }
+            error=0;
+        }
     }
-    rawmidi_next_ns=target;
+    if (!error) rawmidi_next_ns=target; /* only a byte that went out takes the UART slot */
     __sync_lock_release(&rawmidi_wire_lock);
     return error ? -error : 0;
 }
@@ -794,8 +802,10 @@ static void note_ioctl(unsigned long request, enum device kind) {
 /* Fake eth0 (SP16_FAKE_ETH0=1, set with the factory test mode): the guest has only lo, but the DEVICE TEST page
  * (page 8) reads the MAC (retrying with 250 ms sleeps until bytes 3..5 are not all zero) and the IP of eth0 on the
  * UI thread, so without an interface it never returns. Every value below is fake: a locally administered MAC
- * (02:00:5e:10:00:01), 192.0.2.16/24 (TEST-NET-1) and an interface that is up. Link data (SIOCETHTOOL) is not
- * faked: it fails with EOPNOTSUPP. Off in normal runs, where eth0 stays absent. */
+ * (02:00:5e:10:00:01), 192.0.2.16/24 (TEST-NET-1) and an interface that is up. Link data is fake for the carrier
+ * query only: with SP16_NET_GLINK set, SIOCETHTOOL ETHTOOL_GLINK answers 0/1 for eth0, because QEMU user-mode can
+ * reject a networked guest's own link query; every other SIOCETHTOOL request on the fake interface fails with
+ * EOPNOTSUPP. Off in normal runs, where eth0 stays absent. */
 #define SP16_SIOCGIFFLAGS 0x8913UL
 #define SP16_SIOCGIFADDR 0x8915UL
 #define SP16_SIOCGIFNETMASK 0x891bUL

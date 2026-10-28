@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +24,45 @@ static uint64_t ns(void) {
     assert(clock_gettime(CLOCK_MONOTONIC,&t)==0);
     return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;
 }
+
+/* A nonblocking write to a port that cannot take the byte returns EAGAIN without spending the 320 us wire slot: the
+ * shim used to sleep the slot first and only then discover that nothing could be written. A rawmidi port is opened
+ * once per process, so this runs in a child before the parent opens the PTY port. */
+static void nonblock_full_port_case(void) {
+    pid_t child=fork();
+    assert(child>=0);
+    if (!child) {
+        const char *full="/tmp/sp16-din-full.fifo";
+        unlink(full);
+        assert(mkfifo(full,0600)==0);
+        int filler=open(full,O_RDWR|O_NONBLOCK);
+        assert(filler>=0);
+        uint8_t fill[4096]={0};
+        for (;;) {
+            ssize_t n=write(filler,fill,sizeof fill);
+            if (n<0) { assert(errno==EAGAIN); break; }
+            assert(n>0);
+        }
+        assert(setenv("SP16_DIN_PORT",full,1)==0);
+        snd_rawmidi_t *out=NULL;
+        assert(snd_rawmidi_open(NULL,&out,"hw:snddinmidi,0",1)==0 && out);
+        assert(snd_rawmidi_nonblock(out,1)==0);
+        uint8_t byte=0x90;
+        uint64_t begin=ns();
+        for (int i=0;i<20;i++) assert(snd_rawmidi_write(out,&byte,1)==-EAGAIN);
+        /* 20 rejected bytes must not cost 20 wire slots (6.4 ms); a handful of syscalls is well under 2 ms. */
+        assert(ns()-begin<2000000ULL);
+        assert(snd_rawmidi_close(out)==0);
+        assert(close(filler)==0);
+        unlink(full);
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+}
+
 int main(void) {
+    nonblock_full_port_case();
     int master=posix_openpt(O_RDWR|O_NOCTTY);
     assert(master>=0 && grantpt(master)==0 && unlockpt(master)==0);
     char *slave=ptsname(master);
