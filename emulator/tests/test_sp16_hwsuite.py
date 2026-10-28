@@ -472,12 +472,19 @@ class TestmodePageTests(unittest.TestCase):
         self.assertEqual({hw: v["status"] for hw, v in runner.verdicts.items()}, {hw: "N/A" for hw in hwsuite.TESTMODE_IDS})
         self.assertTrue(all(v["reason"].startswith("precondition:") for v in runner.verdicts.values()))
 
-    def test_a_testmode_session_that_cannot_start_blocks_the_checks_and_stops_nothing_else(self):
+    def runner_with_testmode_build(self, tmp, app_sha=None, only=None):
+        """A runner whose testmode build is a one-firmware library (`fw-1`) with `app_sha` in its manifest: the
+        profile's by default. Returns (runner, testmode build folder, profile)."""
         profile_path = TOOLS / "profiles" / "sp16-1.60.json"
         profile = json.loads(profile_path.read_text())
+        build = self.library(Path(tmp) / "testmode", app_sha or profile["firmware"]["app_sha256"])
+        runner = hwsuite.Runner(profile, profile_path, tmp, "fw-1", tmp, tmp, "extra", only or list(hwsuite.TESTMODE_IDS),
+                                testmode_build=build)
+        return runner, build, profile
+
+    def test_a_testmode_session_that_cannot_start_blocks_the_checks_and_stops_nothing_else(self):
         with tempfile.TemporaryDirectory() as tmp:
-            runner = hwsuite.Runner(profile, profile_path, tmp, None, tmp, tmp, "extra", list(hwsuite.TESTMODE_IDS),
-                                    testmode_build=tmp)
+            runner, _, _ = self.runner_with_testmode_build(tmp)
             with mock.patch.object(hwsuite, "launch", side_effect=hwsuite.EnvError("a session is already running")), \
                     mock.patch.object(hwsuite, "stop") as stopped:
                 runner.testmode_checks()
@@ -486,17 +493,84 @@ class TestmodePageTests(unittest.TestCase):
         self.assertIn("already running", runner.verdicts["HW-49"]["reason"])
 
     def test_a_testmode_session_that_started_is_always_stopped_by_its_pid(self):
-        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
-        profile = json.loads(profile_path.read_text())
         with tempfile.TemporaryDirectory() as tmp:
-            runner = hwsuite.Runner(profile, profile_path, tmp, None, tmp, tmp, "extra", list(hwsuite.TESTMODE_IDS),
-                                    testmode_build=tmp)
+            runner, build, _ = self.runner_with_testmode_build(tmp)
             with mock.patch.object(hwsuite, "launch", return_value=(4242, Path(tmp) / "runtime.json", 1.0)), \
                     mock.patch.object(hwsuite, "Session", side_effect=hwsuite.SessionLost("control socket unavailable")), \
                     mock.patch.object(hwsuite, "stop") as stopped:
                 runner.testmode_checks()
-            stopped.assert_called_once_with(Path(tmp), 4242, timeout=90)
+            stopped.assert_called_once_with(build, 4242, timeout=90)
         self.assertEqual({v["status"] for v in runner.verdicts.values()}, {"BLOCKED"})
+
+    def test_a_testmode_build_with_the_profiles_firmware_is_launched_with_the_checked_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, build, profile = self.runner_with_testmode_build(tmp)
+            runner.firmware_id = None                 # the build's own selected firmware is the one that is checked
+            with mock.patch.object(hwsuite, "launch", return_value=(4242, Path(tmp) / "runtime.json", 1.0)) as launched, \
+                    mock.patch.object(hwsuite, "Session", side_effect=hwsuite.SessionLost("no socket")), \
+                    mock.patch.object(hwsuite, "stop"):
+                runner.testmode_checks()
+            launched.assert_called_once_with(build, "fw-1", None, ephemeral=True)
+        self.assertEqual(runner.notes["testmode_manifest"]["app_sha256"], profile["firmware"]["app_sha256"])
+
+    def test_a_testmode_build_holding_another_firmware_under_the_same_id_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, _, _ = self.runner_with_testmode_build(tmp, app_sha="0" * 64)
+            with mock.patch.object(hwsuite, "launch") as launched, mock.patch.object(hwsuite, "stop") as stopped:
+                runner.testmode_checks()
+            launched.assert_not_called()
+            stopped.assert_not_called()
+        self.assertEqual({hw: v["status"] for hw, v in runner.verdicts.items()}, {hw: "BLOCKED" for hw in hwsuite.TESTMODE_IDS})
+        self.assertTrue(all("does not match the profile" in v["reason"] for v in runner.verdicts.values()))
+        self.assertNotIn("testmode_manifest", runner.notes)
+
+    def test_a_run_is_refused_before_any_session_starts_when_the_testmode_firmware_is_not_the_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, _, profile = self.runner_with_testmode_build(tmp, app_sha="0" * 64, only=["HW-48"])
+            runner.build = self.library(Path(tmp) / "main", profile["firmware"]["app_sha256"])
+            with mock.patch.object(hwsuite, "launch") as launched, mock.patch.object(hwsuite.Runner, "main_session") as main:
+                with self.assertRaises(hwsuite.EnvError) as caught:
+                    runner.run()
+            launched.assert_not_called()
+            main.assert_not_called()
+        self.assertIn("testmode build's firmware does not match the profile", str(caught.exception))
+        self.assertEqual(runner.verdicts, {})
+
+    def test_a_testmode_session_running_another_firmware_than_the_checked_one_is_blocked_and_stopped(self):
+        session = mock.Mock(runtime={"audio": "file", "firmware": "fw-other"})
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, build, _ = self.runner_with_testmode_build(tmp)
+            with mock.patch.object(hwsuite, "launch", return_value=(4242, Path(tmp) / "runtime.json", 1.0)), \
+                    mock.patch.object(hwsuite, "Session", return_value=session), mock.patch.object(hwsuite, "stop") as stopped:
+                runner.testmode_checks()
+            stopped.assert_called_once_with(build, 4242, timeout=90)
+        self.assertEqual({v["status"] for v in runner.verdicts.values()}, {"BLOCKED"})
+        self.assertIn("runs firmware fw-other, not the checked fw-1", runner.verdicts["HW-48"]["reason"])
+
+    def test_an_unreadable_library_is_an_environment_error_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, build, _ = self.runner_with_testmode_build(tmp)
+            (build.parent / "lib" / "fw-1" / "manifest.json").write_text("not json")
+            with self.assertRaises(hwsuite.EnvError) as caught:
+                runner.check_firmware("the testmode build's", build, "testmode_manifest")
+            self.assertIn("cannot be read from its library", str(caught.exception))
+            (build.parent / "lib" / "fw-1" / "manifest.json").unlink()
+            with self.assertRaises(hwsuite.EnvError):
+                runner.check_firmware("the testmode build's", build, "testmode_manifest")
+
+    def test_the_result_names_the_testmode_firmware_that_was_checked(self):
+        import types
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, build, profile = self.runner_with_testmode_build(tmp)
+            runner.check_firmware("the testmode build's", build, "testmode_manifest")
+            runner.run_id, runner.fixture_hashes = "r", {}
+            args = types.SimpleNamespace(tier="extra", json_only=True)
+            result, _ = hwsuite.write_result(Path(tmp) / "result", runner, [], "start", args, b"{}")
+        run = result["run"]
+        self.assertEqual(run["testmode_build"], str(build))
+        self.assertEqual((run["testmode_firmware"]["id"], run["testmode_firmware"]["app_sha256"]),
+                         ("fw-1", profile["firmware"]["app_sha256"]))
+        self.assertEqual(len(run["testmode_firmware"]["manifest_sha256"]), 64)
 
     def test_only_extras_selected_means_no_main_session(self):
         self.assertTrue(all(hw in hwsuite.EXTRA_IDS for hw in hwsuite.select_checks("extra")))

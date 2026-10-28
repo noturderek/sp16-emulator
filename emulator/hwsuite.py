@@ -3690,13 +3690,18 @@ class Runner:
         checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51, "HW-53": self.hw53}
         pid = None
         try:
-            pid, self.runtime_path, _ = launch(self.testmode_build, self.firmware_id, None, ephemeral=True)
+            # The firmware this build will boot must be the profile's (a library can hold another one under the same id).
+            firmware_id = self.check_firmware("the testmode build's", self.testmode_build, "testmode_manifest")
+            pid, self.runtime_path, _ = launch(self.testmode_build, firmware_id, None, ephemeral=True)
             self.pid = pid
             # Many presses and snapshots: a loaded host can stall one answer for a minute, so wait longer than usual.
             self.session = Session(self.runtime_path, call_timeout=150)
             self.session.txlog(True)
             if self.session.runtime.get("audio") != "file":
                 raise EnvError("the testmode session must be built with --audio file")
+            running = self.session.runtime.get("firmware")
+            if running and running != firmware_id:
+                raise EnvError(f"the testmode session runs firmware {running}, not the checked {firmware_id}")
             for hw in wanted:
                 self.record(hw, checks[hw])
         except (EnvError, SessionLost, OSError) as error:
@@ -4214,17 +4219,31 @@ class Runner:
         self.firmware_id = self.firmware_id or self.session.runtime.get("firmware")
         self.check_firmware("the session's")
 
-    def check_firmware(self, whose):
-        """The firmware under test (its library manifest) must be the profile's: same application SHA-256."""
-        library = Path(json.loads((self.build / "assets.json").read_text())["library"])
-        manifest = json.loads((library / self.firmware_id / "manifest.json").read_text())
+    def check_firmware(self, whose, build=None, record="manifest"):
+        """The firmware under test must be the profile's: its library manifest, in `build` (the main one by default),
+        carries the profile's application SHA-256. Returns the firmware id that was checked: the run's, else the one the
+        build's library has selected. The manifest is kept in `notes[record]`."""
+        build = Path(build) if build else self.build
+        try:
+            library = Path(json.loads((build / "assets.json").read_text())["library"])
+            firmware_id = self.firmware_id or json.loads((library / "selected.json").read_text())["id"]
+            manifest_path = library / firmware_id / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            if not isinstance(manifest, dict):
+                raise ValueError("the manifest is not a JSON object")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise EnvError(f"{whose} firmware cannot be read from its library ({type(error).__name__}: {error})") from None
         if manifest.get("app_sha256") != self.p["firmware"]["app_sha256"]:
             raise EnvError(f"{whose} firmware does not match the profile (application SHA-256)")
-        self.notes["manifest"] = {k: manifest.get(k) for k in ("id", "app_sha256", "update", "image")}
-        self.notes["manifest"]["sha256"] = sha256_file(library / self.firmware_id / "manifest.json")
+        self.notes[record] = {k: manifest.get(k) for k in ("id", "app_sha256", "update", "image")}
+        self.notes[record]["sha256"] = sha256_file(manifest_path)
+        return firmware_id
 
     def run(self):
         others_before = {str(p): sha256_file(p) for p in self.library_files()} if self.need("HW-42") else {}
+        # The factory test checks must not report on another firmware than the profile's: refuse before any VM starts.
+        if self.testmode_build and any(self.need(hw) for hw in TESTMODE_IDS):
+            self.check_firmware("the testmode build's", self.testmode_build, "testmode_manifest")
         # Extras start their own throwaway sessions: with only those selected there is no main session to boot.
         if not all(hw in EXTRA_IDS for hw in self.selected) or self.given_runtime:
             self.main_session()
@@ -4297,12 +4316,16 @@ def write_result(out, runner, verdicts, started, args, profile_bytes):
     out = Path(out)
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     manifest = runner.notes.get("manifest") or {}
+    testmode = runner.notes.get("testmode_manifest") or {}
     result = {
         "suite": {"name": SUITE_NAME, "version": SUITE_VERSION, "checks_hash": checks_hash(),
                   "hardware_fingerprint": hardware_fingerprint()},
         "run": {"id": runner.run_id, "start": started, "end": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "tier": args.tier, "only": runner.only, "build": str(runner.build) if runner.build else None,
                 "control_build": str(runner.control_build) if runner.control_build else None,
+                "testmode_build": str(runner.testmode_build) if runner.testmode_build else None,
+                "testmode_firmware": ({"id": testmode.get("id"), "app_sha256": testmode.get("app_sha256"),
+                                       "manifest_sha256": testmode.get("sha256")} if testmode else None),
                 "firmware_id": runner.firmware_id, "firmware_version": runner.p["firmware"]["version"],
                 "firmware_image_sha256": (manifest.get("image") or {}).get("sha256"),
                 "manifest_sha256": manifest.get("sha256"), "app_sha256": manifest.get("app_sha256"),
@@ -4395,7 +4418,8 @@ def main(argv=None):
     parser.add_argument("--firmware", help="firmware id in the build's library (default: the session's)")
     parser.add_argument("--control-build", help="build made with --uncalibrated sharing the library (HW-24 control)")
     parser.add_argument("--testmode-build", help="build made with --app-arg testmode, for the factory test page checks "
-                                                 "(HW-48..HW-51, extra tier)")
+                                                 "(HW-48..HW-51 and HW-53, extra tier); its firmware must be the "
+                                                 "profile's, or the run is refused")
     parser.add_argument("--testmode-skip", default="", help="comma-separated controls HW-49 leaves unpressed: the "
                                                             "negative control, which must make that check fail")
     parser.add_argument("--shots", choices=("record", "compare"), help="screenshot regression: record stages this run's "
