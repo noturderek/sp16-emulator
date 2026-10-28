@@ -1,4 +1,7 @@
 """emulator/sync/pdl_sync.py: Pro DJ Link tempo -> MIDI clock and Ableton Link (Carabiner)."""
+import contextlib
+import io
+import socket
 import unittest
 from pathlib import Path
 import sys
@@ -77,6 +80,41 @@ class CarabinerTests(unittest.TestCase):
 
     def test_parse_status_refuses_an_incomplete_reply(self):
         self.assertIsNone(pdl.CarabinerLink.parse_status(b"{:peers 1 :bpm 120.0}"))
+
+    def test_tempo_and_phase_report_one_diagnostic_without_a_carabiner(self):
+        # a loopback port that nothing listens on: connect() gets ECONNREFUSED immediately
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        link = pdl.CarabinerLink(port=port)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(link.set_tempo(130.56))
+            self.assertFalse(link.force_beat_at_time(0.0, 12345678, 4))
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)  # one diagnostic, not one per call
+        self.assertIn(f"127.0.0.1:{port}", lines[0])
+        self.assertIn("Link tempo/phase sync is off", lines[0])
+        self.assertIsNone(link.sock)  # the refused socket is dropped, so a later send retries the connect
+        link.close()
+
+    def test_tempo_is_sent_when_a_carabiner_listens(self):
+        server = socket.create_server(("127.0.0.1", 0))
+        try:
+            link = pdl.CarabinerLink(port=server.getsockname()[1])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertTrue(link.set_tempo(130.56))
+            conn, _ = server.accept()
+            try:
+                self.assertEqual(conn.recv(64), b"set-tempo 130.560000\n")
+            finally:
+                conn.close()
+            link.close()
+            self.assertEqual(err.getvalue(), "")  # a listening Carabiner produces no diagnostic
+        finally:
+            server.close()
 
 
 class BridgeTests(unittest.TestCase):
