@@ -443,7 +443,9 @@ def tone(seconds, freq, amplitude, decay=None, tail=0.0, rate=RATE):
 
 
 def fixture_wavs():
-    """Spec 5.3 audio fixtures: name -> WAV bytes."""
+    """Spec 5.3 audio fixtures: name -> WAV bytes. Every name that states a level (`full` = 0 dBFS, `hw-tone440` =
+    -6 dBFS, `hw-tone-m30` = -30 dBFS) is pinned to it by test_sp16_hwsuite's fixture test: the level is the file's
+    own peak, not what a pass records after the device's track volume."""
     return {
         "hw-tone440.wav": wav_bytes(tone(6.0, 440.0, 10 ** (-6 / 20))),
         "hw-click.wav": wav_bytes(tone(0.08, 440.0, 10 ** (-6 / 20), decay=0.02, tail=2.0)),
