@@ -135,6 +135,12 @@ def validate(profile):
     _require(isinstance(absent, list) and all(isinstance(item, dict) and isinstance(item.get("capability"), str)
                                               and isinstance(item.get("reason"), str) for item in absent),
              "hardware.absent entries need capability and reason")
+    known_failing = (profile.get("hardware") or {}).get("known_failing", [])
+    _require(isinstance(known_failing, list) and all(
+        isinstance(item, dict) and isinstance(item.get("check"), str)
+        and isinstance(item.get("reason"), str) and isinstance(item.get("owner"), str)
+        and isinstance(item.get("date"), str) for item in known_failing),
+        "hardware.known_failing entries need check, reason, owner and date")
     # The output jacks are runtime data the monitor menu reads, so they are checked only when the profile carries the
     # audio section (a shipped copy may drop it).
     if profile.get("audio") is not None:

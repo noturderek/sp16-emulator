@@ -1617,7 +1617,16 @@
     "0x80047004"
   ],
   "hardware": {
-    "absent": []
+    "absent": [],
+    "known_failing": [
+      {
+        "check": "HW-35",
+        "reason": "the OVER lamp (mono 34) never lights at full-scale playback: the master reaches 0.0 dBFS on both channels, but the firmware's level detector sees about 5 dB less than on 2026-10-12, which keeps the ~-0.9 dBFS threshold out of reach",
+        "gap": "the same 0 dBFS sample at track volume 102 measures -5.52 dBFS now vs -0.65 dBFS on 2026-10-12 (E14)",
+        "owner": "owner",
+        "date": "2026-10-28"
+      }
+    ]
   },
   "button_effects": {
     "selector": {

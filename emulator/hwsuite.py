@@ -39,7 +39,7 @@ FINGERPRINT_SOURCES = ("hardware_stub.c", "guest-bridge.py", "panel.py", "panel_
 TIMING_CHECKS = ("HW-19", "HW-32", "HW-33", "HW-44")
 MAX_VMS = 3
 EXIT_OK, EXIT_FAIL, EXIT_BLOCKED, EXIT_ENV, EXIT_LOST = range(5)
-STATUSES = ("PASS", "FAIL", "N/A", "BLOCKED", "SKIP")
+STATUSES = ("PASS", "FAIL", "N/A", "BLOCKED", "SKIP", "KNOWN-FAIL")
 # "X" checks are extras outside verification: a full run never includes them (so a profile can still be marked verified
 # without a testmode build or a disposable session); `--tier extra`, or `--only` naming them, runs them.
 TIERS = {"smoke": ("S",), "core": ("S", "C"), "full": ("S", "C", "L"), "extra": ("X",)}
@@ -210,13 +210,23 @@ def absent_reason(profile, capability):
     return None
 
 
+def known_failing(profile, hw_id):
+    """The profile's declaration that a check is expected to fail (an owner sign-off that records the measured gap),
+    or None. A check marked here still runs and records its measured figures, but its FAIL verdict is re-labelled
+    KNOWN-FAIL so it does not block verification while the cause is investigated."""
+    for item in (profile.get("hardware") or {}).get("known_failing") or []:
+        if item.get("check") == hw_id:
+            return item
+    return None
+
+
 # ---------------------------------------------------------------------------------------------------- verdicts
 
 def verdict(hw_id, status, reason="", metrics=None, evidence=None, subresults=None, elapsed=0.0, load=None):
     if status not in STATUSES:
         raise ValueError(f"bad status {status!r}")
-    if status == "N/A" and not reason:
-        raise ValueError("N/A needs a reason")
+    if status in ("N/A", "KNOWN-FAIL") and not reason:
+        raise ValueError(f"{status} needs a reason")
     check = CHECK_BY_ID[hw_id]
     return {"id": hw_id, "area": check.area, "title": check.title, "tier": check.tier, "status": status,
             "reason": reason, "elapsed_s": round(elapsed, 2), "metrics": metrics or {}, "evidence": evidence or [],
@@ -289,7 +299,7 @@ def render_report(result):
         observed = (item["reason"] or "ok").replace("|", "/").replace("\n", " ")
         lines.append(f"| {item['id']} | {item['area']} | {item['status']} | {observed[:220]} | {item['elapsed_s']} |")
     for item in result["verdicts"]:
-        if item["status"] in ("FAIL", "BLOCKED"):
+        if item["status"] in ("FAIL", "BLOCKED", "KNOWN-FAIL"):
             lines += ["", f"## {item['id']} {item['status']}: {item['title']}", "", item["reason"] or "", ""]
             for s in item["subresults"]:
                 if s["status"] != "PASS":
@@ -4301,6 +4311,18 @@ class Runner:
             result = verdict(hw_id, "BLOCKED", f"runner could not complete the check: {type(error).__name__}: {error}")
         if result is None:
             return  # multi-phase check, finished later
+        if result["status"] == "FAIL":
+            declared = known_failing(self.p, hw_id)
+            if declared:
+                # An owner-declared expected failure: keep the measured figures (the sub-results already carry the live
+                # peak in dBFS), but record the declaration and re-label the verdict so verification still passes.
+                reason = (f"known-failing ({declared.get('owner', 'owner')}, {declared.get('date', '')}): "
+                          f"{declared.get('reason', '')}")
+                if declared.get("gap"):
+                    reason += f"; measured gap: {declared['gap']}"
+                result["status"] = "KNOWN-FAIL"
+                result["reason"] = reason
+                result["evidence"] = list(result.get("evidence") or []) + ["known-failing"]
         result["elapsed_s"] = round(time.monotonic() - t0, 2)
         result["load"] = {"start": load, "end": load_averages(), "vms": len(qemu_processes())}
         self.verdicts[hw_id] = result
@@ -4502,6 +4524,10 @@ def mark_verified(profile_path, result, result_path, result_sha256):
     unjustified = [v["id"] for v in na if v["reason"] not in absent and not v["reason"].startswith("precondition:")]
     if unjustified:
         raise EnvError(f"N/A without a declared hardware.absent reason: {unjustified}")
+    known = {item.get("check") for item in (profile.get("hardware") or {}).get("known_failing") or []}
+    undeclared = [v["id"] for v in result["verdicts"] if v["status"] == "KNOWN-FAIL" and v["id"] not in known]
+    if undeclared:
+        raise EnvError(f"KNOWN-FAIL without a declared hardware.known_failing entry: {undeclared}")
     if summary.get("needs_owner_signoff") and not profile.get("owner_signoff"):
         raise EnvError("more than five N/A need a maintainer's sign-off line (owner_signoff) in the profile")
     try:  # record the stored result relative to the repository (results live in the git-ignored private/ folder)
