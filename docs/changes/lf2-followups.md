@@ -24,9 +24,11 @@ builds were made in this worktree (`build/lf2`, and `build/lf2b` as the second e
 
 `emulator/native-window.swift`. `writeTxLog()` took the shared `lock`, formatted 128 bytes with 128 `String(format:)`
 calls and wrote the line to the file, all on the thread that reads the bridge socket, so any other lock holder or a
-slow disk showed up as a gap between panel frames. The timestamp is now taken where the frame is read (before the lock
-and the queue hop; `started` and `config` are immutable), formatting and the write happen on a dedicated serial queue,
-and the queue is drained and the handle closed on quit.
+slow disk showed up as a gap between panel frames. The bridge reader thread now does only two things: take the
+timestamp where the frame is read (before the lock and the queue hop; `started` and `config` are immutable) and copy
+the raw bytes into a `[UInt8]` the queue owns. All 128 hex conversions — built from a static hex-digit table, not
+`String(format:)` — and the file write happen on the dedicated serial queue, and the queue is drained and the handle
+closed on quit.
 
 - `cd emulator && xcrun swiftc -typecheck -parse-as-library $(python3 -c 'import native; print(" ".join(native.SWIFT_SOURCES))')`
   — no errors (the only output is the pre-existing macOS 27 deprecation warnings).
@@ -163,9 +165,9 @@ Checks: `test_sp16_cli` 92/92; `./sp16 help hwsuite` shows the new list; quick s
 ## Cross-lane requests
 
 1. **`docs/changes/ld-measure.md`** (lane `ld-measure`, not mine to edit): the residual-stall section names
-   `handleMessage`; the symbol is `handle(_:)` in `emulator/native-window.swift`. It also suggests formatting the 128
-   bytes with a table lookup; this lane kept `String(format:)` because it now runs on the log's own queue, off the
-   socket thread. If the reviewer wants the lookup too, that is a follow-up, not a blocker.
+   `handleMessage`; the symbol is `handle(_:)` in `emulator/native-window.swift`. Its other point — format the 128
+   bytes with a table lookup rather than 128 `String(format:)` calls — was right and is now implemented on the log's
+   own queue.
 2. **`docs/python-cli-and-setup.md:38`** still describes `./sp16 run --midi` as "CoreMIDI DIN bridge enabled" only; the
    command now starts the USB MIDI byte-stream bridge as well. `docstring`/help text is updated in `native.py` and
    `sp16emu.py`; the doc line needs an owner's edit because existing `docs/*.md` are outside this lane.
