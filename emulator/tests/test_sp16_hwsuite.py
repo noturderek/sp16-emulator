@@ -315,6 +315,65 @@ class ImageTests(unittest.TestCase):
         self.assertIsNone(hwsuite.highlighted_band(base, (0, 0, 100, 60)))
 
 
+class TrackSelectionTests(unittest.TestCase):
+    """`on_track`: HW-34 must not read a level from the VOLUME knob of a track nobody is playing."""
+
+    def runner(self, tmp):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        runner = hwsuite.Runner(json.loads(profile_path.read_text()), profile_path, tmp, None, tmp, tmp, "core",
+                                ["HW-34"])
+        runner.session = FakeSession()
+        return runner
+
+    def on_track(self, tiles):
+        """Run on_track with the tile screen reading `tiles` in turn; returns (result, calls made)."""
+        calls = []
+
+        def tile(image, probe):
+            calls.append("tile")
+            return tiles[min(len(calls) - 1, len(tiles) - 1)]
+
+        def select(track):
+            calls.append(("select", track))
+            return True
+
+        def home():
+            calls.append("home")
+            return True
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(tmp)
+            with mock.patch.object(hwsuite, "selected_tile", side_effect=tile), \
+                    mock.patch.object(hwsuite.Runner, "select_track", side_effect=select), \
+                    mock.patch.object(hwsuite.Runner, "go_home", side_effect=home):
+                return runner.on_track(1), calls
+
+    def test_a_track_that_is_selected_is_not_touched(self):
+        (selected, shown), calls = self.on_track([1])
+        self.assertEqual((selected, shown), (True, 1))
+        self.assertEqual(calls, ["tile"])
+
+    def test_the_wrong_track_is_selected_again(self):
+        """The reported bug: TRACK 7 was selected after the knob step, so the level never moved. on_track puts TRACK 1
+        back and says so."""
+        (selected, shown), calls = self.on_track([7, 1])
+        self.assertEqual((selected, shown), (True, 1))
+        self.assertEqual(calls, ["tile", ("select", 1), "tile"])
+
+    def test_a_track_that_stays_wrong_is_reported_not_guessed(self):
+        (selected, shown), _ = self.on_track([7, 7])
+        self.assertEqual((selected, shown), (False, 7))
+
+    def test_another_screen_is_looked_at_again_on_the_home_screen(self):
+        (selected, shown), calls = self.on_track([None, 1])
+        self.assertEqual((selected, shown), (True, 1))
+        self.assertEqual(calls, ["tile", "home", "tile"])
+
+    def test_an_unreadable_screen_is_not_selected_and_moves_nothing(self):
+        (selected, shown), calls = self.on_track([None, None])
+        self.assertEqual((selected, shown), (False, None))
+        self.assertEqual(calls, ["tile", "home", "tile"])
+
+
 class TestmodePageTests(unittest.TestCase):
     """The factory test page readers and the checks' gating, on synthetic LCD images."""
 

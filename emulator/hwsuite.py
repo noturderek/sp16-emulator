@@ -1639,6 +1639,24 @@ class Runner:
             time.sleep(1.2)
         return selected_tile(self.session.image("track"), probe) == track
 
+    def on_track(self, track):
+        """Whether the home screen shows `track` selected, re-selecting it once when it does not.
+
+        A track parameter belongs to the selected track: if the selection moved (a knob step or a menu the previous
+        recipe left behind), a VOLUME setting would land on another track while the pad still plays this one, and the
+        level would not change at all. Another screen, or one the probe cannot read, is looked at again on the home
+        screen; an unreadable tile screen is then reported as not selected rather than guessed.
+        Returns (selected, the track the screen showed)."""
+        probe = self.p["selector_probe"]
+        current = selected_tile(self.session.image("track"), probe)
+        if current is None:
+            self.go_home()
+            current = selected_tile(self.session.image("track"), probe)
+        if current is not None and current != track:
+            self.select_track(track)
+            current = selected_tile(self.session.image("track"), probe)
+        return current == track, current
+
     def load_sample(self, track, name):
         """Assign a fixture to a track with the profile's sample_load recipe (once per track and sample)."""
         if self.loaded.get(track) == name:
@@ -3212,6 +3230,10 @@ class Runner:
         volume = self.p["recipes"]["volume_knob"]
         self.set_knob("knob1", 100, volume["value_box"], volume["max"])
         self.go_home()
+        selected, shown = self.on_track(1)
+        if not selected:
+            return from_subresults("HW-34", [sub("TRACK 1 is selected before the tone hit", False,
+                                                 f"the home screen showed TRACK {shown}")])
         left, right, data = self.hit_capture("pad1", 100, seconds=7.0, pre=0.5)
         subs = []
         threshold = max(64, peak(left) * 0.05)
@@ -3241,15 +3263,25 @@ class Runner:
         same = peak(right[span[0]:span[1]]) > 0.5 * peak(body)
         subs.append(sub("sound on the declared channels only", not leak and same,
                         f"other channels with the tone {leak}; right peak {peak(right)}"))
-        levels = []
+        levels, lost = [], []
         self.set_knob("knob1", 0, volume["value_box"], volume["max"])
         for _ in range(4):
+            selected, shown = self.on_track(1)
+            if not selected:
+                lost.append(f"before hit {len(levels) + 1}: TRACK {shown}")
+                break
             s.turn("knob1", 8, 0.35)
             time.sleep(1.5)
             value = read_number(ocr(s.image("vol"), tuple(volume["value_box"]), 7, 4))
+            # The knob step itself can move the selection, so check again right before the hit that reads the level.
+            selected, shown = self.on_track(1)
+            if not selected:
+                lost.append(f"after the step of hit {len(levels) + 1}: TRACK {shown}")
+                break
             l, _, _ = self.hit_capture("pad1", 100, seconds=0.5)
             levels.append((value, peak(l)))
             time.sleep(6.0)
+        subs.append(sub("TRACK 1 is selected before every level hit", not lost, "; ".join(lost)))
         ordered = sorted(levels)
         mono = all(b[1] > a[1] for a, b in zip(ordered, ordered[1:])) and len({v for v, _ in levels}) == 4
         subs.append(sub("level follows the track VOLUME knob monotonically (4 settings)", mono, str(levels)))
