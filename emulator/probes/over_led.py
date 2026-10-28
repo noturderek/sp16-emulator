@@ -35,6 +35,7 @@ sys.path.insert(0, str(TOOLS))
 OVER_ROLE = "over_led"
 OVER_CHANNEL = 34
 NEAR_FULL_SCALE = 0.89  # the check's own threshold: peak at or above this of 32767 is -1 dBFS
+S16_FULL = 32768.0      # one full-scale S16 sample on the shim meter's linear scale; one LSB is one sample step
 
 
 def lit_channels(decoded):
@@ -42,23 +43,31 @@ def lit_channels(decoded):
     return sorted(channel for channel, (lit, _) in decoded["mono"].items() if lit)
 
 
-def board_evidence(board):
-    """The shim's own view of the level path over a window, from the board model's `analog levels` metrics.
+def board_evidence(board, carried=None):
+    """The shim's own view of the level path over one window, from the board model's `analog levels` metrics.
 
     `main_out_gain` is the gain the MAIN OUT law applied (1.0 = neutral, i.e. the control was never moved);
     `shim_out_peak` is the peak the shim's output meter saw on the MAIN pair, over the same samples the sink WAV
     holds. A neutral gain and a `shim_out_peak` equal to the WAV peak mean the shim copied the firmware's samples
     byte-for-byte, so any level shortfall is upstream of the shim (the firmware's own track-volume -> master path),
-    not in the emulator's board model. A gain below 1.0, or an out_peak below the WAV peak, points at the shim."""
-    gains = [gain for gain, _ in board if gain is not None]
-    peaks = [peak for _, peak in board if peak is not None]
+    not in the emulator's board model. A gain below 1.0, or an out_peak below the WAV peak, points at the shim.
+
+    The shim's output meter is a peak-hold the bridge reports every ~2 s, so a window can open on the previous
+    report's carried-over peak, not this window's. Readings equal to `carried` (the peak read just before the
+    strike, or failing that the opening reading) are discarded, so the returned peak belongs to this window only;
+    a window whose meter never reports a fresh value has no shim evidence."""
+    if carried is None:
+        carried = board[0][1] if board else None
+    fresh = [(gain, peak) for gain, peak in board if peak is not None and (carried is None or peak != carried)]
+    gains = [gain for gain, _ in fresh]
+    peaks = [peak for _, peak in fresh]
     return {"main_out_gain": max(gains) if gains else None, "shim_out_peak": max(peaks) if peaks else None}
 
 
 def window(runner, track, sample, seconds=3.0):
     """Strike `track`'s pad and report the window: TX records with their times, the master-left samples, the first
-    sample index of the window, a frame->app-uptime clock and the shim's board-model evidence (MAIN OUT gain and
-    the shim's own output peak)."""
+    sample index of the window, a frame->app-uptime clock, the shim's board-model evidence (MAIN OUT gain and the
+    shim's own output peak) and the output-meter peak carried over from before the strike."""
     session = runner.session
     runner.load_sample(track, sample)
     if not runner.select_track(track):
@@ -68,6 +77,7 @@ def window(runner, track, sample, seconds=3.0):
     board = []
     start = tap.frames()
     offset = session.tx_offset()
+    carried = (((session.metrics().get("guest") or {}).get("board") or {}).get("analog_levels") or {}).get("out_peak")
     session.press(f"pad{track}", 0.15, 127)
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -80,7 +90,7 @@ def window(runner, track, sample, seconds=3.0):
     end = tap.frames()
     left = tap.read(start, end)[:, runner.sound_columns(tap)[0]]
     return {"records": session.lamps_since(offset), "left": left, "start": start,
-            "to_time": runner.frame_clock(clock), "seconds": seconds, "board": board}
+            "to_time": runner.frame_clock(clock), "seconds": seconds, "board": board, "carried": carried}
 
 
 def pass_figures(seen):
@@ -92,7 +102,7 @@ def pass_figures(seen):
     over = [time_point for time_point, decoded in seen["records"] if decoded["mono"][OVER_CHANNEL][0]]
     every = sorted({channel for _, decoded in seen["records"] for channel in lit_channels(decoded)})
     first_loud = None if not loud or not seen["to_time"] else seen["to_time"](seen["start"] + loud[0])
-    evidence = board_evidence(seen.get("board", []))
+    evidence = board_evidence(seen.get("board", []), seen.get("carried"))
     return {"peak": peak_value, "window_samples": int(len(left)),
             "nonzero_samples": int(sum(1 for sample in left if int(sample) != 0)),
             "peak_dbfs": round(20 * math.log10(peak_value / 32767), 2) if peak_value else None,
@@ -105,6 +115,34 @@ def pass_figures(seen):
             "tx_frames": len(seen["records"]),
             "main_out_gain": evidence["main_out_gain"],
             "shim_out_peak": evidence["shim_out_peak"]}
+
+
+def shim_matches(peak, wanted):
+    """Whether the shim's output peak (linear 0..1) equals the WAV peak within one S16 LSB.
+
+    The shim prints `out_peak` to four decimal places, so the value the probe reads is quantized to ~3.3 S16
+    samples; round it back to the nearest S16 sample and allow one LSB of slack before calling a pass divergent."""
+    return abs(round(peak * S16_FULL) - wanted) <= 1.0
+
+
+def divergent_passes(passes):
+    """Each non-control pass whose shim evidence fails to prove the shim copied the firmware byte-for-byte, as a
+    list of (pass name, why). A pass proves it when the MAIN OUT gain is the neutral 1.0 and the shim's output
+    peak equals that pass's own WAV peak within one S16 LSB; the -30 dBFS control pass is never judged."""
+    diverged = []
+    for name, figures in passes.items():
+        if name == "m30":
+            continue
+        gain = figures.get("main_out_gain")
+        peak = figures.get("shim_out_peak")
+        wanted = figures.get("peak")
+        if gain is None or peak is None:
+            diverged.append((name, "no shim evidence"))
+        elif gain != 1.0:
+            diverged.append((name, f"MAIN OUT gain {gain}"))
+        elif not shim_matches(peak, wanted):
+            diverged.append((name, f"shim peak {peak} vs WAV peak {wanted}"))
+    return diverged
 
 
 def run(args):
@@ -162,13 +200,13 @@ def run(args):
         else:
             verdict = (f"the master reached near-full scale at {', '.join(loud)} and mono {OVER_CHANNEL} never lit: "
                        f"the firmware does not raise its clip flag here")
-        gains = {name: figures["main_out_gain"] for name, figures in passes.items()
-                 if name != "m30" and figures["main_out_gain"] is not None}
-        if gains and any(gain != 1.0 for gain in gains.values()):
-            verdict += (f"; the shim's MAIN OUT gain was not neutral ({max(gains.values())}): the shim's board "
-                        f"model attenuated the output")
-        elif gains:
-            verdict += "; the shim's MAIN OUT gain was neutral (1.0) throughout, so the measured level is the firmware's"
+        diverged = divergent_passes(passes)
+        if diverged:
+            verdict += ("; the shim diverged from a byte-for-byte copy on " +
+                        ", ".join(f"{name} ({why})" for name, why in diverged))
+        else:
+            verdict += ("; the shim's MAIN OUT gain was neutral (1.0) and its output peak matched each pass's WAV "
+                        "peak within one LSB, so the measured level is the firmware's")
         print(f"\n{verdict}; wrote {out / 'over-led.json'}")
         return report
     finally:
