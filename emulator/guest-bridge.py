@@ -482,7 +482,7 @@ def main():
                     continue
                 if kind == TOUCH:
                     x, y, action = decode_touch(payload)
-                    controls.touch(x, y, action)
+                    model.lcd_touch(x, y, action)
                 elif kind == WHEEL:
                     x, y, steps = decode_wheel(payload)
                     model.apply(panel_map.CONTROL_IDS["selector"], "delta", steps)
