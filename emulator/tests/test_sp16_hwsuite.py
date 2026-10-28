@@ -93,6 +93,20 @@ class ProfileFieldTests(unittest.TestCase):
         self.assertIsNone(hwsuite.known_failing(profile, "HW-36"))
         self.assertIsNone(hwsuite.known_failing({}, "HW-35"))
 
+    def test_known_failing_tolerates_a_malformed_profile(self):
+        """A hand-edited or half-written profile must not raise out of a check: only usable entries are read."""
+        declaration = {"check": "HW-35", "reason": "r", "owner": "o", "date": "2026-10-28"}
+        for broken in ({}, {"hardware": None}, {"hardware": []}, {"hardware": "known"}, {"hardware": {}},
+                       {"hardware": {"known_failing": None}}, {"hardware": {"known_failing": "HW-35"}},
+                       {"hardware": {"known_failing": [None, 7, "HW-35", {}, {"reason": "r"}]}},
+                       {"hardware": {"known_failing": [{"check": 35, "reason": "r"}]}}):
+            with self.subTest(profile=broken):
+                self.assertEqual(hwsuite.declared_known_failing(broken), [])
+                self.assertIsNone(hwsuite.known_failing(broken, "HW-35"))
+        mixed = {"hardware": {"known_failing": [None, "HW-35", declaration]}}
+        self.assertEqual(hwsuite.known_failing(mixed, "HW-35"), declaration)
+        self.assertIsNone(hwsuite.known_failing(mixed, "HW-36"))
+
 
 class VerdictTests(unittest.TestCase):
     def test_na_needs_a_reason(self):
@@ -1055,6 +1069,29 @@ class MarkVerifiedTests(unittest.TestCase):
         with self.assertRaises(hwsuite.EnvError):
             hwsuite.mark_verified(self.path, self.result(verdicts), "r", "c")
         self.assertEqual(json.loads(self.path.read_text())["status"], self.profile["status"])
+
+    def test_tolerates_a_malformed_known_failing_list(self):
+        # mark_verified reads the profile straight off disk: a declaration list with junk in it must not raise an
+        # AttributeError, and the junk must not count as a declaration for anything.
+        self.profile.setdefault("hardware", {})["known_failing"] = [None, "HW-35", {"reason": "r"}]
+        self.path.write_text(json.dumps(self.profile, indent=2) + "\n")
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "x")
+        with self.assertRaises(hwsuite.EnvError) as caught:
+            hwsuite.mark_verified(self.path, self.result(verdicts), "r", "c")
+        self.assertIn("KNOWN-FAIL without a declared hardware.known_failing entry: ['HW-35']", str(caught.exception))
+
+    def test_the_ineligible_message_names_known_fail(self):
+        # KNOWN-FAIL does not block eligibility (summarize leaves it out of the failing counts), so the message that
+        # lists what a full run may contain has to name it, or an owner reads a KNOWN-FAIL run as ineligible.
+        blocked = all_pass()
+        blocked[5] = hwsuite.verdict("HW-06", "BLOCKED", "x")
+        with self.assertRaises(hwsuite.EnvError) as caught:
+            hwsuite.mark_verified(self.path, self.result(blocked), "r", "c")
+        self.assertIn("KNOWN-FAIL", str(caught.exception))
+        declared = all_pass()
+        declared[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r")
+        self.assertTrue(hwsuite.summarize(declared, "full")["verified_eligible"])  # and it really does not block
 
 
 class ProcessTests(unittest.TestCase):

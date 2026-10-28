@@ -2,6 +2,7 @@
 
 The guest's ``g_midi`` sequencer peer uses this stream without DIN byte pacing.
 These are virtual CoreMIDI endpoints; they do not create a physical USB device.
+As on DIN, the app's routing preferences (see midi.routing) gate each direction through this port's own rows.
 """
 import argparse
 from contextlib import suppress
@@ -13,6 +14,7 @@ import threading
 import time
 
 from midi.din import Messages, connect, session_socket
+from midi.routing import Routing, config_argument
 from midi_bridge.midi import Port, hex_line
 
 
@@ -39,15 +41,19 @@ def signal_stop(pending, timeout=1.0):
         time.sleep(0.005)   # back off instead of spinning: the queue is being consumed (or refilled) elsewhere
 
 
-def bridge(path, build_dir=None, name="SP-16 USB"):
+def bridge(path, build_dir=None, name="SP-16 USB", routing=None):
     sock = connect(path)
+    routing = Routing() if routing is None else routing
     pending = Queue(maxsize=64)
     closed = threading.Event()
     dropped = 0
 
     def received(data):
         nonlocal dropped
-        if closed.is_set():
+        # Host -> guest: our destination row's Out and Send clock decide what reaches the guest.
+        to_guest = routing.route(name, is_source=False)
+        data = bytes(byte for byte in data if to_guest.carries_to_guest(byte))
+        if not data or closed.is_set():
             return
         try:
             pending.put_nowait(data)
@@ -79,6 +85,9 @@ def bridge(path, build_dir=None, name="SP-16 USB"):
             if not data:
                 break
             for message in messages.feed(data):
+                # Guest -> host: our source row's In and Receive clock decide what leaves the guest.
+                if not routing.route(name, is_source=True).carries_from_guest(message):
+                    continue
                 port.process.stdin.write("out " + hex_line(message) + "\n")
                 port.process.stdin.flush()
     finally:
@@ -104,9 +113,10 @@ def main(argv=None):
     parser.add_argument("--name", default="SP-16 USB")
     parser.add_argument("--since", type=float, default=0)
     parser.add_argument("--build-dir", type=Path)
+    parser.add_argument("--config", type=config_argument, help="the app's midi-routing.json")
     args = parser.parse_args(argv)
     path = args.socket or session_socket(args.wait_for_session, args.since, suffix=".usb-midi")
-    bridge(path, args.build_dir, args.name)
+    bridge(path, args.build_dir, args.name, Routing(args.config))
     return 0
 
 
