@@ -50,6 +50,20 @@ class InputChainTests(unittest.TestCase):
             self.assertIn("PASS-pattern", out)
             self.assertIn("PASS-untouched", out)
 
+    @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
+    def test_replacing_the_wav_while_it_is_read_is_safe(self):
+        """The file is replaced and removed every few milliseconds while two PCM threads run; no torn or foreign frame."""
+        with arm_contract.ArmContract() as arm:
+            try:
+                out = arm.run("sp16_input_race_contract", [
+                    "rm -f /tmp/run/analog /tmp/run/in.wav",
+                    "$PRE -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/in.wav -E SP16_INPUT_WAV_POLL_MS=2 "
+                    "/tmp/run/t && echo PASS-race"])
+            except subprocess.CalledProcessError as exc:
+                self.fail((exc.stdout or "")[-1500:] + (exc.stderr or "")[-1500:])
+            self.assertIn("PASS-race", out)
+            self.assertRegex(out, r"race: reads=\d+ bad=0 ")
+
     def test_service_stimulus_preset(self):
         self.assertEqual(service_stimulus.events(-10.0), [("main_out", 1000), ("input_level", 1000), ("input_tone", 604)])
         self.assertAlmostEqual(service_stimulus.dbv_to_dbfs(-10.0), -23.79, places=1)

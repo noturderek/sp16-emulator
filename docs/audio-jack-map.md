@@ -27,8 +27,10 @@ Research builds can play a WAV into the input capture (`hw:ak4452audio,0`, the A
 ```
 
 `input.wav` is 16/24/32-bit PCM or 32-bit float, mono or stereo (mono feeds both channels), any rate (it is resampled
-linearly to 44.1 kHz) and loops. The shim re-reads it when its size changes and goes back to silence (or the research
-test tone) when it is removed; set `SP16_INPUT_WAV` to read another path. The chain is the board's: INPUT LEVEL gain, then
+linearly to 44.1 kHz), up to 64 MB, and loops. The shim looks at the file once a second, re-reads it when its size
+changes (a file that is still being written is picked up on a later look) and goes back to silence (or the research
+test tone) when it is removed; replacing or removing it while the firmware plays is safe. Set `SP16_INPUT_WAV` to read
+another path. The chain is the board's: INPUT LEVEL gain, then
 the input limiter while the firmware holds the LIMIT line high, then the converter. `metrics.json` reports
 `guest.board.analog_levels`: peaks and a dBu readout of input and master output (converter full scale is taken as
 +16 dBu, grade I), `limiter_active`, `limited_samples`, and the source (`wav`, `tone` or `off`).

@@ -1256,14 +1256,28 @@ static void main_out_scale(struct ax_ring *r,uint8_t *data,uint32_t frames) {
 }
 /* Input jack. Source, in order: a WAV the host placed in the developer share (research builds, `./sp16 run
  * --dev-overlay DIR` with DIR/input.wav; SP16_INPUT_WAV overrides the path), else the host test tone, else silence.
- * The WAV is 16/24/32-bit PCM or 32-bit float, mono or stereo (mono feeds both channels), looped, and resampled
- * linearly to the codec rate; it is re-read when its size changes. Chain, as on the board: INPUT LEVEL gain, then the
- * input limiter when the firmware has switched it on (GPIO5_IO06), then the converter. The null plugin leaves a
- * capture buffer untouched, so silence is written (all-zero bytes are 0 in every format the codec takes, and 0.0 in
- * FLOAT_LE) or the app's reused buffer would keep the last tone samples. */
-struct inject { const uint8_t *data; size_t size, bytes; unsigned channels, bits, is_float; double rate, pos; uint64_t frames; };
-static struct inject inject_now;
-static uint64_t inject_checked_ns;
+ * The WAV is 16/24/32-bit PCM or 32-bit float, mono or stereo (mono feeds both channels), up to 64 MB, looped, and
+ * resampled linearly to the codec rate; it is re-read when its size changes (looked at once a second, or every
+ * SP16_INPUT_WAV_POLL_MS milliseconds). Chain, as on the board: INPUT LEVEL gain, then the input limiter when the
+ * firmware has switched it on (GPIO5_IO06), then the converter. The null plugin leaves a capture buffer untouched, so
+ * silence is written (all-zero bytes are 0 in every format the codec takes, and 0.0 in FLOAT_LE) or the app's reused
+ * buffer would keep the last tone samples.
+ *
+ * The file is copied into private memory (a mapping of a file the host truncates or replaces would fault). Threads: the
+ * capture thread holds `inject_busy` for the whole of input_fill; the refresh runs on whichever PCM thread reaches pace()
+ * first (one at a time, `inject_refreshing`), does its file work without the lock and takes it only to swap the source,
+ * then unmaps the old copy, which no reader can reach any more. */
+struct inject { uint8_t *base; size_t size; const uint8_t *data; size_t bytes; unsigned channels, bits, is_float;
+                double rate, pos; uint64_t frames; };
+#define INJECT_MAX_BYTES (64u<<20)
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20
+#endif
+static struct inject inject_now;         /* the source: read and replaced only with inject_busy held */
+static int inject_busy;                  /* 1 while input_fill runs or the source is being swapped */
+static int inject_refreshing;            /* 1 while one thread looks at the file */
+static uint64_t inject_checked_ns, inject_poll_ns;
+static size_t inject_loaded, inject_rejected; /* size of the WAV in use; size of the last file that was not usable (0: none) */
 static int inject_parse(struct inject *w,const uint8_t *b,size_t size) {
     if (size<44 || memcmp(b,"RIFF",4) || memcmp(b+8,"WAVE",4)) return 0;
     unsigned fmt_tag=0, channels=0, bits=0; uint32_t rate=0; size_t at=12;
@@ -1293,25 +1307,66 @@ static float inject_sample(const struct inject *w,uint64_t frame,unsigned c) {
     if (w->bits==24) { int32_t v=(int32_t)((uint32_t)p[0]<<8|(uint32_t)p[1]<<16|(uint32_t)p[2]<<24)>>8; return (float)v/8388608.0f; }
     int32_t v; memcpy(&v,p,4); return (float)v/2147483648.0f;
 }
-static void inject_refresh(uint64_t now) {
-    if (inject_checked_ns && now-inject_checked_ns<1000000000ULL) return;
-    inject_checked_ns=now;
-    if (!original_open) return;
+static void inject_lock(void) {
+    while (__atomic_exchange_n(&inject_busy,1,__ATOMIC_ACQUIRE)) { struct timespec t={ .tv_nsec=20000 }; nanosleep(&t,NULL); }
+}
+static void inject_unlock(void) { __atomic_store_n(&inject_busy,0,__ATOMIC_RELEASE); }
+/* Make `next` (NULL: nothing) the source and return the old one, which no reader can reach any more. */
+static struct inject inject_swap(const struct inject *next) {
+    inject_lock();
+    struct inject old=inject_now;
+    if (next) inject_now=*next; else memset(&inject_now,0,sizeof inject_now);
+    __atomic_store_n(&inject_loaded,next?next->size:0,__ATOMIC_RELEASE);
+    inject_unlock();
+    return old;
+}
+static void inject_reload(void) {
     const char *path=getenv("SP16_INPUT_WAV"); if (!path) path="/opt/sp16/dev-share/input.wav";
+    size_t loaded=__atomic_load_n(&inject_loaded,__ATOMIC_ACQUIRE);
     int fd=original_open(path,O_RDONLY|O_CLOEXEC);
-    if (fd<0) { if (inject_now.data) { munmap((void *)inject_now.data,inject_now.size); memset(&inject_now,0,sizeof inject_now);
-                    fprintf(stderr,"[sp16-ui-stub] input injection: %s removed\n",path); } return; }
+    if (fd<0) {
+        inject_rejected=0;
+        if (loaded) { struct inject old=inject_swap(NULL); munmap(old.base,old.size);
+                      fprintf(stderr,"[sp16-ui-stub] input injection: %s removed\n",path); }
+        return;
+    }
     off_t end=lseek(fd,0,SEEK_END);
-    if (end<44 || end>(off_t)(256u<<20) || (inject_now.data && (size_t)end==inject_now.size)) { original_close(fd); return; }
-    void *map=mmap(NULL,(size_t)end,PROT_READ,MAP_PRIVATE,fd,0); original_close(fd);
-    if (map==MAP_FAILED) return;
-    struct inject next={ .size=(size_t)end };
-    if (!inject_parse(&next,map,(size_t)end)) { munmap(map,(size_t)end);
-        fprintf(stderr,"[sp16-ui-stub] input injection: %s is not a usable WAV (16/24/32-bit PCM or float, mono or stereo)\n",path); return; }
-    struct inject old=inject_now; inject_now=next;
-    if (old.data) munmap((void *)old.data,old.size);
+    if (end<44 || (size_t)end==loaded || (size_t)end==inject_rejected) { original_close(fd); return; }
+    if (end>(off_t)INJECT_MAX_BYTES) {
+        inject_rejected=(size_t)end; original_close(fd);
+        fprintf(stderr,"[sp16-ui-stub] input injection: %s is larger than %u MB\n",path,INJECT_MAX_BYTES>>20); return; }
+    uint8_t *copy=mmap(NULL,(size_t)end,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if (copy==(uint8_t *)MAP_FAILED) { original_close(fd); return; }
+    size_t got=0;
+    if (lseek(fd,0,SEEK_SET)==0) while (got<(size_t)end) {
+        ssize_t n=original_read(fd,copy+got,(size_t)end-got); if (n<=0) break; got+=(size_t)n; }
+    off_t again=lseek(fd,0,SEEK_END); original_close(fd);
+    if (got!=(size_t)end || again!=end) { munmap(copy,(size_t)end); return; } /* changing while read: look again at the next poll */
+    struct inject next={ .base=copy, .size=(size_t)end };
+    if (!inject_parse(&next,copy,(size_t)end)) {
+        munmap(copy,(size_t)end); inject_rejected=(size_t)end;
+        fprintf(stderr,"[sp16-ui-stub] input injection: %s is not a usable WAV (16/24/32-bit PCM or float, mono or stereo)\n",path);
+        return; }
+    inject_rejected=0;
+    struct inject old=inject_swap(&next);
+    if (old.base) munmap(old.base,old.size);
     fprintf(stderr,"[sp16-ui-stub] input injection: %s channels=%u bits=%u rate=%.0f frames=%lu\n",path,next.channels,next.bits,
             next.rate,(unsigned long)next.frames);
+}
+/* Called from pace() on every PCM thread: at most one thread at a time looks at the file, and a thread that finds another
+ * one at it simply goes on. */
+static void inject_refresh(uint64_t now) {
+    uint64_t poll=__atomic_load_n(&inject_poll_ns,__ATOMIC_RELAXED);
+    if (!poll) { /* SP16_INPUT_WAV_POLL_MS (tests): how often the file is looked at, default 1000 */
+        unsigned ms=1000; const char *e=getenv("SP16_INPUT_WAV_POLL_MS"); if (e) sscanf(e,"%u",&ms);
+        poll=(uint64_t)(ms?ms:1)*1000000ULL; __atomic_store_n(&inject_poll_ns,poll,__ATOMIC_RELAXED);
+    }
+    uint64_t last=__atomic_load_n(&inject_checked_ns,__ATOMIC_RELAXED);
+    if (last && (now<last || now-last<poll)) return;
+    if (!original_open || !original_read || __atomic_exchange_n(&inject_refreshing,1,__ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&inject_checked_ns,now,__ATOMIC_RELAXED);
+    inject_reload();
+    __atomic_store_n(&inject_refreshing,0,__ATOMIC_RELEASE);
 }
 
 /* Input limiter (GPIO5_IO06, the AUDIO TEST LIMIT button). Level above the threshold is soft-saturated towards full
@@ -1340,7 +1395,13 @@ static void meter_report(uint64_t now,int force) {
             meter_limited,(double)a.main_gain,(double)a.input_gain,names[meter_source]);
     meter_in_peak=meter_out_peak=0; meter_limited=0;
 }
+static void input_fill_locked(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames);
 static void input_fill(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames) {
+    inject_lock();                       /* a refresh cannot swap or unmap the source while this call reads it */
+    input_fill_locked(s,buffer,frames);
+    inject_unlock();
+}
+static void input_fill_locked(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames) {
     struct analog a=analog_now;
     unsigned w=bm_width(s->format);
     if (!w || !s->channels || frames<=0 || !buffer) return;
@@ -1368,7 +1429,7 @@ static void input_fill(struct pcm_state *s,void *buffer,snd_pcm_sframes_t frames
         if (use_wav) {
             uint64_t f0=(uint64_t)wav->pos, f1=f0+1<wav->frames?f0+1:0; float t=(float)(wav->pos-(double)f0);
             for (unsigned c=0;c<2;c++) y[c]=a.input_gain*(inject_sample(wav,f0,c)*(1-t)+inject_sample(wav,f1,c)*t);
-            wav->pos+=advance; if (wav->pos>=(double)wav->frames) wav->pos-=(double)wav->frames;
+            wav->pos+=advance; while (wav->pos>=(double)wav->frames) wav->pos-=(double)wav->frames; /* a short file at a high rate wraps more than once */
         } else {
             y[0]=y[1]=amp*bm_sin(s->phase);
             s->phase+=step; if (s->phase>BM_PI) s->phase-=2*BM_PI;

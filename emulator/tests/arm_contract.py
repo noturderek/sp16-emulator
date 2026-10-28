@@ -17,7 +17,7 @@ PREPARE = """set -e; mkdir -p /tmp/run; CC="arm-linux-gnueabi-gcc -Wall -Wextra"
 $CC -std=c11 -O2 -fPIC -shared -nostdlib -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp -fno-stack-protector \\
  /src/hardware_stub.c -Wl,--no-as-needed -l:libdl.so.2 -lgcc -o /tmp/run/libsp16-ui.so 2>/dev/null
 $CC -DSP16_FAKE_ALSA -shared -fPIC /src/tests/%(test)s.c -o /tmp/run/libsp16-fake-alsa.so
-$CC /src/tests/%(test)s.c -L/tmp/run -lsp16-fake-alsa -lm -o /tmp/run/t
+$CC /src/tests/%(test)s.c -L/tmp/run -lsp16-fake-alsa -lm -pthread -o /tmp/run/t
 PRE="qemu-arm-static -L /usr/arm-linux-gnueabi -E LD_PRELOAD=/tmp/run/libsp16-ui.so -E LD_LIBRARY_PATH=/tmp/run"
 """
 
