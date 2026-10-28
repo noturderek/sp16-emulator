@@ -56,7 +56,8 @@ GPIO5_IO06 (the AUDIO TEST LIMIT button, high = on, grade I from the line name) 
 capture, after INPUT LEVEL: transparent up to half of full scale, soft saturation above (threshold and curve are
 assumptions, U). The shim logs `analog levels ...` per window and on every limiter change; the bridge puts it in
 `metrics.json` as `guest.board.analog_levels` (`limiter_active`, `limited_samples`, input and output peaks, `in_dbu`,
-`out_dbu`, source). dBu = dBFS + 16: converter full scale is taken as the jack's rated maximum level, +16 dBu (I).
+`out_dbu`, source). The input is metered after INPUT LEVEL and before the limiter, the output on the MAIN pair after MAIN OUT.
+dBu = dBFS + 16: converter full scale is taken as the jack's rated maximum level, +16 dBu (I).
 `emulator/service_stimulus.py --build NAME` sets the manual's service stimulus (-10 dBV in, INPUT LEVEL and MAIN OUT at
 maximum) on a running research session.
 
@@ -67,7 +68,7 @@ Live check (factory test, AUDIO TEST page, injected 1 kHz / 2 kHz tones, INPUT L
 ## 5. Audio input injection and the channel-to-jack map
 
 See [../audio-jack-map.md](../audio-jack-map.md) and `emulator/audio-jack-map.json`. Injection: put `input.wav` in the
-`--dev-overlay` folder. Map (O unless marked): MAIN = OUT1-2 = MASTER is master channels 12/14; OUT7-8 is 0/2; OUT3-4 (8/10)
+`--dev-overlay` folder (up to 64 MB; replacing or removing it while the firmware plays is safe). Map (O unless marked): MAIN = OUT1-2 = MASTER is master channels 12/14; OUT7-8 is 0/2; OUT3-4 (8/10)
 and OUT5-6 (4/6) are inferred (I) from the slot order; PHONES is the AK4452 playback stream. The odd master channels
 are padding. For a later output monitor menu (not built here): `AudioSink.OutputJack` and `AudioSink.monitor`
 (audio-sink.swift) select the jack the CoreAudio output plays; `SP16_PCM_PORT_CHANNELS=0:16` (or an overlay file
@@ -136,18 +137,19 @@ Each needs a file this lane does not own.
    .latencyCritical], reason: "SP16 panel transport")` once at launch, held for the life of the app. Untested hardening of the
    reader, only if stalls remain: take the TX-log timestamp when the message header is read (before any lock), write the log on
    its own queue (`writeTxLog` writes the file inside the shared `lock`), and format hex without a `String(format:)` per byte.
-2. **`emulator/arm-contracts.sh`: run the three contracts this lane added in the packaged image** (they currently run in
+2. **`emulator/arm-contracts.sh`: run the four contracts this lane added in the packaged image** (they currently run in
    a lighter image from `tests/arm_contract.py`). After the `sp16_board_contract` expectations add:
 
    ```sh
    run sp16_rate_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_ANY_RATE=1 /tmp/run/t any"
    run sp16_input_chain_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; rm -f /tmp/run/analog /tmp/run/in.wav; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/in.wav /tmp/run/t"
    run sp16_analog_laws_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -lm -o /tmp/run/t; rm -f /tmp/run/analog; : > /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_ANALOG=/tmp/run/analog -E SP16_PCM_PORT=/tmp/run/port /tmp/run/t 0.25 0.285714 0.446934"
+   run sp16_input_race_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -pthread -o /tmp/run/t; rm -f /tmp/run/analog /tmp/run/in.wav; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_ANALOG=/tmp/run/analog -E SP16_INPUT_WAV=/tmp/run/in.wav -E SP16_INPUT_WAV_POLL_MS=2 /tmp/run/t"
    ```
 
    (the last three numbers come from `analog_laws.py`: MAIN OUT gain at 500, the loop gain of a 1 kHz tone at CUTOFF 500 with
-   RESONANCE 0 and 500). The capture-stale mode of `sp16_input_chain_contract` needs `/opt/sp16/dev-share/capture-stale`
-   and is covered by the lighter image only.
+   RESONANCE 0 and 500). The `capture-stale` and `service` modes of `sp16_input_chain_contract` (a mode name as the first
+   argument) need `/opt/sp16/dev-share/capture-stale` and a 2.6 s run, and are covered by the lighter image only.
 3. **`emulator/profiles/sp16-1.50.json`, `sp16-1.60.json` (and `profiles.py` validation): the jack table.** The task asked
    for the channel-to-jack table in the profile; add `audio.jacks` as the `jacks` array of `emulator/audio-jack-map.json`
    (jack, stream, left, right, grade). `panel-layout.json` names no audio channel, so there is nothing to replace there.
@@ -180,25 +182,41 @@ Checks are run from the repository root. "Quick set" is the brief's list of 14 m
 
 Order: task 2 was committed after task 5 because its live check needed a quiet host.
 
+**Review fixes** (three findings of the code review, one commit each, after the notes were first committed):
+
+| Finding | Commit | Files | Checks and results |
+|---|---|---|---|
+| The input WAV refresh ran unsynchronized on several PCM threads (task 5) | `246fbd4` | `hardware_stub.c`, `tests/sp16_input_race_contract.c`, `tests/arm_contract.py`, `tests/test_sp16_input_chain_contract.py`, `docs/audio-jack-map.md` | new race contract: replaces and removes the WAV 500 times in about four seconds while one thread reads and another paces; segfaults on the old code with the polling sped up, passes three runs in a row on the new (500 reloads, 10 removals, 0 bad frames each); `test_sp16_input_chain_contract`: 6 of 6 OK at that commit |
+| A zero jitter or a zero stall was read as missing (task 6) | `8228fbf` | `timing_probe.py`, `tests/test_sp16_timing_probe.py` | `test_sp16_timing_probe`: 18 of 18 OK (the old code reports a perfect run as missing two targets) |
+| The service-stimulus text put the input meter before INPUT LEVEL (task 4) | `801b81e` | `service_stimulus.py`, `hardware_stub.c` (comment), `docs/audio-jack-map.md`, `tests/sp16_input_chain_contract.c`, `tests/test_sp16_input_chain_contract.py` | `test_sp16_input_chain_contract`: 8 of 8 OK, including the shim's own in_dbu for the preset against `expected_in_dbu()` |
+
+The race fix, in short: one lock covers every read of the source and the swap; the refresh does its file work outside the lock
+and takes it only to swap; one thread at a time refreshes; the WAV is copied into private memory (no fault when the host
+truncates or replaces the file; 64 MB at most); and the source keeps its mapping base. The old code passed a pointer into the
+data chunk to `munmap`, which is not the base, so replaced files were never unmapped.
+
 Slow modules: `test_sp16_audio_output` (touches `audio-sink.swift`) passes on a quiet host. Under heavy host load its
 `device-unavailable` scenario (waits 0.5 s for a state change) fails the same way on the unchanged files.
 
-**Final run on the lane's HEAD (quiet host, load1 about 10).** Quick set: `Ran 358 tests in 5.7s`, `OK` (358 of 358). Lane
-modules, all OK: `test_sp16_rate_contract` 2 of 2, `test_sp16_analog_laws` 6 of 6, `test_sp16_analog_laws_contract` 1 of 1,
-`test_sp16_input_chain_contract` 5 of 5, `test_sp16_jack_map` 4 of 4, `test_sp16_audio_sink` 1 of 1, `test_sp16_timing_probe`
-15 of 15, `test_sp16_audio_output` 1 of 1. The lane's research build (`./sp16 build --name l2 --research --audio file`) plays
-firmware 1.60 with `speed=1.00x` on all five streams (three playback, two capture): 10 of 10 stream lines in each of the six
-measured sessions.
+**Final run on the lane's HEAD `801b81e` (before this notes commit; quiet host).** Quick set: `Ran 358 tests in 5.2s`, `OK`
+(358 of 358). Lane modules, all OK: `test_sp16_rate_contract` 2 of 2, `test_sp16_analog_laws` 6 of 6,
+`test_sp16_analog_laws_contract` 1 of 1, `test_sp16_input_chain_contract` 8 of 8, `test_sp16_jack_map` 4 of 4,
+`test_sp16_audio_sink` 1 of 1, `test_sp16_timing_probe` 18 of 18, `test_sp16_audio_output` 1 of 1. The repository's own stub
+contracts, `emulator/arm-contracts.sh` (ten contracts, in the packaged guest image): 34 PASS, 0 FAIL, run twice (after the race
+fix and on the final tree). The lane's research build (`./sp16 build --name l2 --research --audio file`) plays firmware 1.60
+with `speed=1.00x` on all five streams (three playback, two capture): 10 of 10 stream lines in each of the six measured
+sessions (taken before the review fixes, which do not touch pacing).
 
-**Did not run, and why.** `emulator/arm-contracts.sh` (held; needs the full guest image; the lane's contracts run in a
-lighter image instead). `./sp16 hwsuite` itself (it refuses with more than 3 VMs on the host; HW-34 ran through a scratch
-wrapper). For task 2, the control run and the `untouched` run of the reproduction (host load at the time, then skipped to save
-time). A live MAIN OUT sweep in the factory test, skipped to save time (the shim-level contract covers MAIN OUT; INPUT LEVEL
-and the limiter were checked live). Probe runs on loaded hosts are not used for any number.
+**Did not run, and why.** The lane's four new contracts inside `emulator/arm-contracts.sh` (held; they run in a lighter image
+from `tests/arm_contract.py`, and the script's own ten contracts ran as it is). `./sp16 hwsuite` itself (it refuses with more
+than 3 VMs on the host; HW-34 ran through a scratch wrapper). For task 2, the control run and the `untouched` run of the
+reproduction (host load at the time, then skipped to save time). A live MAIN OUT sweep in the factory test, skipped to save time
+(the shim-level contract covers MAIN OUT; INPUT LEVEL and the limiter were checked live). No live run after the review fixes
+(they change locking and reporting, not pacing). Probe runs on loaded hosts are not used for any number.
 
 **Side effects.** Builds under the git-ignored `build/`: `l2` (rebuilt several times), `l2tm` (factory test mode), `l2base` and
-`l2old` (the bridge before the fix, for the A/B). Docker: a throwaway Debian image per contract test, removed afterwards, and
-one scratch image used for manual runs, removed at the end. One experiment set the preference `NSAppSleepDisabled` for the
+`l2old` (the bridge before the fix, for the A/B). Docker: a throwaway Debian image per contract test, removed afterwards, two
+scratch images used for manual runs (also removed), and the untagged guest image `arm-contracts.sh` builds and removes. One experiment set the preference `NSAppSleepDisabled` for the
 test bundle `local.sp16-compatible.emulator.fullpanel.l2` and deleted it again (its domain no longer exists). Emulator sessions
 started by this lane (`./sp16 run`, the probe, the suite) were stopped by exact process id; none is running. Nothing was
 pushed, rebased or merged; no other worktree, the internal repository or `main` was touched; the calibration run of another
