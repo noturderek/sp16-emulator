@@ -81,6 +81,9 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     var window: NSWindow!
     var socketFD: Int32 = -1
     var stopping = false
+    /// True once `applicationShouldTerminate` has started teardown: a second quit request (a second SIGTERM, Cmd-Q)
+    /// must not spawn a second teardown thread or wedge the reply. Read and written under `lock`.
+    var terminating = false
     var pendingFrame: Data?
     var drawing = false
     var lastPixels: Data?
@@ -907,12 +910,29 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         AppLog.log("quit requested (VM \(process.isRunning ? "running" : "not running"))")
         panel.releaseAll()
-        lock.lock(); stopping = true
+        lock.lock()
+        if terminating {
+            // A second quit request while the first teardown runs: it owns the reply and the bounded exit below.
+            lock.unlock()
+            return .terminateLater
+        }
+        terminating = true
+        stopping = true
         // With a data image the UI socket stays open until the guest confirms its unmount: closing it makes the
         // guest bridge exit, and the guest powers off before it can sync.
         let keepUIOpen = config.data != nil && process.isRunning
         if socketFD >= 0 && !keepUIOpen { shutdown(socketFD, SHUT_RDWR) }
         lock.unlock()
+        // Bounded exit: the 2026-10-27 hang wedged teardown after a clean guest stop and ignored further SIGTERMs.
+        // Whatever blocks (a slow clean stop, a stuck `waitUntilExit`, or a reply the run loop never services), the
+        // app must be gone inside the acceptance window (10 s). The clean stop is 5 s and the terminate ladder 3 s,
+        // so 9 s only ever fires on a hang, never on a slow-but-complete quit.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 9) { [weak self] in
+            guard let self = self else { return }
+            AppLog.log("quit: teardown still running at the 9 s bound; forcing exit")
+            self.log?.write(Data("SP16_HOST_FORCED_EXIT\n".utf8))
+            _exit(0)
+        }
         guard process.isRunning else { return .terminateNow }
         let controlPath = config.data != nil ? config.socket + ".ctl" : nil
         DispatchQueue.global().async { [weak self] in
@@ -928,13 +948,26 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             for _ in 0..<30 { if !self.process.isRunning { break }; Thread.sleep(forTimeInterval: 0.1) }
             if self.process.isRunning { Darwin.kill(self.process.processIdentifier, SIGKILL) }
             self.process.waitUntilExit()
-            // The termination loop does not service plain main-queue blocks; post to the common run-loop modes.
-            CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
-            CFRunLoopWakeUp(CFRunLoopGetMain())
+            self.replyTerminate()
         }
         return .terminateLater
+    }
+
+    /// Post `reply(toApplicationShouldTerminate:)` to the main run loop, then force the exit if the reply is never
+    /// processed. The termination loop does not service plain main-queue blocks, so the reply goes through
+    /// `CFRunLoopPerformBlock` in the common modes; that path only runs while the run loop spins, so a wedged loop
+    /// (the observed hang) still needs the hard `_exit` fallback.
+    func replyTerminate() {
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self = self else { return }
+            AppLog.log("quit: reply not processed within 2 s; forcing exit")
+            self.log?.write(Data("SP16_HOST_FORCED_EXIT\n".utf8))
+            _exit(0)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
