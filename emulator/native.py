@@ -807,7 +807,10 @@ def main():
     launcher.add_argument("--no-audio-files", action="store_true",
                           help="audio builds: the sink keeps reading and counting the guest's PCM (metrics) but "
                                "writes no WAV into the session folder")
-    launcher.add_argument("--midi", action="store_true", help="start the CoreMIDI DIN bridge for this session")
+    launcher.add_argument("--midi", action="store_true",
+                          help="start the CoreMIDI bridges for this session: MIDI DIN in and out, and the separate USB "
+                               "MIDI byte stream the firmware's g_midi peer uses (two virtual endpoints, no physical USB "
+                               "device)")
     fw = commands.add_parser("firmware", help="decoupled builds: import, list, check and manage user-supplied firmware")
     fw.add_argument("action", choices=("import", "list", "show", "check", "rename", "remove", "select", "audit",
                                        "profile"))

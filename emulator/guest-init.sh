@@ -163,9 +163,9 @@ if [ "$sp16_devlayer" = 1 ]; then
 fi
 : > /tmp/sp16-root/dev/null
 : > /tmp/sp16-root/dev/full
-# The app's USB gadget shell requests toggle this marker through the shim. Its
-# sequencer enumeration sees g_midi only while MIDI mode is active.
-: > /tmp/sp16-root/dev/sp16-usb-midi-enabled
+# g_midi appears only while the app has the USB gadget in MIDI mode: the shim creates this marker when the app runs
+# usb_gadget.sh midi probe and removes it for mass storage. Nothing creates it at boot, so the sequencer inventory is
+# what the firmware asked for rather than an endpoint that is not there yet.
 # Publish the DIN sequencer client before the app probes its ALSA endpoints. The proc node is opened through
 # the preload shim, which reports the bridge's current queue capacity.
 if modprobe snd_seq; then

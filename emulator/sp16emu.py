@@ -682,7 +682,8 @@ RUN_OPTS = [
     Opt("--no-audio-files", "Audio builds (--audio file or both): keep reading and counting the guest's audio (metrics) "
         "but write no WAV into the session folder, for unattended runs that read no audio (about 28 MB a minute "
         "otherwise).", flag=True),
-    Opt("--midi", "Start the CoreMIDI DIN bridge for this session.", flag=True),
+    Opt("--midi", "Start the CoreMIDI bridges for this session: MIDI DIN in and out, and the separate USB MIDI byte "
+        "stream the firmware's g_midi peer uses (two virtual endpoints, no physical USB device).", flag=True),
 ]
 
 
