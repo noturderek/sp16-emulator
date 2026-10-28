@@ -41,7 +41,7 @@ MAPPER = "sp16upd"
 # reports which of them the imported application references, and which similar-looking names it uses that the shim
 # does not know. Kept equal to the C source by a unit test.
 SHIM_DEVICES = ("/dev/subucom_spi0.1", "/dev/cdc_spi2.0", "/dev/dac_spi4.0", "/dev/backlight", "/proc/udev_usb1",
-                "/proc/udev_usbctn1", "/dev/gpiodrv", "/dev/ttymxc1", "/dev/din_midi")
+                "/proc/udev_usbctn1", "/dev/gpiodrv", "/dev/ttymxc1", "/dev/din_midi", "/dev/snd/seq")
 SHIM_PCMS = ("hw:ak4452audio,0", "hw:ak4452audio,1", "hw:ak4458audio,0")
 SHIM_IOCTLS = (0x40047000, 0x40107000, 0x80017001, 0x40017001, 0x80047002, 0x40047002, 0x80027003, 0x40027003,
                0x80047004, 0x40047004, 0x40017005, 0x40047007, 0x80017006, 0x40017008, 0x40017009, 0x40017006)

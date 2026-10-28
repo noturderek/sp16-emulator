@@ -251,6 +251,8 @@ def arguments(qemu, guest, socket, trace=None, data=False, audio=None, firmware=
     # Full-duplex DIN MIDI UART, separate from the panel and factory-test loopback.
     din = ["-chardev", f"socket,id=sp16din,path={socket}.midi,server=on,wait=off",
            "-device", "virtserialport,chardev=sp16din,name=sp16.din"]
+    usb_midi = ["-chardev", f"socket,id=sp16usbmidi,path={socket}.usb-midi,server=on,wait=off",
+                "-device", "virtserialport,chardev=sp16usbmidi,name=sp16.usb-midi"]
     # Research gdb bridge (--trace gdb): a dedicated virtio-serial port so the guest can tunnel the qemu-user
     # gdbstub (127.0.0.1:1234 in the guest) out to the host, since the guest has no NIC beyond lo. The host end
     # is the unix socket {socket}.gdb; the guest-init forwarder bridges the vport to the in-guest stub, and a tiny
@@ -277,7 +279,7 @@ def arguments(qemu, guest, socket, trace=None, data=False, audio=None, firmware=
                        + (f" sp16.app={app_arg}" if app_arg else ""),
             "-device", "virtio-serial-device",
             "-chardev", f"socket,id=sp16,path={socket},server=on,wait=off",
-            "-device", "virtserialport,chardev=sp16,name=sp16.ui", *fw, *persistent, *pcm, *din, *gdb]
+            "-device", "virtserialport,chardev=sp16,name=sp16.ui", *fw, *persistent, *pcm, *din, *usb_midi, *gdb]
 
 
 def shipped_profile(profile):
@@ -649,6 +651,12 @@ def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overla
             subprocess.Popen([sys.executable, "-m", "midi.din", "--wait-for-session", str(output),
                               "--since", str(midi_since), "--build-dir", str(output.parent),
                               "--name", f"SP-16 DIN [{output.name}]"],
+                             cwd=TOOLS, stdin=subprocess.DEVNULL, stdout=midi_log, stderr=subprocess.STDOUT,
+                             start_new_session=True, close_fds=True)
+        with (output / "usb-midi.log").open("a") as midi_log:
+            subprocess.Popen([sys.executable, "-m", "midi.usb", "--wait-for-session", str(output),
+                              "--since", str(midi_since), "--build-dir", str(output.parent),
+                              "--name", f"SP-16 USB [{output.name}]"],
                              cwd=TOOLS, stdin=subprocess.DEVNULL, stdout=midi_log, stderr=subprocess.STDOUT,
                              start_new_session=True, close_fds=True)
     print(json.dumps({"status": "native_app_opened", "app": assets["app_bundle"], **({"net": net} if net_env else {}),

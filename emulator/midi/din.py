@@ -143,7 +143,7 @@ def connect(path, timeout=60):
             time.sleep(0.1)
 
 
-def session_socket(build, since, timeout=60):
+def session_socket(build, since, timeout=60, suffix=".midi"):
     until = time.monotonic() + timeout
     while time.monotonic() < until:
         root = Path(build) / "sessions"
@@ -152,7 +152,7 @@ def session_socket(build, since, timeout=60):
                 continue
             try:
                 runtime = json.loads(runtime_path.read_text())
-                path = Path(runtime["socket"] + ".midi")
+                path = Path(runtime["socket"] + suffix)
             except (OSError, ValueError, KeyError):
                 continue
             if path.exists():
