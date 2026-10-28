@@ -2,25 +2,28 @@
 
 A pixel differs when any colour channel differs by more than the tolerance. The tolerance (a whole number from 0 to 254)
 and the share of changed pixels a capture may have (from 0 up to, but not including, 1) are checked: a value outside
-them would switch the comparison off, so it is an error. Regions that always move (the level meters,
-the clock, a playhead) are masked out; a mask is a rectangle in fractions of the image, so it survives a window resize.
-The references are the suite's own earlier captures, kept in a folder outside the repository (they show the firmware's
-screen, which is never committed); nothing here knows or reads any manufacturer image.
+them would switch the comparison off, so it is an error. A capture matches when no more pixels changed than
+floor(share * compared pixels), decided on whole pixels: a share of 0 allows none. When the masks leave no pixel to
+compare, that is an error, never a match. Regions that always move (the level meters, the clock, a playhead) are masked
+out; a mask is a rectangle in fractions of the image, so it survives a window resize. The references are the suite's own
+earlier captures, kept in a folder outside the repository (they show the firmware's screen, which is never committed);
+nothing here knows or reads any manufacturer image.
 
   Region      a rectangle as fractions (x0, y0, x1, y1) of the image, 0..1, from the top-left corner
   read_masks  a `.mask` sidecar: one `x0 y0 x1 y1` per line, `#` starts a comment
-  compare     reference + actual -> a report {compared, changed, fraction, bbox}
+  compare     reference + actual -> a report {compared, changed, fraction, bbox} (EmptyComparison if nothing is compared)
   heat_map    the picture of the difference: actual in grey, changed pixels red, masked pixels tinted blue
   ShotStore   a folder of `<name>.png` references; stage, promote, compare and the diff files of one run
 
 The design follows the pixel comparison of the open CDJ-3000 emulator's control crate (tolerance, masks, region, a heat
 map), written again here for Pillow and numpy.
 """
+from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 import re
 
 DEFAULT_TOLERANCE = 8          # per channel, 0..254: absorbs resampling and colour-management noise, not a recolour
-DEFAULT_MAX_FRACTION = 0.0     # share of compared pixels allowed to differ before a capture counts as changed
+DEFAULT_MAX_FRACTION = 0.0     # share of compared pixels allowed to differ (rounded down to whole pixels: 0 allows none)
 # Two 8-bit channels differ by at most 255, and a pixel is changed only when its difference is above the tolerance, so a
 # tolerance of 255 or more would call every pixel equal and switch the comparison off without a word.
 MAX_TOLERANCE = 254
@@ -32,12 +35,24 @@ class ShotError(ValueError):
     threshold outside its range."""
 
 
+class EmptyComparison(ShotError):
+    """No pixel is left to compare (the masks and the region cover the whole capture): nothing was checked, and that must
+    never read as a match."""
+
+
 def check_tolerance(value):
     """`value` as a per-channel tolerance: a whole number from 0 to 254 (see MAX_TOLERANCE). Returns it."""
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_TOLERANCE:
         raise ShotError(f"tolerance {value!r} is not a whole number from 0 to {MAX_TOLERANCE}: 255 and above would count "
                         f"every pixel as equal")
     return value
+
+
+def allowed_changes(compared, share):
+    """The most changed pixels a capture of `compared` compared pixels may have and still match: floor(share * compared).
+    It is decided on whole pixels, so a share of 0 allows none however large the capture, and no rounding of a fraction can
+    let a changed capture through. The share is read as the decimal it was written as (0.29 of 100 pixels is 29)."""
+    return int((Decimal(str(float(share))) * compared).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def check_share(value):
@@ -129,16 +144,19 @@ def changed_pixels(reference, actual, tolerance=DEFAULT_TOLERANCE, masks=(), reg
 
 
 def compare(reference, actual, tolerance=DEFAULT_TOLERANCE, masks=(), region=None):
-    """The report of one comparison: pixels compared and changed, the changed share and the box around the changes."""
+    """The report of one comparison: pixels compared and changed, the changed share (exact: round it only to show it) and
+    the box around the changes. Raises EmptyComparison when the masks and region leave no pixel to compare."""
     import numpy as np
     changed, keep = changed_pixels(reference, actual, tolerance, masks, region)
     compared, count = int(keep.sum()), int(changed.sum())
+    if not compared:
+        raise EmptyComparison("the mask leaves nothing to compare: every pixel is masked or outside the region")
     box = None
     if count:
         ys, xs = np.nonzero(changed)
         box = [int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)]
     return {"width": actual.size[0], "height": actual.size[1], "compared": compared, "changed": count,
-            "fraction": round(count / compared, 6) if compared else 0.0, "bbox": box}
+            "fraction": count / compared, "bbox": box}
 
 
 def heat_map(reference, actual, tolerance=DEFAULT_TOLERANCE, masks=(), region=None):
@@ -162,8 +180,9 @@ class ShotStore:
     look like a regression. "compare" checks each capture against its reference and writes the heat map of a difference
     into `<out>`; a capture with no reference yet is "missing" (record one first).
 
-    A status is "recorded" (staged), "match", "diff" (changed share above `max_fraction`), "size" (the capture's size
-    differs from the reference's) or "missing"."""
+    A status is "recorded" (staged), "match", "diff" (more changed pixels than `allowed_changes` lets through: with the
+    default share of 0, any one), "size" (the capture's size differs from the reference's), "empty" (the masks leave
+    nothing to compare) or "missing"."""
 
     def __init__(self, folder, out, mode="compare", tolerance=DEFAULT_TOLERANCE, max_fraction=DEFAULT_MAX_FRACTION):
         if mode not in ("record", "compare"):
@@ -197,11 +216,14 @@ class ShotStore:
                 expected = handle.convert("RGB")
             try:
                 report = compare(expected, image, self.tolerance, masks)
+            except EmptyComparison as error:
+                entry.update(status="empty", note=str(error))
             except ShotError as error:
                 entry.update(status="size", note=str(error))
             else:
-                entry.update(report)
-                entry["status"] = "diff" if report["fraction"] > self.max_fraction else "match"
+                allowed = allowed_changes(report["compared"], self.max_fraction)
+                entry.update(report, allowed=allowed)
+                entry["status"] = "diff" if report["changed"] > allowed else "match"
                 if entry["status"] == "diff":
                     self.out.mkdir(parents=True, exist_ok=True)
                     path = self.out / f"{name}-diff.png"
@@ -227,7 +249,7 @@ class ShotStore:
         return promoted
 
     def failures(self):
-        return [e for e in self.entries if e["status"] in ("diff", "size")]
+        return [e for e in self.entries if e["status"] in ("diff", "size", "empty")]
 
     def render_report(self):
         """shots-report.md: one row per capture, the changed share and the box, and the heat map file of each diff."""

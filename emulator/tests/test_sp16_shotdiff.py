@@ -54,6 +54,21 @@ class CompareTests(unittest.TestCase):
         inside = shotdiff.Region(0.0, 0.0, 0.5, 1.0)
         self.assertEqual(shotdiff.compare(solid(), actual, region=inside)["changed"], 200)
 
+    def test_compare_raises_when_nothing_is_left_to_compare(self):
+        self.assertTrue(issubclass(shotdiff.EmptyComparison, shotdiff.ShotError))
+        with self.assertRaises(shotdiff.EmptyComparison) as caught:
+            shotdiff.compare(solid(), solid(), masks=[shotdiff.Region(0.0, 0.0, 1.0, 1.0)])
+        self.assertIn("mask leaves nothing to compare", str(caught.exception))
+        with self.assertRaises(shotdiff.EmptyComparison):              # a region too thin to hold one pixel
+            shotdiff.compare(solid(), solid(), region=shotdiff.Region(0.0, 0.0, 0.001, 0.001))
+
+    def test_the_fraction_is_exact_not_rounded(self):
+        actual = solid(size=(2560, 1600))
+        actual.putpixel((5, 5), (255, 255, 255))
+        report = shotdiff.compare(solid(size=(2560, 1600)), actual)
+        self.assertEqual((report["compared"], report["changed"]), (4096000, 1))
+        self.assertEqual(report["fraction"], 1 / 4096000)
+
     def test_images_of_different_sizes_cannot_be_compared(self):
         with self.assertRaises(shotdiff.ShotError):
             shotdiff.compare(solid(), solid(size=(100, 51)))
@@ -131,6 +146,20 @@ class RegionTests(unittest.TestCase):
             self.assertEqual(shotdiff.read_masks(Path(folder) / "none.mask"), [])
 
 
+class AllowedChangesTests(unittest.TestCase):
+    """The pass mark is a whole number of pixels, floor(share * compared), read from the decimal the share was written as."""
+
+    def test_the_most_changed_pixels_a_capture_may_have(self):
+        for compared, share, expected in ((3911680, 0, 0), (3911680, 0.0, 0), (5000, 0.01, 50), (10, 0.3, 3), (7, 0.5, 3),
+                                          (1, 0.999, 0), (4096000, 1e-7, 0), (4096000, 1e-6, 4), (99, 0.999999, 98),
+                                          (100, 0.29, 29)):   # 100 * 0.29 is 28.999999999999996 in binary floating point
+            self.assertEqual(shotdiff.allowed_changes(compared, share), expected, (compared, share))
+
+    def test_a_share_below_1_never_lets_a_completely_changed_capture_through(self):
+        for compared in (1, 2, 100, 3911680):
+            self.assertLess(shotdiff.allowed_changes(compared, 0.999999999), compared)
+
+
 @unittest.skipIf(Image is None, "needs pillow and numpy")
 class StoreTests(unittest.TestCase):
     def setUp(self):
@@ -162,6 +191,58 @@ class StoreTests(unittest.TestCase):
         entry = self.store().check("home", solid())
         self.assertEqual(entry["status"], "missing")
         self.assertFalse((self.refs / "home.png").exists())
+
+    def test_an_identical_capture_still_matches_at_the_default_share(self):
+        self.record("home", solid())
+        entry = self.store().check("home", solid())
+        self.assertEqual((entry["status"], entry["changed"], entry["allowed"], entry["compared"]), ("match", 0, 0, 5000))
+
+    def test_one_changed_pixel_in_a_full_size_capture_fails_at_the_default_share(self):
+        size = (2560, 1600)                  # a panel capture: 4,096,000 pixels, so one pixel is 0.0000244% of them
+        self.record("home", solid(size=size))
+        changed = solid(size=size)
+        changed.putpixel((1280, 800), (255, 255, 255))
+        store = self.store()
+        entry = store.check("home", changed)
+        self.assertEqual((entry["status"], entry["changed"], entry["allowed"], entry["compared"]), ("diff", 1, 0, 4096000))
+        self.assertEqual(round(entry["fraction"], 6), 0.0)   # the old rounded fraction: it called this capture a match
+        self.assertEqual(store.failures(), [entry])
+        self.assertTrue(Path(entry["heat_map"]).exists())
+
+    def test_a_change_just_inside_and_just_over_the_allowed_share(self):
+        def changed(count, size=(100, 50)):
+            image = solid(size=size)
+            for i in range(count):
+                image.putpixel((i % size[0], i // size[0]), (255, 0, 0))
+            return image
+        self.record("home", solid())                         # 5000 pixels
+        store = self.store(max_fraction=0.01)                # floor(0.01 * 5000) = 50
+        self.assertEqual([store.check("home", changed(n))["status"] for n in (49, 50, 51)], ["match", "match", "diff"])
+        self.record("small", solid(size=(10, 10)))           # 100 pixels
+        store = self.store(max_fraction=0.29)                # 29, as the decimal 0.29 says (not 28)
+        self.assertEqual([store.check("small", changed(n, (10, 10)))["status"] for n in (28, 29, 30)],
+                         ["match", "match", "diff"])
+        self.record("panel", solid(size=(2560, 1600)))       # 4,096,000 pixels
+        store = self.store(max_fraction=1e-6)                # floor(4.096) = 4; rounded to 6 places, 4 and 5 both look like 1e-6
+        self.assertEqual([store.check("panel", changed(n, (2560, 1600)))["status"] for n in (4, 5)], ["match", "diff"])
+
+    def test_masks_that_cover_the_whole_capture_fail_instead_of_matching(self):
+        self.record("home", solid())
+        changed = solid()
+        changed.paste((255, 0, 0), (0, 0, 40, 20))
+        store = self.store()
+        entry = store.check("home", changed, masks=[shotdiff.Region(0.0, 0.0, 1.0, 1.0)])
+        self.assertEqual(entry["status"], "empty")
+        self.assertIn("mask leaves nothing to compare", entry["note"])
+        self.assertNotIn("changed", entry)                   # nothing was compared, so there is no zero to read as a pass
+        self.assertEqual(store.failures(), [entry])
+        self.assertIn("| home | empty |", store.render_report())
+        self.assertIn("mask leaves nothing to compare", store.render_report())
+
+    def test_a_sidecar_mask_over_everything_fails_even_an_identical_capture(self):
+        self.record("home", solid())
+        (self.refs / "home.mask").write_text("0 0 1 1\n")
+        self.assertEqual(self.store().check("home", solid())["status"], "empty")
 
     def test_a_recorded_capture_matches_the_next_run(self):
         self.record("home", solid())

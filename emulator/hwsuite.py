@@ -3656,7 +3656,7 @@ class Runner:
             return sub(f"screenshot {name}", True, "staged as a reference if this check passes")
         if entry["status"] == "missing":
             return sub(f"screenshot {name}", False, entry["note"], blocked=True)
-        if entry["status"] == "size":
+        if entry["status"] in ("size", "empty"):
             return sub(f"screenshot {name}", False, entry["note"])
         return sub(f"screenshot {name}", entry["status"] == "match",
                    f"{entry['changed']} of {entry['compared']} pixels differ ({entry['fraction']:.3%}), box {entry['bbox']}"
@@ -4459,7 +4459,8 @@ def main(argv=None):
                         help="largest per-channel difference that still counts as equal, a whole number from 0 to 254 "
                              "(default 8)")
     parser.add_argument("--shots-share", type=shots_share_arg, default=None,
-                        help="share of compared pixels allowed to differ, from 0 up to but not including 1 (default 0)")
+                        help="share of compared pixels allowed to differ, rounded down to whole pixels (so 0 allows "
+                             "none): from 0 up to but not including 1 (default 0)")
     parser.add_argument("--fixtures", help="fixture directory (default <out>/fixtures)")
     parser.add_argument("--out", help="output directory (default <build>/hwsuite/<run id>)")
     parser.add_argument("--tier", choices=list(TIERS), default="full")

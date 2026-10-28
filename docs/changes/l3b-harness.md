@@ -114,9 +114,11 @@ the live negative control).
   (git-ignored: they show the firmware's screen). Nothing from a manufacturer's artwork is used.
   - `record` writes each capture to `<out>/shots/recorded/` and moves it into the reference folder only when its check
     PASSED, so a failing run never becomes the truth (an earlier design that recorded on the spot did exactly that).
-  - `compare` checks each capture against its reference. A changed capture fails its check (a sub-result with the changed
-    pixel count and box); a capture with no reference is BLOCKED ("run once with `--shots record`"); a different image size is
-    a FAIL reported as a size mismatch (another display scale gives another size).
+  - `compare` checks each capture against its reference. A capture fails when more than floor(share x compared pixels)
+    pixels changed, counted in whole pixels: with the default share of 0 a single changed pixel fails, however large the
+    capture. Its sub-result gives the changed pixel count and box. A capture with no reference is BLOCKED ("run once with
+    `--shots record`"); a different image size is a FAIL reported as a size mismatch (another display scale gives another
+    size); masks that leave no pixel to compare are a FAIL ("mask leaves nothing to compare"), never a match.
   - Every run with `--shots` writes `shots-report.md`, a heat map `shots/<name>-diff.png` for each difference, and a `shots`
     block in the result JSON.
   - `--shots-tolerance N` is a whole number from 0 to 254 and `--shots-share F` is from 0 up to, but not including, 1: the
@@ -183,6 +185,13 @@ counters mean; the persistent-session behaviour above is inferred from the guest
 | 2, blocking: the testmode build's firmware was not checked against the profile | `8e7d26f` | pt-i44.11 | `check_firmware` takes the build and returns the id it checked; `run()` refuses before any VM starts, `testmode_checks` checks again where it launches, passes that id to `launch` and stops a session that reports another id; an unreadable manifest is an `EnvError`; the result records the testmode build and firmware | quick set 393 OK; 6 new tests fail on the old code; live HW-48 PASS 10 of 10 |
 | 3, non-blocking: `--testmode-skip` accepted unknown control names | `52a78bb` | pt-i44.11 | `check_testmode_skip` for the parser and the `Runner`; an unknown name is refused with the closest control suggested | quick set 397 OK, `test_sp16_sessionctl` 20 OK; 4 new tests fail on the old code |
 
+Round 2 (the commit after `965c97e`), two more blocking findings in `shotdiff`: the changed share was rounded to six
+places before it was compared with the allowed share, so one changed pixel in 3.9 million passed at share 0; and masks that
+covered the whole capture left nothing compared, which counted as a match. The decision is now on whole pixels
+(`allowed_changes`: floor(share x compared pixels), the share read as the decimal it was written as) and an empty comparison
+is an `EmptyComparison` error that fails (status `empty`). The fraction is kept exact and rounded only where it is shown.
+Per-control checking in HW-49 (the attribution weakness in section 2) is left to a follow-up task by the owner's decision.
+
 Two choices to know about:
 
 - The tolerance range is 0 to 254, not 0 to 255: two 8-bit channels differ by at most 255, so 255 switches the comparison off
@@ -236,5 +245,5 @@ None.
 - References are per firmware version and per display scale (a Retina panel capture is 2560x1600; another display gives
   another size, reported as a size mismatch, not a diff).
 - HW-49 attribution by name is weak when the page reorders events (see section 2). A stronger check would compare the
-  page's status line with the control just pressed; not done.
+  page's status line with the control just pressed; the owner made it a follow-up task.
 - Should extras (HW-47..HW-53) get their own line in `docs/hardware-suite.md`'s verification rules, or stay out of them as now?

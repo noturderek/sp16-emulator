@@ -693,6 +693,22 @@ class ShotRegressionTests(unittest.TestCase):
         changed.paste((255, 0, 0), (0, 0, 20, 20))
         self.assertEqual(self.shot(self.make("compare"), "home-panel", changed, masks)["status"], "FAIL")
 
+    def test_a_single_changed_pixel_fails_at_the_default_share(self):
+        image = self.Image.new("RGB", (2560, 1600), (30, 30, 30))
+        self.record("home-panel", image)
+        changed = image.copy()
+        changed.putpixel((10, 10), (255, 255, 255))
+        result = self.shot(self.make("compare"), "home-panel", changed)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("1 of 4096000 pixels differ", result["observed"])
+
+    def test_masks_that_leave_nothing_to_compare_fail_the_capture(self):
+        image = self.Image.new("RGB", (200, 100), (30, 30, 30))
+        self.record("home-lcd", image)
+        result = self.shot(self.make("compare"), "home-lcd", image, masks=[(0.0, 0.0, 1.0, 1.0)])
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("mask leaves nothing to compare", result["observed"])
+
     def test_the_result_file_and_a_report_carry_the_shots(self):
         import types
         image = self.Image.new("RGB", (200, 100), (30, 30, 30))
