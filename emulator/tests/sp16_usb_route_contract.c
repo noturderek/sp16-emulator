@@ -3,6 +3,7 @@
 #include "/opt/sp16/seq-bridge.c"
 #undef main
 #include <assert.h>
+#include <stdlib.h>
 
 static void check_din_and_proxy(struct proxy_client clients[MAX_PROXY_CLIENTS],int peer) {
     int din[2];
@@ -27,6 +28,16 @@ static void check_din_and_proxy(struct proxy_client clients[MAX_PROXY_CLIENTS],i
 }
 
 int main(void) {
+    /* publish_usb_peer: the g_midi marker appears once the USB transport is open, never for an absent one (pt-i44.35). */
+    setenv("SP16_USB_MIDI_MODE_PATH","/tmp/run/usb-midi-enabled",1);
+    unlink("/tmp/run/usb-midi-enabled");
+    publish_usb_peer(-1);
+    assert(access("/tmp/run/usb-midi-enabled",F_OK)<0 && errno==ENOENT);
+    publish_usb_peer(0);
+    assert(access("/tmp/run/usb-midi-enabled",F_OK)==0);
+    unlink("/tmp/run/usb-midi-enabled");
+    unsetenv("SP16_USB_MIDI_MODE_PATH");
+
     int peers[2];
     assert(socketpair(AF_UNIX,SOCK_SEQPACKET,0,peers)==0);
     struct proxy_client clients[MAX_PROXY_CLIENTS];
