@@ -364,6 +364,17 @@ class LcdTouchTests(unittest.TestCase):
         self.assertEqual(raw, (512, 533))
         self.assertNotEqual(raw, panel_map.screen_to_touch_raw(400, 240))
 
+    def test_screen_touch_clamps_raw_words_under_non_default_calibration(self):
+        calibration = dict(panel_map.LCD_TOUCH_CALIBRATION)
+        calibration["raw_x"], calibration["raw_y"] = (1100, -100), (-100, 1200)
+        model = panel.PanelModel(touch_calibration=calibration)
+        self.assertEqual(model.lcd_touch(0, 0, "down"), protocol.INPUT_OK)
+        frame = model.frame()
+        self.assertEqual((self.word(frame, panel_map.LCD_TOUCH_X_OFFSET),
+                          self.word(frame, panel_map.LCD_TOUCH_Y_OFFSET)), (1023, 0))
+        self.assertIsNotNone(panel.decode_rx(frame))
+        self.assertTrue(model.touch_contact)
+
     def test_raw_injection_bypasses_calibration_and_is_range_checked(self):
         model = panel.PanelModel()
         self.assertEqual(model.lcd_touch_raw(500, 400, True), protocol.INPUT_OK)

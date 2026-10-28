@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-53 checks (HW-01..HW-54; HW-47..HW-54 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
+54 checks (HW-01..HW-54; HW-47..HW-54 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
