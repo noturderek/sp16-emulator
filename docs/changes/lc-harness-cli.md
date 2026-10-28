@@ -74,7 +74,7 @@ these modules cover every file this lane touched.
 8. **Worktree builds.** `prepare.private_path()` asks git which working tree holds the path and accepts a sibling
    worktree with the same common git dir, so `--library ../sp16-emulator/build/sp16/library` and `--reuse-qemu-from
    ../sp16-emulator/build/qemu-source` work; another repository, a non-ignored path and a symlink parent are still
-   refused.
+   refused. The test's worktree folders are created 0o700, so a umask of 022 does not fail it.
 9. **CLI wiring.** `./sp16 midi ports|learn|preset|run` (each subcommand only its own options, PYTHONPATH set, the
    build dir default from `SP16EMU_BUILD_DIR`), `./sp16 ctl power|standby|pressure|calibrate`, `./sp16 hwsuite
    --testmode-build NAME` (default `build/NAME-testmode`), `--tier extra`, and the five hwsuite options wave 1 left

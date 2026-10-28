@@ -42,12 +42,15 @@ class PrivatePathTests(unittest.TestCase):
         """The reported bug: a build in ../sp16-emulator-worktrees/<lane> could not reuse the main checkout's
         build/sp16/library or build/qemu-source, because both must be Git-ignored inside the same repository."""
         worktree = self.worktree()
-        (worktree / "build").mkdir()
-        for path in (worktree / "build/sp16/library", worktree / "build/qemu-source"):
+        build = worktree / "build"
+        library, qemu = build / "sp16/library", build / "qemu-source"
+        for path in (build, library, qemu):
             path.mkdir(parents=True)
+            os.chmod(path, 0o700)  # mkdir keeps the umask; private_path wants owner-only
+        for path in (library, qemu):
             self.assertEqual(prepare.private_path(path), path)
         # and an output that does not exist yet, as --name creates it
-        self.assertEqual(prepare.private_path(worktree / "build/lane", fresh=True), worktree / "build/lane")
+        self.assertEqual(prepare.private_path(build / "lane", fresh=True), build / "lane")
 
     def test_a_plain_directory_outside_the_repository_is_refused(self):
         with self.assertRaisesRegex(ValueError, "worktree"):
