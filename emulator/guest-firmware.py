@@ -748,7 +748,7 @@ def apl_hook_line(apl_start):
     The emulator never runs the firmware's apl_start, but a firmware that loads a mod from the data volume does it with
     one line placed just before the app starts (for example `[ -f /root/data/mod.sh ] && (. /root/data/mod.sh)`). The
     init runs only that line, so such a mod is exercised the way the unit would. The line must be a single printable
-    ASCII line of at most APL_HOOK_MAX bytes; anything else is refused."""
+    ASCII line (a tab character is tolerated) of at most APL_HOOK_MAX bytes; anything else is refused."""
     try:
         lines = Path(apl_start).read_bytes().split(b"\n")
     except OSError:
@@ -758,7 +758,8 @@ def apl_hook_line(apl_start):
             continue
         hook = lines[index + 1].rstrip(b"\r")
         if not hook.strip() or len(hook) > APL_HOOK_MAX or any(byte < 32 or byte > 126 for byte in hook if byte != 9):
-            raise ValueError("the apl_start hook line is empty, longer than 240 bytes or not printable ASCII")
+            raise ValueError("the apl_start hook line is empty, longer than 240 bytes or not printable ASCII"
+                             " (a tab character is tolerated)")
         return hook.decode("ascii")
     return None
 

@@ -151,7 +151,7 @@ SP16_APL_HOOK <whatever the script printed>
 SP16_APL_HOOK rc=0
 ```
 
-- The line must be one printable-ASCII line of at most 240 bytes; anything else is refused (`SP16_APL_HOOK_ERROR`).
+- The line must be one printable-ASCII line (a tab character is tolerated) of at most 240 bytes; anything else is refused (`SP16_APL_HOOK_ERROR`).
   Without the marker nothing runs and no `SP16_APL_HOOK` line appears.
 - `rc=124` means the 10 second limit stopped it (`rc=137`: it ignored the stop signal and was killed 2 seconds later); a syntax error in the script gives `rc=2` and the app still starts
   (keep the `( … )` subshell so a broken script cannot stop the line itself).
