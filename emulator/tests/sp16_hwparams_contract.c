@@ -106,6 +106,10 @@ int main(void) {
     assert(snd_pcm_hw_params_set_format(handle,p,10)<0); /* S32_LE */
     assert(snd_pcm_hw_params_set_format(handle,p,14)<0); /* FLOAT_LE */
     assert(snd_pcm_close(handle)==0);
+    assert(snd_pcm_open(&handle,"hw:ak4458audio,1",0,0)==0);
+    assert(snd_pcm_hw_params_set_format(handle,p,2)==0);
+    assert(snd_pcm_hw_params_set_format(handle,p,6)<0);
+    assert(snd_pcm_close(handle)==0);
     assert(snd_pcm_open(&handle,"unmodeled",0,0)==0);
     assert(snd_pcm_hw_params_set_format(handle,p,14)==0);
     assert(snd_pcm_close(handle)==0);

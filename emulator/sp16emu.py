@@ -682,6 +682,7 @@ RUN_OPTS = [
     Opt("--no-audio-files", "Audio builds (--audio file or both): keep reading and counting the guest's audio (metrics) "
         "but write no WAV into the session folder, for unattended runs that read no audio (about 28 MB a minute "
         "otherwise).", flag=True),
+    Opt("--midi", "Start the CoreMIDI DIN bridge for this session.", flag=True),
 ]
 
 
@@ -3026,7 +3027,7 @@ def make_commands():
         "run", "Build and run", "Launch a built emulator app",
         "Opens build/NAME with `open -n`; close the window to stop the emulator. The first boot of each firmware "
         "creates a 1 GB data image for it in the library; projects and settings persist there.",
-        opts=RUN_OPTS, usage="./sp16 run [--name NAME] [--firmware ID] [--usb-image PATH | --no-usb] [--ephemeral] [--dev-overlay DIR] [--no-ui-input] [--no-audio-files] [--net MODE]",
+        opts=RUN_OPTS, usage="./sp16 run [--name NAME] [--firmware ID] [--usb-image PATH | --no-usb] [--ephemeral] [--dev-overlay DIR] [--no-ui-input] [--no-audio-files] [--net MODE] [--midi]",
         examples=["./sp16 run", "./sp16 run --name sp16-dev --firmware ID",
                   "./sp16 run --usb-image ~/sticks/other.img", "./sp16 run --no-usb", "./sp16 run --ephemeral",
                   "./sp16 run --net host   # a NIC on the socket_vmnet host network",

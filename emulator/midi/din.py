@@ -105,8 +105,9 @@ class PacedInput:
                 if not self.realtime and not self.normal:
                     return
                 release_ns, byte = (self.realtime if self.realtime else self.normal).popleft()
-            deadline = max(self.clock(), self.next_ns, release_ns) + BYTE_NS
-            delay = (deadline - self.clock()) / 1_000_000_000
+            now = self.clock()
+            deadline = max(now, self.next_ns, release_ns) + BYTE_NS
+            delay = (deadline - now) / 1_000_000_000
             if delay > 0:
                 self.sleep(delay)
             if self.cancelled.is_set():

@@ -535,6 +535,20 @@ class PersistenceArgumentTests(unittest.TestCase):
                 native.launch("/b", no_ui_input=bench, no_audio_files=True)
                 run.assert_called_once_with(expected)
 
+    def test_din_helper_starts_only_when_midi_is_requested(self):
+        from unittest import mock
+        assets = {"app_bundle": "/b/SP16.app", "decoupled": True, "research": True}
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(native, "host_check"), \
+                mock.patch.object(native, "private_path", side_effect=Path), \
+                mock.patch.object(native, "validated_assets", return_value=assets), \
+                mock.patch.object(native, "run"), mock.patch("subprocess.Popen") as helper, \
+                mock.patch("builtins.print"):
+            native.launch(folder)
+            helper.assert_not_called()
+            native.launch(folder, midi=True)
+            helper.assert_called_once()
+            self.assertIn("--wait-for-session", helper.call_args.args[0])
+
     def test_the_app_keeps_the_audio_sink_without_files_when_asked(self):
         """--no-audio-files: the sink still reads every PCM packet from the guest and keeps its counters (the guest's audio
         path and timing are the same as a file build's); it opens no WAV, and metrics say so."""

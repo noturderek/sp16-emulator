@@ -1,6 +1,7 @@
 /* The snddinmidi ALSA rawmidi card is a full-duplex 31,250 baud UART. Synthetic PTY bytes only. */
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
@@ -12,6 +13,7 @@
 typedef struct _snd_rawmidi snd_rawmidi_t;
 int snd_rawmidi_open(snd_rawmidi_t **,snd_rawmidi_t **,const char *,int);
 int snd_rawmidi_close(snd_rawmidi_t *);
+int snd_rawmidi_nonblock(snd_rawmidi_t *,int);
 int snd_rawmidi_poll_descriptors(snd_rawmidi_t *,struct pollfd *,unsigned int);
 ssize_t snd_rawmidi_read(snd_rawmidi_t *,void *,size_t);
 ssize_t snd_rawmidi_write(snd_rawmidi_t *,const void *,size_t);
@@ -39,18 +41,31 @@ int main(void) {
     assert(pfd.events==POLLIN);
     assert(snd_rawmidi_poll_descriptors(out,&pfd,1)==1);
     assert(pfd.events==POLLOUT);
+    uint8_t received[3];
+    assert(snd_rawmidi_nonblock(in,1)==0);
+    assert(snd_rawmidi_read(in,received,1)==-EAGAIN);
     const uint8_t note[]={0x90,60,100};
     uint64_t begin=ns();
     assert(snd_rawmidi_write(out,note,sizeof(note))==3);
     uint64_t elapsed=ns()-begin;
     assert(elapsed>=900000ULL); /* 3 UART bytes at 320 us each, with scheduling tolerance */
-    uint8_t received[3];
     assert(read(master,received,sizeof(received))==3);
     assert(!memcmp(received,note,3));
+    assert(snd_rawmidi_nonblock(in,0)==0);
     const uint8_t inbound[]={0x80,60,0};
     assert(write(master,inbound,sizeof(inbound))==3);
     assert(snd_rawmidi_read(in,received,sizeof(received))==3);
     assert(!memcmp(received,inbound,3));
+    int gpio=open("/dev/gpiodrv",O_RDWR);
+    assert(gpio>=0 && lseek(gpio,5,SEEK_SET)==5);
+    uint8_t thru=1;
+    assert(write(gpio,&thru,1)==1);
+    assert(write(master,inbound,sizeof(inbound))==3);
+    begin=ns();
+    assert(snd_rawmidi_read(in,received,sizeof(received))==3);
+    assert(ns()-begin>=900000ULL); /* THRU bytes use the same 320 us wire slots. */
+    assert(read(master,received,sizeof(received))==3 && !memcmp(received,inbound,3));
+    assert(close(gpio)==0);
     assert(snd_rawmidi_close(in)==0 && snd_rawmidi_close(out)==0);
     assert(close(control)==0 && close(master)==0);
     return 0;

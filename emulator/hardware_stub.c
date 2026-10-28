@@ -323,7 +323,7 @@ static ssize_t midi_write(struct state *s,const void *buffer,size_t count) {
 typedef struct _snd_rawmidi snd_rawmidi_t;
 #define RAWMIDI_MAGIC 0x534d4944u
 #define MIDI_BYTE_NS 320000ULL
-struct fake_rawmidi { uint32_t magic; int fd, input; };
+struct fake_rawmidi { uint32_t magic; int fd, input, nonblock; };
 static volatile int rawmidi_wire_lock;
 static uint64_t rawmidi_next_ns;
 static int rawmidi_fd=-1;
@@ -334,7 +334,7 @@ static int rawmidi_open_port(void) {
     if (rawmidi_fd>=0) return rawmidi_fd;
     const char *path=getenv("SP16_DIN_PORT");
     if (!path) path="/dev/sp16-din";
-    int fd=original_open(path,O_RDWR|O_CLOEXEC);
+    int fd=original_open(path,O_RDWR|O_CLOEXEC|O_NONBLOCK);
     if (fd>=0) rawmidi_fd=fd;
     return fd;
 }
@@ -348,8 +348,8 @@ int snd_rawmidi_open(snd_rawmidi_t **input,snd_rawmidi_t **output,const char *na
     struct fake_rawmidi *in=NULL,*out=NULL;
     if (input) { in=calloc(1,sizeof(*in)); if (!in) return -ENOMEM; }
     if (output) { out=calloc(1,sizeof(*out)); if (!out) { free(in); return -ENOMEM; } }
-    if (in) { in->magic=RAWMIDI_MAGIC; in->fd=port; in->input=1; *input=(snd_rawmidi_t *)in; }
-    if (out) { out->magic=RAWMIDI_MAGIC; out->fd=port; *output=(snd_rawmidi_t *)out; }
+    if (in) { in->magic=RAWMIDI_MAGIC; in->fd=port; in->input=1; in->nonblock=!!(mode&1); *input=(snd_rawmidi_t *)in; }
+    if (out) { out->magic=RAWMIDI_MAGIC; out->fd=port; out->nonblock=!!(mode&1); *output=(snd_rawmidi_t *)out; }
     fprintf(stderr,"[sp16-ui-stub] rawmidi %s -> %s input=%d output=%d\n",name,
             getenv("SP16_DIN_PORT")?getenv("SP16_DIN_PORT"):"/dev/sp16-din",!!input,!!output);
     return 0;
@@ -365,19 +365,46 @@ int snd_rawmidi_close(snd_rawmidi_t *handle) {
 int snd_rawmidi_nonblock(snd_rawmidi_t *handle,int nonblock) {
     int (*real)(snd_rawmidi_t *,int)=dlsym(RTLD_NEXT,"snd_rawmidi_nonblock");
     if (!rawmidi_is_fake(handle)) return real?real(handle,nonblock):-ENOSYS;
-    int flags=fcntl(((struct fake_rawmidi *)handle)->fd,F_GETFL);
-    return flags<0?-errno:fcntl(((struct fake_rawmidi *)handle)->fd,F_SETFL,nonblock?flags|O_NONBLOCK:flags&~O_NONBLOCK)<0?-errno:0;
+    __atomic_store_n(&((struct fake_rawmidi *)handle)->nonblock,!!nonblock,__ATOMIC_RELEASE);
+    return 0;
+}
+static int rawmidi_write_byte(int fd,uint8_t byte,int nonblock) {
+    while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
+    uint64_t now=mono_ns();
+    uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
+    struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
+    int slept;
+    do { slept=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); } while (slept==EINTR);
+    int error=slept;
+    if (!error) for (;;) {
+        ssize_t wrote=original_write(fd,&byte,1);
+        if (wrote==1) break;
+        error=wrote==0 ? EIO : errno;
+        if (error!=EAGAIN || nonblock) break;
+        struct pollfd ready={ .fd=fd,.events=POLLOUT };
+        if (poll(&ready,1,-1)<0 && errno!=EINTR) { error=errno; break; }
+        error=0;
+    }
+    rawmidi_next_ns=target;
+    __sync_lock_release(&rawmidi_wire_lock);
+    return error ? -error : 0;
 }
 ssize_t snd_rawmidi_read(snd_rawmidi_t *handle,void *buffer,size_t count) {
     ssize_t (*real)(snd_rawmidi_t *,void *,size_t)=dlsym(RTLD_NEXT,"snd_rawmidi_read");
     if (!rawmidi_is_fake(handle)) return real?real(handle,buffer,count):-ENOSYS;
     struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
     if (!fake->input) return -EBADF;
-    ssize_t n=original_read(fake->fd,buffer,count);
+    ssize_t n;
+    for (;;) {
+        n=original_read(fake->fd,buffer,count);
+        if (n>=0 || errno!=EAGAIN || __atomic_load_n(&fake->nonblock,__ATOMIC_ACQUIRE)) break;
+        struct pollfd ready={ .fd=fake->fd,.events=POLLIN };
+        if (poll(&ready,1,-1)<0 && errno!=EINTR) return -errno;
+    }
     if (n>0 && gpio_ready && __atomic_load_n(&gpio_level[5],__ATOMIC_ACQUIRE)==1) {
         /* MIDI_PASS is the hardware THRU gate. Echo incoming bytes to the host, not back to the app. */
         const uint8_t *bytes=buffer;
-        for (ssize_t i=0;i<n;i++) original_write(fake->fd,bytes+i,1);
+        for (ssize_t i=0;i<n;i++) (void)rawmidi_write_byte(fake->fd,bytes[i],0);
     }
     return n<0?-errno:n;
 }
@@ -388,17 +415,8 @@ ssize_t snd_rawmidi_write(snd_rawmidi_t *handle,const void *buffer,size_t count)
     if (fake->input) return -EBADF;
     const uint8_t *bytes=buffer;
     for (size_t i=0;i<count;i++) {
-        while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
-        uint64_t now=mono_ns();
-        uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
-        struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
-        int sleep_result;
-        do { sleep_result=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); }
-        while (sleep_result==EINTR);
-        ssize_t wrote=sleep_result? -1 : original_write(fake->fd,bytes+i,1);
-        rawmidi_next_ns=target;
-        __sync_lock_release(&rawmidi_wire_lock);
-        if (wrote!=1) return i?(ssize_t)i:-(sleep_result?sleep_result:errno);
+        int result=rawmidi_write_byte(fake->fd,bytes[i],__atomic_load_n(&fake->nonblock,__ATOMIC_ACQUIRE));
+        if (result) return i?(ssize_t)i:result;
     }
     return (ssize_t)count;
 }
@@ -804,7 +822,8 @@ static const char *access_label(int access) {
 }
 int snd_pcm_open(snd_pcm_t **handle, const char *name, int stream, int mode) {
     int (*real)(snd_pcm_t **,const char *,int,int)=dlsym(RTLD_NEXT,"snd_pcm_open");
-    int matched=!strcmp(name,"hw:ak4452audio,0") || !strcmp(name,"hw:ak4452audio,1") || !strcmp(name,"hw:ak4458audio,0");
+    int matched=!strcmp(name,"hw:ak4452audio,0") || !strcmp(name,"hw:ak4452audio,1") ||
+                !strncmp(name,"hw:ak4458audio,",15);
     int result=real(handle,matched?"null":name,stream,mode);
     if (matched) {
         fprintf(stderr,"[sp16-ui-stub] PCM %s -> null stream=%d result=%d\n",name,stream,result);
@@ -840,7 +859,7 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
 static int codec_refuses(const struct pcm_state *s,int format) {
     const char *any=getenv("SP16_PCM_ANY_FORMAT");
     if (!s || (any && !strcmp(any,"1"))) return 0;
-    if (!strcmp(s->name,"hw:ak4458audio,0")) return format!=2;
+    if (!strncmp(s->name,"hw:ak4458audio,",15)) return format!=2;
     if (!strncmp(s->name,"hw:ak4452audio,",15)) return format!=2 && format!=6;
     return 0;
 }
