@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,9 +24,10 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <sound/asequencer.h>
 
 #define MAX_FDS 1024
-enum device { NONE, PANEL, CDC, DAC, BACKLIGHT, MEDIA, PACKET, MIDI, GPIO, MIDI_CONTROL };
+enum device { NONE, PANEL, CDC, DAC, BACKLIGHT, MEDIA, PACKET, MIDI, GPIO, MIDI_CONTROL, SEQUENCER };
 /* media: 1 = /proc/udev_usb1, 2 = /proc/udev_usbctn1 (only meaningful when kind==MEDIA). */
 struct state { enum device kind; int peer; uint32_t interval, bytes, offset; uint16_t bits; uint8_t timer, endian, input, media; };
 struct spi_message { uint8_t multi_id, reserved, part_id, part_num; uint32_t bytes; uint64_t tx_buf; };
@@ -197,6 +199,24 @@ static int idle_socket(enum device kind) {
     return pair[0];
 }
 
+/* The native DIN bridge owns ALSA and the UART. The ARM process keeps a real
+ * pollable socket fd; fixed-size 32-bit sequencer events cross it unchanged. */
+static int sequencer_socket(void) {
+    const char *path=getenv("SP16_SEQ_PROXY");
+    if (!path) path="/dev/sp16-seq-proxy";
+    if (!*path || strlen(path)>=sizeof(((struct sockaddr_un *)0)->sun_path)) { errno=EINVAL; return -1; }
+    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
+    if (fd<0) return -1;
+    if (fd>=MAX_FDS) { original_close(fd); errno=EMFILE; return -1; }
+    struct sockaddr_un address={.sun_family=AF_UNIX};
+    strcpy(address.sun_path,path);
+    if (connect(fd,(struct sockaddr *)&address,sizeof address)<0 && errno!=EINPROGRESS) {
+        int error=errno; original_close(fd); errno=error; return -1;
+    }
+    devices[fd]=(struct state){.kind=SEQUENCER,.peer=-1};
+    return fd;
+}
+
 __attribute__((constructor)) static void initialize(void) {
     owner_pid = getpid();
     original_open = dlsym(RTLD_NEXT, "open");
@@ -302,6 +322,7 @@ static int media_socket(int node) {
 }
 
 static enum device classify(const char *path) {
+    if (!strcmp(path, "/dev/snd/seq")) return SEQUENCER;
     if (!strcmp(path, "/dev/subucom_spi0.1")) return PANEL;
     if (!strcmp(path, "/dev/cdc_spi2.0")) return CDC;
     if (!strcmp(path, "/dev/dac_spi4.0")) return DAC;
@@ -583,6 +604,7 @@ static int open_device(const char *path, int flags, mode_t mode) {
         if (din_control_request(UINT32_MAX)<0) return -1;
         fd=idle_socket(kind);
     }
+    else if (kind==SEQUENCER) fd=sequencer_socket();
     else if (kind==GPIO) fd=gpio_open();
     else if (kind==MEDIA) {
         int node=!strcmp(path,"/proc/udev_usbctn1")?2:1;
@@ -593,6 +615,11 @@ static int open_device(const char *path, int flags, mode_t mode) {
         }
     }
     else fd=idle_socket(kind);
+    if (fd>=0 && kind==SEQUENCER) {
+        static unsigned next_client=129;
+        devices[fd].offset=__atomic_fetch_add(&next_client,1,__ATOMIC_RELAXED);
+        devices[fd].bytes=0;
+    }
     fprintf(stderr, "[sp16-ui-stub] open %s => fd=%d\n", path, fd);
     return fd;
 }
@@ -654,6 +681,20 @@ ssize_t write(int fd, const void *buffer, size_t count) {
         if (s->peer<0) return media_write(s,fd,buffer,count);
     }
     if (s->kind==MIDI) return midi_write(s,buffer,count);
+    if (s->kind==SEQUENCER) {
+        if (!buffer || count%sizeof(struct snd_seq_event)) { errno=EINVAL; return -1; }
+        const struct snd_seq_event *events=buffer;
+        size_t done=0;
+        for (; done<count; done+=sizeof *events) {
+            const struct snd_seq_event *event=(const void *)((const uint8_t *)buffer+done);
+            if (event->flags & SNDRV_SEQ_EVENT_LENGTH_MASK) { errno=EOPNOTSUPP; break; }
+            uint8_t packet[1+sizeof *event];
+            packet[0]='E'; memcpy(packet+1,event,sizeof *event);
+            if (send(fd,packet,sizeof packet,MSG_NOSIGNAL)!=sizeof packet) break;
+        }
+        if (done) return (ssize_t)done;
+        return -1;
+    }
     if (s->kind==MIDI_CONTROL) { errno=ENOTSUP; return -1; }
     if (s->kind==GPIO) return gpio_io(s,(void *)buffer,count,1);
     if (s->kind == MEDIA || s->kind==PACKET) { errno=ENOTSUP; return -1; }
@@ -685,6 +726,7 @@ ssize_t read(int fd, void *buffer, size_t count) {
         return result;
     }
     if (s->kind==MIDI) return original_read(fd,buffer,count); /* the loopback cable */
+    if (s->kind==SEQUENCER) return original_read(fd,buffer,count);
     if (s->kind==MIDI_CONTROL) { errno=ENOTSUP; return -1; }
     if (s->kind==GPIO) return gpio_io(s,buffer,count,0);
     if (s->kind==MEDIA) {
@@ -702,7 +744,7 @@ ssize_t read(int fd, void *buffer, size_t count) {
 static void note_ioctl(unsigned long request, enum device kind) {
     static unsigned long seen[32];
     static int count;
-    static const char *names[] = {"none", "panel", "cdc", "dac", "backlight", "media", "packet", "midi", "gpio", "din-control"};
+    static const char *names[] = {"none", "panel", "cdc", "dac", "backlight", "media", "packet", "midi", "gpio", "din-control", "sequencer"};
     int known = __atomic_load_n(&count, __ATOMIC_ACQUIRE);
     for (int i=0; i<known && i<32; i++) if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED)==request) return;
     int slot = __atomic_fetch_add(&count, 1, __ATOMIC_ACQ_REL);  /* a racing duplicate line is harmless */
@@ -809,6 +851,90 @@ int ioctl(int fd, unsigned long request, ...) {
 }
 
 static int device_ioctl(struct state *s, int fd, unsigned long request, void *arg) {
+    if (s->kind==SEQUENCER) {
+        static unsigned long seq_seen[32];
+        static unsigned seq_count;
+        int known=0;
+        for (unsigned i=0;i<seq_count;i++) if (seq_seen[i]==request) known=1;
+        if (!known && seq_count<32) {
+            seq_seen[seq_count++]=request;
+            fprintf(stderr,"[sp16-ui-stub] MIDI seq ioctl request=0x%lx\n",request);
+        }
+        if (!arg) { errno=EFAULT; return -1; }
+        if (request==SNDRV_SEQ_IOCTL_PVERSION) { *(int *)arg=SNDRV_SEQ_VERSION; return 0; }
+        if (request==SNDRV_SEQ_IOCTL_CLIENT_ID) { *(int *)arg=(int)s->offset; return 0; }
+        if (request==SNDRV_SEQ_IOCTL_RUNNING_MODE) {
+            struct snd_seq_running_info *info=arg;
+            info->client=(uint8_t)s->offset; info->big_endian=0; info->cpu_mode=4;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_SYSTEM_INFO) {
+            struct snd_seq_system_info *info=arg;
+            memset(info,0,sizeof *info);
+            info->queues=32; info->clients=256; info->ports=32; info->channels=16;
+            info->cur_clients=3;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_QUERY_NEXT_CLIENT) {
+            struct snd_seq_client_info *info=arg;
+            int after=info->client;
+            if (after>=128) { errno=ENOENT; return -1; }
+            memset(info,0,sizeof *info);
+            info->client=128; info->type=KERNEL_CLIENT;
+            strcpy(info->name,"snd-din-midi"); info->num_ports=1;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_QUERY_NEXT_PORT) {
+            struct snd_seq_port_info *info=arg;
+            if (info->addr.client!=128 || info->addr.port!=255) { errno=ENOENT; return -1; }
+            memset(info,0,sizeof *info);
+            info->addr.client=128; info->addr.port=0;
+            strcpy(info->name,"DIN MIDI");
+            info->capability=SNDRV_SEQ_PORT_CAP_READ|SNDRV_SEQ_PORT_CAP_WRITE|
+                SNDRV_SEQ_PORT_CAP_SUBS_READ|SNDRV_SEQ_PORT_CAP_SUBS_WRITE;
+            info->type=SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC|SNDRV_SEQ_PORT_TYPE_HARDWARE;
+            info->midi_channels=16;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_GET_CLIENT_INFO) {
+            struct snd_seq_client_info *info=arg;
+            if (info->client!=128 && info->client!=(int)s->offset) { errno=ENOENT; return -1; }
+            int client=info->client;
+            memset(info,0,sizeof *info);
+            info->client=client; info->type=client==128?KERNEL_CLIENT:USER_CLIENT;
+            strcpy(info->name,client==128?"snd-din-midi":"SP-16 MIDI");
+            info->num_ports=client==128?1:(int)s->bytes;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_SET_CLIENT_INFO) return 0;
+        if (request==SNDRV_SEQ_IOCTL_CREATE_PORT) {
+            struct snd_seq_port_info *info=arg;
+            if (s->bytes>=16) { errno=ENOSPC; return -1; }
+            /* The kernel assigns both address fields. ALSA passes an unset
+             * client address when creating a simple port. */
+            info->addr.client=(uint8_t)s->offset;
+            info->addr.port=(uint8_t)s->bytes++;
+            fprintf(stderr,"[sp16-ui-stub] MIDI seq client=%u port=%u name=%s caps=0x%x\n",
+                    s->offset,info->addr.port,info->name,info->capability);
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT || request==SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT) {
+            struct snd_seq_port_subscribe *sub=arg;
+            int from_din=sub->sender.client==128 && sub->sender.port==0 &&
+                sub->dest.client==s->offset && sub->dest.port<s->bytes;
+            int to_din=sub->dest.client==128 && sub->dest.port==0 &&
+                sub->sender.client==s->offset && sub->sender.port<s->bytes;
+            if (!from_din && !to_din) { errno=EINVAL; return -1; }
+            char command=from_din?'I':'O';
+            if (request==SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT) command=(char)(command+('a'-'A'));
+            if (send(fd,&command,1,MSG_NOSIGNAL)!=1) return -1;
+            fprintf(stderr,"[sp16-ui-stub] MIDI seq %s %u:%u -> %u:%u\n",
+                    request==SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT?"subscribe":"unsubscribe",
+                    sub->sender.client,sub->sender.port,sub->dest.client,sub->dest.port);
+            return 0;
+        }
+        errno=ENOTTY; return -1;
+    }
     if (s->kind==BACKLIGHT && request==0x40047000UL) {
         if (!arg) { errno=EFAULT; return -1; }
         uint32_t level=*(const uint32_t *)arg;

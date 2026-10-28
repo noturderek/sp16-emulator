@@ -177,10 +177,10 @@ PYDEV
   /opt/sp16/din-seq-bridge > /dev/console 2>&1 &
   sp16_din_ready=0
   for sp16_din_try in 1 2 3 4 5 6 7 8 9 10; do
-    if [ -S /tmp/sp16-root/dev/sp16-din-control ]; then sp16_din_ready=1; break; fi
+    if [ -S /tmp/sp16-root/dev/sp16-din-control ] && [ -S /tmp/sp16-root/dev/sp16-seq-proxy ]; then sp16_din_ready=1; break; fi
     sleep .1
   done
-  if [ "$sp16_din_ready" != 1 ]; then echo 'SP16_DIN control=missing' > /dev/console; fi
+  if [ "$sp16_din_ready" != 1 ]; then echo 'SP16_DIN proxy=missing' > /dev/console; fi
   echo 'SP16_DIN sequencer=started' > /dev/console
 else
   echo 'SP16_DIN sequencer=missing' > /dev/console

@@ -37,6 +37,7 @@ run sp16_din_queue_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/
 run sp16_din_ioctl_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
 run sp16_din_contract "$CC /tmp/test.c /opt/sp16/libsp16-ui.so -o /tmp/run/t; $PRE /tmp/run/t"
 expect 'rawmidi hw:snddinmidi,0 ->'
+run sp16_seq_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
 run sp16_pcm_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run /tmp/run/t"
 run sp16_hwparams_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run /tmp/run/t"
 expect 'PCM hw:ak4452audio,1 set_access requested=3(RW_INTERLEAVED) result=0'
