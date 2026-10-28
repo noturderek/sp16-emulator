@@ -32,8 +32,10 @@ changes (a file that is still being written is picked up on a later look) and go
 test tone) when it is removed; replacing or removing it while the firmware plays is safe. Set `SP16_INPUT_WAV` to read
 another path. The chain is the board's: INPUT LEVEL gain, then
 the input limiter while the firmware holds the LIMIT line high, then the converter. `metrics.json` reports
-`guest.board.analog_levels`: peaks and a dBu readout of the input (metered after INPUT LEVEL, before the limiter) and of
-the MAIN output pair (converter full scale is taken as +16 dBu, grade I), `limiter_active`, `limited_samples`, and the source (`wav`, `tone` or `off`).
+`guest.board.analog_levels`: peaks and peak-equivalent dBu readouts (`in_dbu_peak` and `out_dbu_peak`,
+where dBu = dBFS + 16 and converter full scale is taken as +16 dBu peak-equivalent, grade I) of the input
+(metered after INPUT LEVEL, before the limiter) and of the MAIN output pair, `limiter_active`,
+`limited_samples`, and the source (`wav`, `tone` or `off`).
 `emulator/service_stimulus.py` sets the service manual's stimulus (-10 dBV in, INPUT LEVEL and MAIN OUT at maximum)
 on a running session.
 
@@ -65,12 +67,12 @@ or MODE3 (800x480 panel, buttons at y 145: x 272, 400, 528; LIMIT at x 656) and 
 dominant frequency of `audio-ak4458audio-0.wav`. Page 8 (DEVICE TEST) now renders; pages step one HOME press at a time,
 so wait for the title before the next press.
 
-## Monitor API (for an output monitor menu)
+## Output monitor menu and API
 
-- `AudioSink.OutputJack` (audio-sink.swift): `main`, `out34`, `out56`, `out78`, `phones`; `source` gives the stream id
-  and the two channels. `AudioSink.monitor` selects the jack the CoreAudio output plays (thread safe, flushes the
-  output queue on change). The WAV files never depend on it.
-- The guest sends channels 12..15 of the master stream by default. To monitor the other pairs the guest must send all
-  16: set `SP16_PCM_PORT_CHANNELS=0:16` (or put `0:16` in the overlay's `pcm-port-channels`). The sink then still
-  writes channels 12..15 to `audio-ak4458audio-0.wav`, so the WAV is unchanged, and offers every channel to the
-  monitor. Making that the default needs the held transport contract updated (see the cross-lane requests).
+- The host application provides an **Output** menu (MAIN, PHONES, OUT 3-4, OUT 5-6, OUT 7-8) and the research control
+  `./sp16 ctl monitor MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8` to select which jack pair CoreAudio plays (thread safe,
+  flushes the output queue on change). The menu is enabled when an audio sink exists. `metrics.json` reports the
+  selected jack in `audio.monitor`. The WAV files never depend on the monitor selection and always record the MAIN pair.
+- The guest sends all 16 master channels by default. `AudioSink.OutputJack` (`audio-sink.swift`) defines `main`,
+  `phones`, `out34`, `out56`, `out78`; `source` gives the stream id and channel pair. In file-only builds or when
+  monitoring MAIN, the historical WAV recording retains channels 12..15.
