@@ -96,6 +96,36 @@ class GuestOverlayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "32-bit ARM"):
             self.apply()
 
+    def test_a_restart_still_restores_a_file_the_overlay_put_in_the_data_volume(self):
+        """The record of written paths used to sit in /run, so after the VM restarted nothing remembered that an earlier
+        session had written through files/ into the persistent data directory, and the next session found the file."""
+        emmc = self.root / "mnt/emmc"
+        (emmc / ".sp16/data").mkdir(parents=True)
+        (self.share / "files/root/data").mkdir(parents=True)
+        (self.share / "files/root/data/mod.sh").write_text("echo mod\n")
+        self.assertTrue(guest.dev_state_path(self.root, profiles.LEGACY_PROFILE) == emmc / ".sp16/sp16-dev-applied.json")
+        guest.dev_apply({}, share=self.share, root=self.root, lower=self.lower, profile_id=profiles.LEGACY_PROFILE)
+        staged = self.root / "root/data/mod.sh"
+        self.assertTrue(staged.is_file())
+        self.assertEqual(json.loads((emmc / ".sp16/sp16-dev-applied.json").read_text())["paths"], ["/root/data/mod.sh"])
+        # The restart: only /run was lost, so the next session must restore from the record it finds on the volume.
+        (self.share / "files/root/data/mod.sh").unlink()
+        guest.dev_apply({}, share=self.share, root=self.root, lower=self.lower, profile_id=profiles.LEGACY_PROFILE)
+        self.assertFalse(staged.exists())
+        self.assertEqual(json.loads((emmc / ".sp16/sp16-dev-applied.json").read_text())["paths"], [])
+
+    def test_without_a_mounted_emmc_the_record_falls_back_to_run(self):
+        self.assertEqual(guest.dev_state_path(self.root, profiles.LEGACY_PROFILE), Path(guest.DEV_STATE))
+        self.assertEqual(guest.dev_state_path(self.root, "sp16-9.99"), Path(guest.DEV_STATE))
+
+    def test_an_overlay_may_not_write_the_record_of_written_paths(self):
+        emmc = self.root / "mnt/emmc"
+        (emmc / ".sp16").mkdir(parents=True)
+        (self.share / "files/mnt/emmc/.sp16").mkdir(parents=True)
+        (self.share / "files/mnt/emmc/.sp16/sp16-dev-applied.json").write_text("{}")
+        with self.assertRaisesRegex(ValueError, "overlay's own record"):
+            guest.dev_apply({}, share=self.share, root=self.root, lower=self.lower, profile_id=profiles.LEGACY_PROFILE)
+
     def test_recipe_can_patch_an_overlay_file(self):
         (self.share / "files/root/pdj").mkdir(parents=True)
         (self.share / "files/root/pdj/EP085_Main_R").write_bytes(BASE)

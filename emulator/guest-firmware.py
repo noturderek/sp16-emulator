@@ -609,9 +609,26 @@ def package_update(params):
 
 
 DEV_SHARE = "/opt/sp16/dev-share"
+# Where the record of the overlay's written paths lives. A record in /run is lost when the VM restarts, and then files an
+# earlier session wrote through files/ into the persistent data directory are never put back. The eMMC image's own
+# .sp16 directory survives a restart and is outside the app's data directory, so the record goes there; without a mounted
+# eMMC nothing under it can persist, so /run is the honest fallback.
 DEV_STATE = "/run/sp16-dev-applied.json"
+DEV_STATE_IN_EMMC = (".sp16", "sp16-dev-applied.json")
 DEV_PRELOAD_DIR = "/opt/sp16/dev"
 MAX_DEV_FILE = 256 << 20
+
+
+def dev_state_path(root, profile_id):
+    """The file that records which guest paths the overlay wrote, next to the firmware's own .sp16 data directory on the
+    eMMC image, or /run when this boot has no eMMC mounted."""
+    import prepare
+    try:
+        mount = profiles_module().load(profile_id)["runtime"]["emmc_mount"]
+        folder = prepare.guest_file(Path(root), mount) / DEV_STATE_IN_EMMC[0]
+    except (OSError, ValueError, KeyError):
+        return Path(DEV_STATE)
+    return folder / DEV_STATE_IN_EMMC[1] if folder.is_dir() else Path(DEV_STATE)
 
 
 def dev_plan(share, lower, profile_id):
@@ -672,18 +689,23 @@ def dev_restore(root, lower, paths):
             target.unlink()
 
 
-def dev_apply(params, share=DEV_SHARE, root=ROOT, lower=FW_LOWER, state=DEV_STATE, profile_id=None):
+def dev_apply(params, share=DEV_SHARE, root=ROOT, lower=FW_LOWER, state=None, profile_id=None):
     """Apply the developer overlay into the overlay's upper layer, never the read-only image. Transactional: on any
     error every touched path is restored and nothing of the overlay stays. Prints the preload list for the shell."""
     import prepare
     profile_id = profile_id or os.environ.get("SP16_PROFILE", "")
+    state = Path(state) if state is not None else dev_state_path(root, profile_id)
     try:
-        previous = json.loads(Path(state).read_text()).get("paths", [])
-    except (OSError, ValueError):
+        previous = json.loads(state.read_text()).get("paths", [])
+    except (OSError, ValueError, AttributeError):
         previous = []
     dev_restore(root, lower, previous)
-    Path(state).write_text(json.dumps({"paths": []}))
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"paths": []}))
     plan, applied, preload = dev_plan(share, lower, profile_id)
+    owned = {path for path in plan if prepare.guest_file(Path(root), path) == state}
+    if owned:
+        raise ValueError(f"overlay file {sorted(owned)[0]} is the overlay's own record of written paths")
     written = []
     try:
         for path, (data, mode) in sorted(plan.items()):
@@ -698,7 +720,7 @@ def dev_apply(params, share=DEV_SHARE, root=ROOT, lower=FW_LOWER, state=DEV_STAT
     except BaseException:
         dev_restore(root, lower, written)
         raise
-    Path(state).write_text(json.dumps({"paths": written}))
+    state.write_text(json.dumps({"paths": written}))
     app_path = params.get("sp16.app_path", "")
     app_sha = hashlib.sha256(prepare.guest_file(Path(root), app_path).read_bytes()).hexdigest() \
         if app_path else "unknown"
