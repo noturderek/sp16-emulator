@@ -457,10 +457,28 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         release.target = self
         inputMenu.addItem(release)
         inputItem.submenu = inputMenu
+        let midiItem = NSMenuItem(); menu.addItem(midiItem)
+        let midiMenu = NSMenu(title: "MIDI")
+        let routing = NSMenuItem(title: "Routing…", action: #selector(showMidiRouting), keyEquivalent: "")
+        routing.target = self
+        midiMenu.addItem(routing)
+        midiItem.submenu = midiMenu
         NSApp.mainMenu = menu
     }
 
     @objc func releaseAllHolds() { panel.releaseAll() }
+
+    // MARK: MIDI routing
+
+    private var midiRouting: MidiRoutingPreferences?
+
+    /// The MIDI routing preferences window (one live window; the notify proc reaches it through the window's own
+    /// active reference).
+    @objc func showMidiRouting() {
+        if midiRouting == nil { midiRouting = MidiRoutingPreferences() }
+        midiRouting?.showWindow(nil)
+        midiRouting?.window?.makeKeyAndOrderFront(nil)
+    }
 
     // MARK: Output monitor
 
