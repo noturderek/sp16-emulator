@@ -53,6 +53,19 @@ int main(int argc, char **argv) {
         int passthrough=arp && !strcmp(arp,"1");
         assert(domain==(passthrough?AF_PACKET:AF_UNIX));
         assert(close(packet)==0);
+    } else if (!strcmp(argv[1],"diag")) {
+        int one=1;
+        assert(setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one)==0);
+        assert(setsockopt(fd,SOL_SOCKET,SO_BROADCAST,&one,sizeof one)==0);
+        struct sockaddr_in local={.sin_family=AF_INET,.sin_port=htons(50002),.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+        assert(bind(fd,(struct sockaddr *)&local,sizeof local)==0);
+        struct sockaddr_in remote={.sin_family=AF_INET,.sin_port=htons(50000),.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+        const char bytes[4]={0,1,2,3};
+        assert(sendto(fd,bytes,sizeof bytes,0,(struct sockaddr *)&remote,sizeof remote)==sizeof bytes);
+        struct ifreq ifr={0};
+        strcpy(ifr.ifr_name,"lo");
+        assert(ioctl(fd,0x8915UL,&ifr)==0);
+        assert(ioctl(fd,0x891bUL,&ifr)==0);
     } else abort();
     assert(close(fd)==0);
     puts("network contract passed");

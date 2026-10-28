@@ -26,6 +26,17 @@ PROBES = {
     0x52A408: "GLINK_HELPER_RETURN",
     0x5258A8: "AUTOIP_MESSAGE",
     0x50CD18: "OPERATION",
+    0x50CD9C: "WORKER_START",
+    0x50C330: "WORKER_ENTRY",
+    0x50C3A4: "REUSEADDR_RETURN",
+    0x50C3B4: "RECEIVER_BIND_RETURN",
+    0x50C524: "WORKER_CLOSE",
+    0x50CAE8: "STATE_CHANGE",
+    0x51132C: "OPERATING_START",
+    0x510C10: "ANNOUNCEMENT_ENQUEUE",
+    0x515A30: "SENDER_ENTRY",
+    0x515AA8: "BROADCAST_RETURN",
+    0x515AD4: "SENDER_SEND_RETURN",
     0xFD78: "BIND",
     0x10744: "SENDTO",
 }
@@ -86,6 +97,36 @@ def hit(frame, _location, _internal):
         elif event == "OPERATION":
             operation = int.from_bytes(read(frame, reg(frame, "r1") + 0x20, 4), "little")
             emit(event, f"operation={operation}")
+        elif event in ("WORKER_START", "WORKER_ENTRY"):
+            worker = reg(frame, "r0")
+            port = int.from_bytes(read(frame, worker + 0xD4, 4), "little")
+            running = int.from_bytes(read(frame, worker + 8, 4), "little")
+            emit(event, f"worker=0x{worker:x} port={port} running={running}")
+        elif event in ("REUSEADDR_RETURN", "RECEIVER_BIND_RETURN"):
+            worker = reg(frame, "r5")
+            port = int.from_bytes(read(frame, worker + 0xD4, 4), "little")
+            result = reg(frame, "r0")
+            if result >= 0x80000000:
+                result -= 0x100000000
+            emit(event, f"worker=0x{worker:x} fd={reg(frame, 'r6')} port={port} result={result}")
+        elif event == "WORKER_CLOSE":
+            worker = reg(frame, "r5")
+            port = int.from_bytes(read(frame, worker + 0xD4, 4), "little")
+            emit(event, f"worker=0x{worker:x} fd={reg(frame, 'r6')} port={port}")
+        elif event == "STATE_CHANGE":
+            emit(event, f"state={reg(frame, 'r1')}")
+        elif event in ("OPERATING_START", "ANNOUNCEMENT_ENQUEUE"):
+            emit(event, "reached")
+        elif event == "SENDER_ENTRY":
+            message = reg(frame, "r1")
+            port = int.from_bytes(read(frame, message + 0x24, 4), "little")
+            broadcast = int.from_bytes(read(frame, message + 0x2C, 4), "little")
+            emit(event, f"port={port} broadcast={broadcast}")
+        elif event in ("BROADCAST_RETURN", "SENDER_SEND_RETURN"):
+            result = reg(frame, "r0")
+            if result >= 0x80000000:
+                result -= 0x100000000
+            emit(event, f"result={result}")
         elif event == "BIND":
             address = read(frame, reg(frame, "r1"), 4)
             if int.from_bytes(address[:2], "little") == 2:

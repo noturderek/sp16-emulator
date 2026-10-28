@@ -39,6 +39,8 @@ static int (*original_close)(int);
 static ssize_t (*original_read)(int, void *, size_t);
 static ssize_t (*original_write)(int, const void *, size_t);
 static int (*original_ioctl)(int, unsigned long, ...);
+static int network_diag_enabled(void);
+static int network_diag_port(const struct sockaddr *address, socklen_t length);
 static int usb_midi_enabled(void) {
     const char *path=getenv("SP16_USB_MIDI_MODE_PATH");
     return access(path?path:"/dev/sp16-usb-midi-enabled",F_OK)==0;
@@ -692,6 +694,13 @@ int64_t lseek64(int fd,int64_t offset,int whence) {
 
 int close(int fd) {
     if (!original_close) original_close=dlsym(RTLD_NEXT,"close");
+    int port=0;
+    if (network_diag_enabled()) {
+        struct sockaddr_in local;
+        socklen_t length=sizeof local;
+        if (getsockname(fd,(struct sockaddr *)&local,&length)==0)
+            port=network_diag_port((const struct sockaddr *)&local,length);
+    }
     struct state *s = device(fd);
     if (s) {
         int peer=s->peer;
@@ -711,7 +720,13 @@ int close(int fd) {
         memset(s, 0, sizeof(*s));
         if (peer>=0) original_close(peer);
     }
-    return original_close(fd);
+    int result=original_close(fd);
+    int saved_errno=errno;
+    if (port)
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG close fd=%d port=%d result=%d errno=%d\n",
+                fd,port,result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
 }
 
 ssize_t write(int fd, const void *buffer, size_t count) {
@@ -835,6 +850,17 @@ static int network_arp_enabled(void) {
     return value && !strcmp(value,"1");
 }
 
+static int network_diag_enabled(void) {
+    const char *value=getenv("SP16_NET_DIAG");
+    return value && !strcmp(value,"1");
+}
+
+static int network_diag_port(const struct sockaddr *address, socklen_t length) {
+    if (!address || length<sizeof(struct sockaddr_in) || address->sa_family!=AF_INET) return 0;
+    unsigned port=ntohs(((const struct sockaddr_in *)address)->sin_port);
+    return port>=50000 && port<=50002 ? (int)port : 0;
+}
+
 static int fake_eth0_enabled(void) {
     static int enabled=-1;
     if (enabled<0) { const char *v=getenv("SP16_FAKE_ETH0"); enabled = v && !strcmp(v,"1"); }
@@ -891,7 +917,21 @@ int ioctl(int fd, unsigned long request, ...) {
         int fake_result;
         if (network_glink_ioctl(request, arg, &fake_result)) return fake_result;
         if (fake_eth0_ioctl(request, arg, &fake_result)) return fake_result;
-        return original_ioctl(fd, request, arg);
+        int result=original_ioctl(fd, request, arg);
+        int saved_errno=errno;
+        if (network_diag_enabled() && (request==SP16_SIOCGIFADDR || request==SP16_SIOCGIFNETMASK)) {
+            int nonzero=0;
+            if (result==0 && arg) {
+                const struct ifreq *ifr=arg;
+                const struct sockaddr_in *in=(const struct sockaddr_in *)&ifr->ifr_addr;
+                nonzero=in->sin_family==AF_INET && in->sin_addr.s_addr!=0;
+            }
+            fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG ioctl request=0x%lx result=%d errno=%d %s=%d\n",
+                    request,result,result<0?saved_errno:0,
+                    request==SP16_SIOCGIFADDR?"address_nonzero":"mask_nonzero",nonzero);
+        }
+        errno=saved_errno;
+        return result;
     }
     int result = device_ioctl(s, fd, request, arg);
     if (result==0) note_ioctl(request, s->kind);
@@ -2107,11 +2147,36 @@ int bind(int fd,const struct sockaddr *address,socklen_t length) {
     int (*real)(int,const struct sockaddr *,socklen_t)=dlsym(RTLD_NEXT,"bind");
     struct state *s=device(fd);
     if (s && s->kind==PACKET && address && address->sa_family==AF_PACKET) return 0;
-    return real(fd,address,length);
+    int result=real(fd,address,length);
+    int saved_errno=errno;
+    int port=network_diag_port(address,length);
+    if (network_diag_enabled() && port)
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG bind fd=%d port=%d result=%d errno=%d\n",
+                fd,port,result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
+}
+int setsockopt(int fd,int level,int option,const void *value,socklen_t length) {
+    int (*real)(int,int,int,const void *,socklen_t)=dlsym(RTLD_NEXT,"setsockopt");
+    int result=real(fd,level,option,value,length);
+    int saved_errno=errno;
+    if (network_diag_enabled() && level==SOL_SOCKET && (option==SO_REUSEADDR || option==SO_BROADCAST))
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG setsockopt fd=%d option=%s result=%d errno=%d\n",
+                fd,option==SO_REUSEADDR?"SO_REUSEADDR":"SO_BROADCAST",
+                result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
 }
 ssize_t sendto(int fd,const void *buffer,size_t length,int flags,const struct sockaddr *address,socklen_t address_length) {
     ssize_t (*real)(int,const void *,size_t,int,const struct sockaddr *,socklen_t)=dlsym(RTLD_NEXT,"sendto");
     struct state *s=device(fd);
     if (s && s->kind==PACKET) return (ssize_t)length; /* discarded; never sent on a network */
-    return real(fd,buffer,length,flags,address,address_length);
+    ssize_t result=real(fd,buffer,length,flags,address,address_length);
+    int saved_errno=errno;
+    int port=network_diag_port(address,address_length);
+    if (network_diag_enabled() && port)
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG sendto fd=%d port=%d bytes=%zu result=%zd errno=%d\n",
+                fd,port,length,result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
 }

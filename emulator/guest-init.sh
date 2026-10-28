@@ -299,6 +299,10 @@ fi
 sp16_net_env=
 if [ -n "$sp16_have_nic" ]; then
   sp16_net_env="-E SP16_NET_GLINK=1 -E SP16_NET_ARP=1"
+  # The GDB trace build is research-only; keep socket diagnostics off in ordinary sessions.
+  case " $(cat /proc/cmdline) " in
+    *" sp16.trace=gdb "*) sp16_net_env="$sp16_net_env -E SP16_NET_DIAG=1" ;;
+  esac
 fi
 # Research builds only (native.py --research --trace): opt-in QEMU user-mode tracing, default off.
 sp16_trace_args=
