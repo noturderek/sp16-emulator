@@ -117,6 +117,18 @@ python3 emulator/sync/bridge.py --duration 60                           # --link
 The bridge is stdlib only and reads the segment directly, so it also works against a real master on a bridged or host
 network as long as the packets reach it.
 
+## Diagnosing the network
+
+A build with `--research --trace gdb` and a NIC keeps the shim's network diagnostics on: `SP16_NET_DIAG=1` makes the
+shim print one line per address query, ioctl, bind, close, socket option and `sendto` with its numeric result, errno
+and port — never an address, a MAC or a payload. Ordinary sessions keep it off.
+
+The diagnostics themselves show up on the guest console, which is what makes a "the app binds but the segment sees
+nothing" question answerable: if the guest logs `sendto` returning 54 bytes and the relay or `segment_watch.py` sees no
+frame, the loss is host-side. `emulator/net/diag/carrier.py` is an optional LLDB probe script for the same session (it
+stops at the firmware's GLINK, autoconfiguration and socket routines, and its `force_up` switch only overrides a return
+register for observation — it is not validation of anything).
+
 ## Not there
 
 - Beat/DJ-link features beyond tempo: track info, cue and seek messages, and the on-screen link view are not emulated
