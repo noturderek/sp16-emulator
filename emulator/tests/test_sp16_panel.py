@@ -58,6 +58,15 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 protocol.decode_research(bad)
 
+    def test_standby_round_trip_and_bounds(self):
+        for flag in (False, True):
+            wire = protocol.encode_standby(flag)
+            self.assertEqual(wire[4], protocol.STANDBY)
+            self.assertEqual(protocol.decode_standby(wire[5:]), flag)
+        for bad in (b"", b"\x02", b"\0\0"):
+            with self.assertRaises(ValueError):
+                protocol.decode_standby(bad)
+
 
 class PanelModelTests(unittest.TestCase):
     def selector(self):
@@ -574,6 +583,33 @@ class BoardModelTests(unittest.TestCase):
                       source)
         self.assertIn('"[sp16-ui-stub] midi loopback %s first bytes=%ld\\n"', source)
         self.assertIn('"[sp16-ui-stub] gpio GPIO%u_IO%02u=%u %s\\n"', source)
+
+    def test_bridge_reads_the_standby_flag_from_a_complete_tx_frame(self):
+        spec = importlib.util.spec_from_file_location("sp16_bridge_standby", TOOLS / "guest-bridge.py")
+        source = (TOOLS / "guest-bridge.py").read_text()
+        start, end = source.index("DAC_WORD = "), source.index("def main():")
+        scope = {"re": re, "panel_map": panel_map}
+        exec(compile(source[start:end], str(spec.origin), "exec"), scope)
+        frame = bytearray(128)
+        frame[0], frame[0x77], frame[0x67] = 2, 0xaa, 1
+        self.assertTrue(scope["standby_flag"](bytes(frame)))
+        frame[0x67] = 0
+        self.assertFalse(scope["standby_flag"](bytes(frame)))
+        self.assertIsNone(scope["standby_flag"](bytes(127)))   # an incomplete frame never carries the flag
+
+    def test_the_standby_message_leaves_the_research_txlog_gate(self):
+        # FINDING 7: standby rode TX_FRAME, which the guest sends only with research logging. The STANDBY emission must
+        # sit at the frame loop's own level, shallower than the TX_FRAME put inside `if state["txlog"]:`.
+        source = (TOOLS / "guest-bridge.py").read_text()
+        standby_put = source.index("outbox.put((STANDBY, bytes((int(standby),))))")
+        tx_frame_put = source.index("outbox.put((TX_FRAME,")
+
+        def indent(at):
+            line = source[:at].rstrip("\n").rsplit("\n", 1)[1]
+            return len(line) - len(line.lstrip(" "))
+
+        self.assertLess(indent(standby_put), indent(tx_frame_put),
+                        "the standby flag must leave the txlog gate, not hide inside it")
 
 
 class GeometryTests(unittest.TestCase):

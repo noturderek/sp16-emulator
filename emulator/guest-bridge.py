@@ -13,7 +13,7 @@ import time
 
 import panel_map
 from protocol import (ACK, CONTROL, FRAME, INPUT_FAILED, INPUT_INVALID, INPUT_UNSUPPORTED, KEY,
-                      RESEARCH, TOUCH, TX_FRAME, WHEEL, decode_control, decode_key,
+                      RESEARCH, STANDBY, TOUCH, TX_FRAME, WHEEL, decode_control, decode_key,
                       decode_research, decode_touch, decode_wheel, encode_feedback,
                       encode_result, encode_stats, frame_pixels, message, receive)
 from panel import AnalogStateFile, PanelModel, StartOff, crc16
@@ -193,6 +193,15 @@ def board_line(line):
         level = int(match.group(1))
         return ("backlight", level) if 0 <= level <= 255 else None
     return None
+
+
+def standby_flag(frame):
+    """The standby transition flag (byte 0x67 bit 0) of a complete OEM TX frame, or None when the frame is not one.
+
+    The flag rides the panel TX frame, which the firmware also sets in its start-up frames, so callers act on it only
+    after the home screen has settled. Kept separate from panel_map.decode_tx so the bridge can read this one bit
+    without decoding every lamp channel on every frame."""
+    return bool(frame[panel_map.TX_STANDBY_OFFSET] & 1) if len(frame) == 128 else None
 
 
 def main():
@@ -388,6 +397,7 @@ def main():
 
         threading.Thread(target=sender, daemon=True).start()
         last_frame = None
+        last_standby = None
         try:
             while not stopped.is_set():
                 try:
@@ -412,6 +422,14 @@ def main():
                             outbox.put((TX_FRAME, bytes((multi, part, parts)) + frame))
                             link.outbox(depth + 1)
                             wake.set()
+                    # Standby must reach the window on an ordinary launch too: TX_FRAME above is research logging only,
+                    # so the flag is sent as its own transition on the always-on port. The window ignores the flag until
+                    # the home screen has settled, which makes the start-up frames' flag harmless.
+                    standby = standby_flag(frame)
+                    if standby is not None and standby != last_standby:
+                        last_standby = standby
+                        outbox.put((STANDBY, bytes((int(standby),))))
+                        wake.set()
                     if frame == last_frame:
                         continue  # the OEM resends unchanged lamp state continuously
                     last_frame = frame

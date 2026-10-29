@@ -59,7 +59,7 @@ var currentUSBImagePath: String?
 enum Kind {
     static let frame: UInt8 = 1, touch: UInt8 = 2, ack: UInt8 = 3, control: UInt8 = 6
     static let inputResult: UInt8 = 7, feedback: UInt8 = 8, research: UInt8 = 9
-    static let txFrame: UInt8 = 10, stats: UInt8 = 11
+    static let txFrame: UInt8 = 10, stats: UInt8 = 11, standby: UInt8 = 12
 }
 
 /// Host power state machine (QRT1001 p15): BOOT (boot overlay) → RUN at the first LCD frame. Standby (OFF: dark panel,
@@ -792,6 +792,13 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             if let standby = txStandbyFlag(body) {
                 DispatchQueue.main.async { [weak self] in self?.applyStandby(standby) }
             }
+        case Kind.standby:
+            // The guest forwards the TX standby flag on its own always-on message, so an ordinary (non-research) launch
+            // reaches here too; applyStandby ignores the start-up frames' flag until the home screen has settled.
+            guard size == 2, let flag = body.last, flag <= 1 else {
+                throw NSError(domain: "Invalid standby flag", code: 8)
+            }
+            DispatchQueue.main.async { [weak self] in self?.applyStandby(flag == 1) }
         case Kind.stats:
             if let object = try? JSONSerialization.jsonObject(with: body.dropFirst()) as? [String: Any] {
                 lock.lock(); guestStats = object; lock.unlock()
@@ -821,6 +828,11 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// only.
     func applyStandby(_ standby: Bool) {
         guard standby != self.standby else { return }
+        if standby && !screenSeen {
+            // The firmware sets the standby flag in its start-up frames too; ignore a true flag until the home screen
+            // has settled, so booting never latches the standby overlay. Wake (a false flag) is always applied.
+            return
+        }
         self.standby = standby
         if standby {
             panel.releaseAll()
