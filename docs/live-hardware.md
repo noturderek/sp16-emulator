@@ -3,7 +3,7 @@ title: Live hardware with the emulator
 description: "Recipes for using the emulator with real gear: a physical SP-16 as a MIDI clock and transport source, a CDJ-3000 as a Pro DJ Link master over Ethernet, Ableton Link through Carabiner, and keeping the settings these need."
 type: runbook
 status: active
-created: 2026-10-29
+created: 2026-10-28
 tags: [midi, prodjlink, link, hardware]
 author:
   harness: claude-code
