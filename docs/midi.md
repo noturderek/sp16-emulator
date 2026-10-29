@@ -17,7 +17,8 @@ author:
 
 How MIDI gets in and out of the emulated sampler: the ALSA sequencer the firmware's application talks to, the two
 virtual CoreMIDI endpoints the emulator publishes on the host, the routing preferences window, and the firmware menu
-settings that gate generated output.
+settings that gate generated output. To drive the emulator from a physical SP-16 or another hardware device, see
+[live-hardware.md](live-hardware.md).
 
 Grades below: **O** observed in this emulator, **S** static (code, manual), **I** inferred, **U** unknown. Nothing
 here was measured on a unit.
