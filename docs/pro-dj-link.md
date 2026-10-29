@@ -38,7 +38,14 @@ on this Mac only, which is what the tests and the fake master below use.
 
 The two daemon modes need `socket_vmnet` (`brew install socket_vmnet`) with its daemon running as root: the host one
 listens on `/opt/homebrew/var/run/socket_vmnet` (or `/usr/local/var/run` on Intel), and a bridged one per interface on
-`/opt/homebrew/var/run/socket_vmnet.bridged.<if>`. Start the bridged daemon yourself, for example:
+`/opt/homebrew/var/run/socket_vmnet.bridged.<if>`. Start the bridged daemon yourself with the helper (it finds the
+daemon, checks the interface and runs it with sudo until Ctrl-C):
+
+```sh
+emulator/net/vmnet-bridged.sh en0
+```
+
+which runs:
 
 ```sh
 sudo /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-mode=bridged --vmnet-interface=en0 \
