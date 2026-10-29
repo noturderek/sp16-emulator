@@ -49,9 +49,17 @@ def mac_key(mac):
     return "".join(mac.lower().split(":"))
 
 
-def join_group(port, group, iface=None):
+def join_group(port, group, iface="127.0.0.1"):
     """A UDP socket bound to the wildcard address and joined to `group` on `port` (SO_REUSEADDR/REUSEPORT so several
-    relays and `segment_watch.py` can share the port on one host)."""
+    relays and `segment_watch.py` can share the port on one host), pinned to the loopback interface by default.
+
+    This mirrors `net/segment.py`'s `multicast_socket`; the relay is deployed standalone next to `qemu-net.sh` (the
+    build copies this one file), so it cannot import that helper and keeps the same three options inline:
+    `IP_MULTICAST_IF` on the loopback address so sends leave on the loop, `IP_MULTICAST_LOOP` so a peer's datagram
+    loops back to the other listeners on this host, and `IP_ADD_MEMBERSHIP` on the loopback address so the receive
+    path does not depend on the host's default route (a `bridge100` default route used to break local delivery).
+    """
+    iface = iface or "127.0.0.1"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -59,10 +67,11 @@ def join_group(port, group, iface=None):
     except (AttributeError, OSError):
         pass
     sock.bind(("", port))
-    membership = socket.inet_aton(group) + socket.inet_aton("0.0.0.0")
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
-    if iface:
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(iface))
+    iface_bytes = socket.inet_aton(iface)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, iface_bytes)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton(group) + iface_bytes)
     return sock
 
 
@@ -237,7 +246,8 @@ def main(argv=None):
     parser.add_argument("--socket", required=True, help="unix socket path QEMU connects to (the relay listens here)")
     parser.add_argument("--target", required=True, help="multicast GROUP:PORT the segment uses, e.g. 230.0.0.1:34567")
     parser.add_argument("--mac", default="", help="this guest's MAC; frames with this source are not echoed back")
-    parser.add_argument("--iface", help="IPv4 address of the interface to send the multicast on (default: the route)")
+    parser.add_argument("--iface", default="127.0.0.1",
+                        help="IPv4 address of the interface the multicast uses (default: the loopback)")
     parser.add_argument("--idle-timeout", type=float, default=30.0, help="exit after this many seconds without QEMU")
     args = parser.parse_args(argv)
     return relay(args.socket, args.target, args.mac, args.iface, args.idle_timeout)

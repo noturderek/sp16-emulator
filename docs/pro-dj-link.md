@@ -65,11 +65,19 @@ Instead the build's wrapper (`emulator/net/qemu-net.sh`) starts a host-side rela
 attaches QEMU to it over a unix `stream` with the framing socket_vmnet speaks (a 4-byte big-endian length, then the raw
 Ethernet frame). The relay:
 
-- joins the multicast group on a wildcard-bound socket, the setup that does deliver on macOS, and sends the guest's
-  frames to `group:port`;
+- joins the multicast group on a wildcard-bound socket pinned to the loopback interface (see below), the setup that
+  does deliver on macOS, and sends the guest's frames to `group:port`;
 - hands frames arriving from other relays (or any host process) back to the guest;
 - drops its own multicast echo by matching the frame's source MAC;
 - tolerates transient multicast errors and reports the traffic it forwards.
+
+Every host peer of the segment pins the group to the loopback interface (`IP_MULTICAST_IF` = 127.0.0.1 for the send
+path, `IP_MULTICAST_LOOP` = 1 so a peer's own datagrams loop back, and `IP_ADD_MEMBERSHIP` on 127.0.0.1 for the
+receive path). `net/segment.py`'s `multicast_socket` is the shared helper; the relay keeps the same options inline
+because the build deploys that one file standalone. This matters because multicast delivery between two host
+processes depends on the interface the OS picks for the group: a second default route (a `bridge100` from
+socket_vmnet, say) changes the default interface and breaks loopback delivery unless the group is pinned to the
+loop. The relay and the segment tests fail rather than silently losing frames when that default route is present.
 
 If the relay's socket never appears the wrapper exits 2. `SP16_NET_NO_RELAY=1` leaves the relay out (for an
 already-running relay named by `SP16_NET_SOCKET`), and `SP16_NET_SOCKET` overrides the socket path.

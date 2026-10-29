@@ -107,6 +107,42 @@ class FrameTests(unittest.TestCase):
             segment.parse_frame(bytes(corrupted))
 
 
+def free_udp_port():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+class MulticastSocketTests(unittest.TestCase):
+    """net/segment.multicast_socket pins the group to the loopback interface so two host peers always reach each
+    other regardless of the host's default route (a bridge100 default route used to break local delivery)."""
+
+    def test_two_peers_deliver_on_the_loopback_segment(self):
+        group, port = "230.0.0.1", free_udp_port()
+        a = segment.multicast_socket(port, group)
+        b = segment.multicast_socket(port, group)
+        try:
+            b.settimeout(2.0)
+            a.sendto(b"loopback-segment", (group, port))
+            self.assertEqual(b.recvfrom(65535)[0], b"loopback-segment")
+        finally:
+            a.close()
+            b.close()
+
+    def test_socket_is_pinned_to_the_loopback_interface(self):
+        sock = segment.multicast_socket(free_udp_port(), "230.0.0.1")
+        try:
+            # macOS returns IP_MULTICAST_IF as the in_addr in host byte order; compare byte-for-byte with the
+            # packed loopback address rather than assuming a particular integer encoding.
+            iface = sock.getsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF)
+            self.assertEqual(iface, int.from_bytes(socket.inet_aton("127.0.0.1"), sys.byteorder))
+            self.assertEqual(sock.getsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP), 1)
+        finally:
+            sock.close()
+
+
 class SegmentMasterTests(unittest.TestCase):
     """The segment fake master imports and carries the same packet layouts as fake_master."""
 

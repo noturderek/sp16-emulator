@@ -30,16 +30,7 @@ MASTER_IP, BROADCAST_IP, MASTER_MAC = "169.254.7.7", "169.254.255.255", "02:00:0
 
 
 def join_segment(group, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except OSError:
-        pass
-    sock.bind(("", port))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                    socket.inet_aton(group) + socket.inet_aton("0.0.0.0"))
-    return sock
+    return segment.multicast_socket(port, group)
 
 
 def send_packet(seg, group, port, src_mac, src_ip, dst_ip, dst_port, payload):
