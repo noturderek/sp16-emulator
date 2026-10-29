@@ -127,7 +127,7 @@ followers, independently of whether the emulator's own follower is engaged:
 ```sh
 python3 emulator/sync/bridge.py --clock-out "IAC Driver Bus 1"          # MIDI clock only
 python3 emulator/sync/bridge.py --clock-out "IAC Driver Bus 1" --link   # and Ableton Link
-python3 emulator/sync/bridge.py --duration 60                           # --link only, no clock destination
+python3 emulator/sync/bridge.py --link --duration 60                    # Link only, no clock destination
 ```
 
 - **MIDI clock (works, unit-tested).** The master's effective BPM (base BPM times the actual pitch) retunes a 24 PPQN
@@ -143,8 +143,10 @@ python3 emulator/sync/bridge.py --duration 60                           # --link
   (`sync: no Carabiner listening on 127.0.0.1:17000 …; Link tempo/phase sync is off`) and keeps the MIDI clock running;
   a later outage after a recovery warns once more.
 
-The bridge is stdlib only and reads the segment directly, so it also works against a real master on a bridged or host
-network as long as the packets reach it.
+The bridge is stdlib only and reads the multicast segment (encapsulated Ethernet frames on `230.0.0.1:34567`), so it
+follows the fake master or another emulator on `--net mcast`. It does not read native Pro DJ Link UDP (ports
+50001/50002), so a real master on a `host` or `bridged` network must first have its traffic re-encapsulated onto the
+segment; that step is not automated today.
 
 ## Diagnosing the network
 
