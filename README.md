@@ -232,9 +232,10 @@ On the segment the firmware binds UDP 50000, 50002 and 50001 and emits its keep-
 decode and fake that traffic:
 
 ```sh
-./sp16 run --name NAME --net mcast                        # one terminal: the emulator, on the segment
-python3 emulator/net/segment_watch.py --seconds 20        # decode what the guest sends
-python3 emulator/net/segment_master.py --bpm 128 --pitch 2 --duration 120   # a fake tempo master
+./sp16 run --name NAME --net mcast                     # one shell: the emulator, on the segment
+python3 emulator/net/segment_watch.py --seconds 20     # another: decode what the guest sends
+python3 emulator/net/segment_master.py --bpm 128 --pitch 2 --duration 120   # another: a fake tempo master
+# or all of it in one run (it starts the master and its own session):
 python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 --master-pitch 2
 ```
 
