@@ -15,8 +15,8 @@ The firmware talks to its hardware through a small set of interfaces. The emulat
 | Audio codec (three ALSA playback ports, two capture ports) | `hardware_stub.c` paces each stream on its own clock and carries the samples to the host (`audio-sink.swift`, `audio-output.swift`). Board PCMs are fixed at 44.1 kHz (`SP16_PCM_ANY_RATE=1` for research). AK4452 ports refuse S20_3LE and settle on S24_LE; AK4458 is fixed to S16_LE across all 16 channels. The master transport sends all 16 channels by default (`SP16_PCM_ANY_FORMAT=1` for research) |
 | Analog board: filter send/return loop, high-pass DAC, MAIN OUT, INPUT LEVEL, CUTOFF, RESONANCE | `hardware_stub.c` board model (see [Analog board model](#analog-board-model)); host-only pot positions from `panel.py` through a shared state file; reference curves in `analog_laws.py` |
 | GPIO lines (filter select, input limiter, MIDI thru, USB-A power and over-current) | `hardware_stub.c` serves `/dev/gpiodrv` (one byte per line); input limiter on GPIO5_IO06; active-low USB over-current on GPIO4_IO14 (`ctl usb-oc on\|off`). Logged and reported in `metrics.guest.board.gpio` |
-| DIN MIDI and clock | Dedicated `sp16.din` virtio port with host virtual CoreMIDI bridge (`emulator/midi/din.py`, gated by `--midi`), ALSA sequencer bridge (`seq-bridge.c`), rawmidi UART backend, and shared clock engine (`emulator/midi/clock.py`). Note: host-to-guest transport is demonstrated, but firmware MIDI discovery/routing and audio-position clock output remain parked. Factory test loopback (`/dev/ttymxc1`) serves PAGE 8: DEVICE TEST |
-| Network and Pro DJ Link | Virtio-net NIC (`--net host\|bridged:IF\|mcast[:PORT]`, `--net-ip`). `hardware_stub.c` provides fixed GLINK carrier=1 response and passes real ARP packet sockets. Link-local 169.254.A.B assigned by guest. Note: the firmware binds UDP 50001/50002 but does not bind or emit port 50000 UDP keep-alives; Pro DJ Link sync is parked |
+| ALSA sequencer and MIDI | `hardware_stub.c` answers the 32-bit ALSA sequencer ABI for the firmware app (version and running-mode ioctls, client/port enumeration, port creation, subscriptions, events), advertising client 128 `snd-din-midi` always and client 129 `g_midi` while the USB-B MIDI mode marker exists. DIN UART (`/dev/din_midi`) and the `sp16.usb-midi` byte stream are carried by `emulator/midi/seq-bridge.c` to the host bridges (`emulator/midi/din.py`, `usb.py`, gated by `--midi`); shared clock engine `emulator/midi/clock.py`. See [midi.md](midi.md). Factory test loopback (`/dev/ttymxc1`) serves PAGE 8: DEVICE TEST |
+| Network and Pro DJ Link | Virtio-net NIC (`--net host\|bridged:IF\|mcast[:PORT]`, `--net-ip`). `mcast` runs through a host-side relay (`emulator/net/segment_relay.py`) instead of QEMU's own multicast backend. `hardware_stub.c` provides fixed GLINK carrier=1 response and passes real ARP packet sockets. Link-local 169.254.A.B assigned by guest. The keep-alive is emitted and decoded on the segment and the firmware follows a master's tempo; the downbeat is not aligned. See [pro-dj-link.md](pro-dj-link.md) |
 | Internal storage | a per-firmware 1 GB data image (`data/emmc.img`), formatted once; `./sp16 run --ephemeral` uses a disposable one with no saved project and no lock, so a second app can run the same firmware |
 | USB stick | `virtio-blk-pci` on a PCIe root port supporting QMP hot attach at runtime (`ctl usb attach PATH`, USB > Attach USB Image...) |
 | Backlight, media notifications, helper processes | `hardware_stub.c` serves `/dev/backlight` ioctl `0x40047000` (raw 0..255), scaling panel LCD brightness from Utility settings. Unknown device nodes and ioctls fail loudly and are counted |
@@ -36,10 +36,11 @@ profile ([profiles.md](profiles.md)).
 | Linux guest base image | `Dockerfile.native-base`, `pack-guest.sh`, `guest-init.sh`, `guest-firmware.py` (import and repack in the guest), `prepare.py` (unpacks an update's layers without running its programs), `guest-bridge.py`, `enter.py`, `input.py` |
 | Hardware shim (ARM preload library) | `hardware_stub.c` |
 | Panel model and wire protocol | `panel.py`, `panel_map.py`, `protocol.py`, `analog_laws.py` |
-| macOS app | `native-window.swift`, `panel-view.swift`, `panel-layout.json`, `firmware-window.swift`, `firmware-library.swift`, `app-diagnostics.swift`, `data-image.swift`, `audio-sink.swift`, `audio-output.swift`, `make-icon.swift` |
+| macOS app | `native-window.swift`, `panel-view.swift`, `panel-layout.json`, `firmware-window.swift`, `firmware-library.swift`, `app-diagnostics.swift`, `data-image.swift`, `audio-sink.swift`, `audio-output.swift`, `midi-routing.swift` (MIDI > Routing…), `make-icon.swift` |
 | Developer tools | `fwdev.py`, `sessionctl.py`, `e2e-screen.py`, `pcm-tap-analyze.py`, `arm-contracts.sh`, `exectrace.py` (reads `--trace exec` output), `gdb-bridge.py` (host side of `--trace gdb`), `audio-selftest.swift` (`./sp16 audio selftest`), `service_stimulus.py`, `timing_probe.py`, `layout_overlay.py` |
-| MIDI controller bridge and clock | `emulator/midi_bridge/` (`midi.py`, `profile.py`, `learn.py`, `actions.py`, `leds.py`, `presets.py`, `coremidi-io.swift`), `emulator/midi/` (`clock.py`, `din.py`, `seq-bridge.c`) |
-| Network and Pro DJ Link tooling | `net/qemu-net.sh`, `emulator/net/segment_watch.py`, `emulator/net/fake_master.py` |
+| Probes (live measurements from the host side) | `emulator/probes/over_led.py` (OVER lamp against master level), `ak4458_transport.py` (transport words per AUDIO TEST mode), `filter_send.py` (filter send stream and loop) |
+| MIDI controller bridge and clock | `emulator/midi_bridge/` (`midi.py`, `profile.py`, `learn.py`, `actions.py`, `leds.py`, `presets.py`, `coremidi-io.swift`), `emulator/midi/` (`clock.py`, `din.py`, `usb.py`, `routing.py` (reads the app's preferences), `seq-bridge.c`), `emulator/menu/sync_source.py` (firmware menu recipes) |
+| Pro DJ Link tooling, sync | `net/qemu-net.sh`, `emulator/net/` (`segment_relay.py`, `segment.py`, `segment_watch.py`, `segment_master.py`, `fake_master.py`, `diag/carrier.py`), `emulator/sync/` (`pdl_sync.py`, `bridge.py`) |
 | Hardware conformance suite | `hwsuite.py`, `shotdiff.py` |
 | Data | `profiles/*.json`, `profiles/products/sp16.json` |
 
@@ -116,6 +117,9 @@ about (115, 112) runs the loopback test and reports `MIDI CHECK : OK`.
   launches. The repository ships no OEM artwork or logos; personal skins stay in git-ignored `private/`.
 - **Output monitor menu.** The menu bar includes an **Output** menu (MAIN, PHONES, OUT 3-4, OUT 5-6, OUT 7-8)
   allowing the user to select which jack pair CoreAudio plays (via `AudioSink.monitor`).
+- **MIDI routing.** The menu bar includes a **MIDI** menu whose **Routing…** item opens the routing preferences
+  window (one row per CoreMIDI endpoint, a clock source picker and a BPM/lock/jitter readout); it persists its
+  choices and writes the file the Python bridges read. See [midi.md](midi.md#routing-preferences).
 - **USB hot attach.** The virtual USB stick uses `virtio-blk-pci` on a PCIe root port. Choosing USB > Attach USB
   Image... or running `./sp16 ctl usb attach PATH` ejects the current stick, swaps the backing image via QMP, and
   announces the new stick to the guest. Active-low over-current can be tested with `./sp16 ctl usb-oc on|off`.
@@ -123,31 +127,57 @@ about (115, 112) runs the loopback test and reports `MIDI CHECK : OK`.
   so background sessions without audio sinks are not throttled. On termination, teardown follows a clean guest
   stop ladder bounded by a 9-second `_exit(0)` fallback.
 
-## MIDI controller bridge and DIN MIDI
+## MIDI controller bridge, ALSA sequencer and DIN MIDI
 
+The user-facing guide is [midi.md](midi.md). In the emulator:
+
+- **ALSA sequencer proxy.** The firmware's 32-bit app opens `/dev/snd/seq`; the shim answers that ABI itself (QEMU user
+  mode returns `ENOSYS` for the version ioctl, so an unproxied app cannot create a client). Client 128 (`snd-din-midi`)
+  is always present, client 129 (`g_midi`) only while the USB-B MIDI mode marker exists; `emulator/midi/seq-bridge.c`
+  creates the marker when the USB MIDI transport opens, because the emulator does not run the firmware's own start-up
+  script. The app registers `JuceMidiInput`/`JuceMidiOutput` clients and subscribes both peers.
+- **Host bridges.** `./sp16 run --midi` starts `emulator/midi/din.py` (`SP-16 DIN [<build>]`, the `sp16.din` virtio
+  port, rawmidi UART paced at 320 µs per byte) and `emulator/midi/usb.py` (`SP-16 USB [<build>]`, the `sp16.usb-midi`
+  byte stream, unpaced). Both are virtual CoreMIDI endpoints; no physical USB MIDI gadget is enumerated. A missing USB
+  transport, a poll fault or a failed flush disables only the USB route.
+- **Routing preferences.** The app's MIDI > Routing… window (`midi-routing.swift`) writes
+  `~/Library/Application Support/SP-16 Emulator/midi-routing.json`; `emulator/midi/routing.py` reads it, and both
+  bridges honour In/Out and Send/Receive clock per port without a restart. An absent port carries everything.
+- **Menu recipes.** `emulator/menu/sync_source.py` drives the firmware's own settings (SYNC SOURCE SELECT, MIDI OUT
+  MODE (USB), MIDI OUT NOTE/CC) by LCD OCR through `hwsuite.run_recipe`.
 - **MIDI controller bridge.** `./sp16 midi` (`emulator/midi_bridge`) connects any CoreMIDI controller to the emulator:
   `ports` lists endpoints, `learn` interactively maps pads, knobs and keys into `private/midi/`, and `run` translates
   MIDI input into session control events (`actions.py`). Pad velocity, knob detents, analog pots and the touch strip
   are supported, with lamp feedback echoed as LED note/CC velocity (`leds.py`). A built-in preset mirrors the real
   SP-16 MIDI OUT layout (`--preset sp16`).
 - **Shared clock engine.** `emulator/midi/clock.py` provides a second-order delay-locked loop (DLL) that recovers
-  BPM and phase from an inbound 0xF8 clock stream, and a sample-accurate clock generator from audio position.
-- **DIN MIDI transport.** Launched with `./sp16 run --midi`, a dedicated `sp16.din` virtio port connects a host
-  virtual CoreMIDI bridge (`SP-16 DIN [<build>]`) to an ALSA sequencer bridge (`seq-bridge.c`) and rawmidi UART backend
-  with 320 µs slot pacing. **Current status:** host-to-guest delivery is demonstrated, but firmware-side MIDI routing,
-  sequencer subscriptions and audio-position clock output remain incomplete and parked. USB-B MIDI device emulation is
-  not implemented.
+  BPM and phase from an inbound 0xF8 clock stream, and a sample-accurate clock generator from audio position. The
+  routing window's lock/jitter readout uses the same loop.
+
+**Current status:** DIN in and out are observed (a host note triggers a loaded sample; PLAY emits `FA`, `F8` at
+48.05 clocks/s at 120 BPM, `FC`), and the USB-B route carries the same transport and CC once `g_midi` is published.
+USB-B pad notes are not finished: the route works, but a pad hit has no project content to turn into a note.
 
 ## Networking and Pro DJ Link
 
-`./sp16 run --net host|bridged:IF|mcast[:PORT]` (`--net-ip ADDR`) launches QEMU with a virtio-net NIC:
-- `host` connects via the `socket_vmnet` daemon on `bridge100`.
-- `bridged:IF` connects to the physical LAN interface (with `--net-ip` configuring a static IP).
-- `mcast` joins a local multicast socket (230.0.0.1:34567) without root.
+The user-facing guide, with the tools and their options, is [pro-dj-link.md](pro-dj-link.md).
+
+`./sp16 run --net host|bridged:IF|mcast[:PORT]` (`--net-ip ADDR` for a bridged static address) launches QEMU with a
+virtio-net NIC:
+
+- `host` connects via the `socket_vmnet` daemon on `bridge100`; `bridged:IF` connects to a physical LAN interface. Both
+  need the root daemon running.
+- `mcast` joins a local multicast segment (230.0.0.1:34567 by default) without root, through the host relay
+  `emulator/net/segment_relay.py`: QEMU attaches to it over a unix `stream` (the framing socket_vmnet uses) and the
+  relay joins the group on a wildcard-bound socket, which is the setup macOS actually delivers to other local
+  listeners. Its own multicast echo is dropped by source MAC.
 - The shim provides a synthetic GLINK carrier=1 response and passes real ARP packet sockets, and the guest assigns a
   169.254.A.B link-local address.
-- **Current status:** the firmware binds UDP ports 50001 and 50002, but does not bind or transmit port 50000 UDP
-  keep-alive packets. Consequently, following a fake tempo master (`fake_master.py`) and Pro DJ Link sync remain parked.
+- The firmware binds UDP 50000, 50002 and 50001 and emits its 54-byte keep-alive about every 2 s; `segment_watch.py`
+  decodes it and `segment_master.py` (a fake master on the segment) reads it back as proof of acceptance. With SYNC
+  SOURCE = PRO DJ LINK the sequencer follows the master's effective tempo exactly; the downbeat stays ~495 ms off.
+  `emulator/sync/bridge.py` additionally turns the master's tempo into a 24 PPQN MIDI clock and, with `--link`, drives
+  a Carabiner. `timing_probe.py run --net mcast` measures a whole follow run.
 
 ## Boot
 
@@ -260,6 +290,19 @@ into one `i<n> c<cpu> 0x%08x` per line. A console from an older build still read
 `SP16_TB <hex> ...` is instance 0 with no cpu.
 Tracing every block slows the app a lot: expect a long boot. A clean stop (`SIGTERM` to the app's process id, or Cmd-Q)
 loses at most the last half second of addresses.
+
+### Timing probe
+
+`python3 emulator/timing_probe.py run --build NAME [--seconds 60]` measures two independent paths of a running research
+session: the audio clock (a click on every one of the 16 steps gives the step interval and its jitter from the recorded
+WAV, sample-accurate) and the panel link (the intervals between the firmware's TX frames as the host received them; a
+gap above `--stall-ms`, 40 ms by default, is a stall). The bridge counts the same frames at its own end, so the report
+names the hop a stall sat on: `guest-to-bridge`, `bridge-to-app` or `mixed`. Targets are an onset sigma below 1 ms and
+a stall maximum below 40 ms over 60 s; the report carries the load average and the VM count, so compare runs taken
+under similar load. A host that stops draining the audio port long enough leaves holes in the WAV, which the report
+shows as `gap_frames_in_window`/`guest_drops_in_window` and `targets_met.audio_window_clean` false. `--net mcast` turns
+the same run into a Pro DJ Link follow measurement ([pro-dj-link.md](pro-dj-link.md)). The `wav` and `tx` subcommands
+re-analyse a recording or a session's `tx-frames.jsonl` without starting anything.
 
 ### Bench mode (`--no-ui-input`)
 
