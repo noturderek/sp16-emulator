@@ -27,7 +27,7 @@ titles, probe coordinates, lamp roles). A check whose profile data is missing is
 | Pads | HW-21..25 | pressure and contact words, velocity range, hold, simultaneous hits, calibration state |
 | Touch strip | HW-26..29 | position and contact, strip lamps |
 | Analog words | HW-30 | analog pot words reach the firmware; HP CUTOFF comes back out as a rising DAC code that DRIVE leaves alone; CUTOFF and RESONANCE are accepted as host analog state |
-| Audio | HW-31..35 | three playback ports, clock at 1.00x (tempo from the step lamps), sample-exact streams, level lamp |
+| Audio | HW-31..35 | three playback ports, clock at 1.00x (tempo from the step lamps), sample-exact streams, level lamp (HW-35, the OVER lamp, is known-failing: see [below](#known-failing-checks)) |
 | USB | HW-36..39 | attach, mount, eject, USB STOP, presence lamp, blank and dirty sticks |
 | Storage, power, soak | HW-40..44 | persistence across clean and hard restarts, isolation between firmware data images, clean quit, 5-minute soak |
 | Driver coverage | HW-45 | every device node and ioctl the firmware uses is served; unknown ones are reported |
@@ -96,7 +96,7 @@ stick images; no firmware content), and writes `hwsuite-result.json` and `hwsuit
 
 | Exit code | Meaning |
 |---|---|
-| 0 | every selected check `PASS` or `N/A` |
+| 0 | every selected check `PASS`, `KNOWN-FAIL` or `N/A` |
 | 1 | at least one `FAIL` |
 | 2 | no `FAIL`, but at least one `BLOCKED` (missing profile data, unmapped lamp, new ioctl) |
 | 3 | environment or usage error (no research socket, no `--audio file`, unreadable profile, host overloaded) |
@@ -109,17 +109,47 @@ HW-24 (pad calibration state) compares against the control build above. Without 
 check is not run, reports HW-24 as `BLOCKED` ("no --control-build given") and exits 2 even when every other check
 passes; that is a missing build, not a failure.
 
+## Known-failing checks
+
+A version's profile can declare that a check is expected to fail, so an understood failure is recorded instead of
+silently weakening the check. The declaration lives in the profile's `hardware.known_failing`: a list of entries with
+`check`, `reason`, `owner` and `date` (`gap` is optional and quotes the measured shortfall).
+
+- The check still runs and still records its measured figures (sub-results keep the live numbers, for example the peak
+  in dBFS).
+- A FAIL on a declared check is re-labelled **KNOWN-FAIL**. The reason quotes the declaration, its owner and date, and
+the measured gap, and the report gives the check its own section.
+- KNOWN-FAIL does not count as a failure: it does not change the exit code and does not block verification
+  eligibility. `--mark-verified` refuses a KNOWN-FAIL that is not declared in the profile.
+- A malformed entry (not an object, or no `check`) is skipped rather than raising, so a hand-edited profile cannot
+  crash a run.
+
+Deleting the entry is the only way to make a KNOWN-FAIL block verification again; fix the cause first.
+
+### HW-35 and the OVER lamp
+
+HW-35 is declared known-failing in the 1.60 profile. The OVER lamp is the firmware's `ClipMeter` on the DSI drive
+input, with a threshold of 1.8, i.e. **+5.1 dBFS**, and a 500 ms hold (grade S, from the firmware reading; the service
+manual grades the lamp an app-driven output following the digital master peak, E15). A full-scale sampler playback
+reaches the master at 0 dBFS, which is 5.1 dB below that threshold, so the lamp correctly stays dark and the check's
+first expectation cannot be met by the fixture.
+
+The check's title and first expectation therefore read "OVER lights when the DSI drive input passes +5.1 dBFS", and
+the profile's gap records that no test drives the DSI drive input past the threshold yet. The measurements behind that
+conclusion are in [audio-jack-map.md](audio-jack-map.md#the-over-lamp); `emulator/probes/over_led.py` reproduces them.
+
 ## Marking a profile verified
 
 `./sp16 hwsuite --tier full --mark-verified` writes the profile's verification block, and nothing else may. It requires one
-full-tier run without `--only` in which every check is `PASS` or `N/A`, where every `N/A` matches a capability the
+full-tier run without `--only` in which every check is `PASS`, `KNOWN-FAIL` or `N/A`, where every `N/A` matches a capability the
 profile declares absent, on the exact firmware image and profile being marked.
 
 ## Not in this suite
 
 Firmware features (menus, sequencer editing, effects, scales, project workflows) belong to a per-version feature
-check, not to hardware verification. Hardware that is not emulated is listed as such in every suite report: DIN MIDI
-beyond the factory test loopback (HW-54) and USB-B MIDI, sync sources and PRO DJ LINK (port 50000 UDP keep-alive/sync),
-audio input and live sampling (a research tone or injected WAV stands in for the input), output routing beyond the
-monitored pairs, the analog filter acting on sampler playback (the filter loop exists but only carries a research
-tone), network traffic beyond the carrier/ARP compatibility layer, and physical pad force.
+check, not to hardware verification. Hardware that is not emulated is listed as such in every suite report: a physical
+USB-B MIDI device (the emulator publishes virtual CoreMIDI endpoints instead, see [midi.md](midi.md)), the downbeat
+phase of Pro DJ Link following ([pro-dj-link.md](pro-dj-link.md)), audio input and live sampling (a research tone or
+injected WAV stands in for the input), output routing beyond the monitored pairs, the analog filter acting on sampler
+playback (the filter loop exists but only carries a research tone), the DSI drive input above +5.1 dBFS (HW-35's gap),
+network traffic beyond the carrier/ARP compatibility layer, and physical pad force.
