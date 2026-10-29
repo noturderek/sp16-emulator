@@ -52,7 +52,7 @@ faults or a failed USB flush close and disable only the USB route and clear its 
 
 ## Routing preferences
 
-The app has a **MIDI > Routing…** window (unreleased until this branch; nothing else depends on it).
+The app has a **MIDI > Routing…** window. Nothing else in the emulator depends on it.
 
 - One row per CoreMIDI endpoint, sources first, with the columns **Port**, **In**, **Out**, **Send clock**,
   **Receive clock**. A toggle that does not apply to an endpoint's kind is disabled. Ports appear and disappear live
@@ -78,8 +78,8 @@ The bridges read that file and act on it without a restart (re-read when its mti
   ID; the app remembers a re-plugged device by unique ID instead.
 - `--config PATH` (both bridges) points them at a different preferences file.
 
-If a preferences file from an earlier unreleased build lists every port with every toggle off, the bridges read that
-as "everything off"; delete the file once.
+The window writes only the ports you toggle, so a file that lists every port with every toggle off closes all
+routes: delete it and the bridges carry everything again.
 
 ## Firmware menu settings
 

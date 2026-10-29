@@ -109,8 +109,8 @@ python3 emulator/sync/bridge.py --duration 60                           # --link
   sink is a thin adapter, so the packet → tempo → clock pipeline is tested without CoreMIDI.
 - **Ableton Link (not tested live).** `--link` drives a minimal Carabiner client on TCP `127.0.0.1:17000`: `set-tempo`
   on a tempo change and `force-beat-at-time` on every downbeat (beat 0 of the next bar). Carabiner is a design
-  reference the user runs themselves; it is not bundled, and the acceptance was not run because this host had no
-  Carabiner listening. With no Carabiner the bridge prints one diagnostic per outage
+  reference the user runs themselves; it is not bundled, and no live acceptance was run (the Mac used had no
+  Carabiner listening). With no Carabiner the bridge prints one diagnostic per outage
   (`sync: no Carabiner listening on 127.0.0.1:17000 …; Link tempo/phase sync is off`) and keeps the MIDI clock running;
   a later outage after a recovery warns once more.
 
