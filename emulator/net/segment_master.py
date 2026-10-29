@@ -158,7 +158,8 @@ def main(argv=None):
             next_keepalive += 1.5
         if now >= next_status:
             send(fake_master.PORT_STATUS, fake_master.status_packet(args.name, args.player, state["bpm"], pitch,
-                                                                    beat_in_bar, beat_count, True, status_count))
+                                                                    beat_in_bar, beat_count, playing=True,
+                                                                    counter=status_count, master=True))
             status_count += 1
             next_status += 0.2
         if now >= next_beat:

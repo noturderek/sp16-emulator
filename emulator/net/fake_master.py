@@ -80,7 +80,7 @@ def beat_packet(name, player, bpm, pitch, beat_in_bar, next_beat_ms):
     return bytes(packet)
 
 
-def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=True, master=True, counter=0):
+def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=True, counter=0, *, master=True):
     """Player status (type 0x0a, 212 bytes) with the fields a follower needs: the P3 play state (0x9d, 0x0d while
     playing so the follower's (P3 & 1) || (P3 & 8) gate passes), the master-meaningful and Mv multiplier bytes,
     playing/master/sync flags, pitch, BPM, beat counter and beat in bar (offsets from the public protocol write-up;
@@ -194,7 +194,8 @@ def main():
             send(PORT_KEEPALIVE, keepalive(args.name, args.player, mac, ip_bytes))
             next_keepalive += 1.5
         if now >= next_status:
-            send(PORT_STATUS, status_packet(args.name, args.player, state["bpm"], pitch, beat_in_bar, beat_count, True, status_count))
+            send(PORT_STATUS, status_packet(args.name, args.player, state["bpm"], pitch, beat_in_bar, beat_count,
+                                            playing=True, counter=status_count, master=True))
             status_count += 1
             next_status += 0.2
         if now >= next_beat:

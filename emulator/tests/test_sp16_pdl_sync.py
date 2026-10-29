@@ -22,7 +22,8 @@ def beat_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1):
 
 def status_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1, beat_count=0, playing=True, master=True):
     """A master 0x0a status packet built by the shared packet builder, not by hand."""
-    return fake_master.status_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, beat_count, playing, master)
+    return fake_master.status_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, beat_count, playing=playing,
+                                       master=master)
 
 
 class TempoTests(unittest.TestCase):

@@ -196,6 +196,19 @@ class FakeMasterTests(unittest.TestCase):
         # Mm (master meaningful) and Mv (rekordbox-track multiplier) match a real CDJ.
         self.assertEqual((playing[0x9e], struct.unpack(">H", playing[0x90:0x92])[0]), (0x01, 0x8000))
 
+    def test_status_packet_keeps_playing_and_counter_positional(self):
+        import struct
+        # fake_master and segment_master call status_packet(..., True, status_count) positionally: the first status
+        # (counter 0) must be a master and the counter must serialize at 0xc8, not be swallowed as the master flag.
+        first = self.master.status_packet("CDJ-3000", 1, 128.0, 0.0, 1, 1, True, 0)
+        self.assertTrue(first[0x89] & 0x20)                          # the first status is master
+        self.assertEqual(struct.unpack(">I", first[0xc8:0xcc])[0], 0)
+        stepped = self.master.status_packet("CDJ-3000", 1, 128.0, 0.0, 1, 1, True, 7)
+        self.assertTrue(stepped[0x89] & 0x20)                        # still master
+        self.assertEqual(struct.unpack(">I", stepped[0xc8:0xcc])[0], 7)   # the counter increments
+        off = self.master.status_packet("CDJ-3000", 1, 128.0, 0.0, 1, 1, True, 7, master=False)
+        self.assertFalse(off[0x89] & 0x20)                           # master is keyword-only and still overridable
+
     def test_packet_name_reads_each_family_at_its_own_offset(self):
         mac, ip = bytes.fromhex("020000000007"), bytes([169, 254, 7, 7])
         self.assertEqual(self.master.packet_name(self.master.keepalive("TORAIZ", 2, mac, ip), 50000), "TORAIZ")
