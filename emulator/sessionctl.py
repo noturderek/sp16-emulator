@@ -179,10 +179,17 @@ class Session:
         self.call(op="panelshot", name=name)
         return self.dir / name
 
-    def usb(self, action):
+    def usb(self, action, path=None):
         """Virtual USB stick: "eject" (guest flushes and unmounts, then the app sees it removed; replies usb-busy
-        and leaves the stick mounted if something still holds it) or "attach" (remount and announce again)."""
-        return self.call(op="usb", action=action)
+        and leaves the stick mounted if something still holds it) or "attach" (remount and announce again; with a
+        `path`, hot-swap to a different image while QEMU runs)."""
+        command = {"op": "usb", "action": action}
+        if path is not None:
+            command["path"] = path
+        return self.call(**command)
+
+    def usb_oc(self, on):
+        return self.call(op="usb-oc", on=on)
 
     def pressure(self, pad, raw):
         """Hold a pad's raw pressure word (0..1023) until it is set to 0: the AD value the factory test's pad
@@ -241,6 +248,14 @@ class Session:
             flag = self.tx_standby(0.5)
         return {"before": before, "standby": bool(flag), "seconds": round(time.monotonic() - started, 1)}
 
+    def fault(self, on):
+        """Force the power-fault display (QRT1001 p24): dark panel, WAKE UP blinking red; off restores."""
+        return self.call(op="fault", on=on)
+
+    def monitor(self, name):
+        """Choose which output jack pair the CoreAudio output plays (MAIN, PHONES, OUT3-4, OUT5-6, OUT7-8)."""
+        return self.call(op="monitor", name=name)
+
     def metrics(self):
         return self.call(op="metrics")
 
@@ -263,7 +278,8 @@ def main():
     parser.add_argument("--runtime", required=True, help="session runtime.json")
     parser.add_argument("command", choices=["event", "press", "turn", "touch", "raw", "clear",
                                             "snapshot", "metrics", "txlog", "period", "panelshot", "resize", "adc", "usb",
-                                            "app-restart", "firmware", "power", "standby", "pressure", "calibrate"])
+                                            "app-restart", "firmware", "power", "standby", "pressure", "calibrate",
+                                            "fault", "monitor", "usb-oc"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=None,
                         help=f"seconds to wait for each reply (default SP16_CONTROL_TIMEOUT or {DEFAULT_TIMEOUT:g})")
@@ -305,7 +321,12 @@ def run_command(session, command, a):
     elif command == "panelshot":
         result = {"path": str(session.panelshot(a[0]))}
     elif command == "usb":
-        result = session.usb(a[0] if a else "eject")
+        action = a[0] if a else "eject"
+        result = session.usb(action, a[1] if len(a) > 1 else None)
+    elif command == "usb-oc":
+        if a != ["on"] and a != ["off"]:
+            raise RuntimeError("usb-oc needs on|off")
+        result = session.usb_oc(a[0] == "on")
     elif command == "adc":
         result = session.adc()
     elif command == "pressure":
@@ -324,6 +345,14 @@ def run_command(session, command, a):
         if a[:1] != ["yes"]:
             raise RuntimeError(f"standby needs the argument yes: {STANDBY_WARNING}")
         result = session.standby()
+    elif command == "fault":
+        if a != ["on"] and a != ["off"]:
+            raise RuntimeError("fault needs on|off")
+        result = session.fault(a[0] == "on")
+    elif command == "monitor":
+        if not a or a[0] not in ("MAIN", "PHONES", "OUT3-4", "OUT5-6", "OUT7-8"):
+            raise RuntimeError("monitor needs MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8")
+        result = session.monitor(a[0])
     elif command == "app-restart":
         result = session.app_restart()
     elif command == "firmware":

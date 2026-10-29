@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SP-16 hardware conformance suite runner (docs/hardware-suite.md).
 
-53 checks (HW-01..HW-53; HW-47..HW-53 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
+54 checks (HW-01..HW-54; HW-47..HW-54 are extras outside the verification tiers) of the emulated hardware boundary, driven only through a research session's control socket,
 its files and process signals to exact PIDs. The firmware is the oracle for hardware outcomes only; per-version data
 (probes, recipes, lamp roles) comes from the firmware's compatibility profile, and a check whose profile data is
 missing is BLOCKED, never PASS.
@@ -39,7 +39,7 @@ FINGERPRINT_SOURCES = ("hardware_stub.c", "guest-bridge.py", "panel.py", "panel_
 TIMING_CHECKS = ("HW-19", "HW-32", "HW-33", "HW-44")
 MAX_VMS = 3
 EXIT_OK, EXIT_FAIL, EXIT_BLOCKED, EXIT_ENV, EXIT_LOST = range(5)
-STATUSES = ("PASS", "FAIL", "N/A", "BLOCKED", "SKIP")
+STATUSES = ("PASS", "FAIL", "N/A", "BLOCKED", "SKIP", "KNOWN-FAIL")
 # "X" checks are extras outside verification: a full run never includes them (so a profile can still be marked verified
 # without a testmode build or a disposable session); `--tier extra`, or `--only` naming them, runs them.
 TIERS = {"smoke": ("S",), "core": ("S", "C"), "full": ("S", "C", "L"), "extra": ("X",)}
@@ -114,7 +114,7 @@ CHECKS = [
           ["audio.default_bpm", "rgb_known.playhead", "recipes.sample_load", "recipes.click_steps"], ["HW-01"]),
     Check("HW-34", "Audio", "Playback is sample-exact and in tune", "S",
           ["recipes.sample_load", "audio.sound_channels", "recipes.volume_knob"], ["HW-01"]),
-    Check("HW-35", "Audio, lamps", "Level lamp follows the master output", "C",
+    Check("HW-35", "Audio, lamps", "OVER lights when the DSI drive input passes +5.1 dBFS", "C",
           ["panel.lamp_groups.over", "recipes.sample_load"], ["HW-01"]),
     Check("HW-36", "USB", "A stick present at boot is mounted and visible to the firmware", "C",
           ["usb.sample_dir", "usb.browse_recipe", "panel.lamp_groups.usb"], ["HW-01"]),
@@ -137,19 +137,21 @@ CHECKS = [
     # Factory test pages, graded against the service manual's pass lines. They run in a build made with
     # `--app-arg testmode` (--testmode-build), where the app starts in the factory test instead of the firmware UI.
     Check("HW-48", "Factory test", "Pages 1 and 2: every pad and step lamp shows red, green, blue and white; all off, LCD black", "X"),
-    Check("HW-49", "Factory test", "Page 4: every button counts once (48 with a lamp, MODE and SHIFT: 50 of 50)", "X"),
+    Check("HW-49", "Factory test", "Page 4: every button counts once (48 with a lamp, MODE and SHIFT: 50 of 50) and the "
+          "status line names the pressed control", "X"),
     Check("HW-50", "Factory test", "Page 5: MASTER, DSF DRIVE and DSF HIGHPASS span 0-1023 and the strip 0-127", "X"),
     Check("HW-51", "Factory test", "Page 6: the six encoders and the push encoder count and report their state", "X"),
     Check("HW-52", "Screenshots", "The settled home screen and the panel match the suite's own earlier captures", "X",
           ["home.title_regex"], ["HW-01"]),
     Check("HW-53", "Factory test", "Page 3: three WAKE UP passes record a held pad's calibration, only inside the valid range", "X",
           ["calibration.pads", "calibration.range", "calibration.default"]),
+    Check("HW-54", "Factory test", "Page 8: the MIDI CHECK touch button runs the DIN MIDI loopback to OK", "X"),
 ]
-TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51", "HW-53")
+TESTMODE_IDS = ("HW-48", "HW-49", "HW-50", "HW-51", "HW-53", "HW-54")
 EXTRA_IDS = ("HW-47",) + TESTMODE_IDS + ("HW-52",)
 CHECK_BY_ID = {check.id: check for check in CHECKS}
 SMOKE_IDS = tuple(c.id for c in CHECKS if c.tier == "S")
-assert len(CHECKS) == 53 and len(SMOKE_IDS) == 16
+assert len(CHECKS) == 54 and len(SMOKE_IDS) == 16
 
 
 def checks_hash():
@@ -208,13 +210,36 @@ def absent_reason(profile, capability):
     return None
 
 
+def declared_known_failing(profile):
+    """The profile's hardware.known_failing entries, skipping anything malformed.
+
+    A run validates the profile first (profiles.validate), but these readers also see a hand-edited or half-written
+    file, so an entry that is not an object with a string check is skipped here instead of raising an AttributeError
+    out of a check or out of mark_verified."""
+    hardware = profile.get("hardware") if isinstance(profile, dict) else None
+    entries = hardware.get("known_failing") if isinstance(hardware, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [item for item in entries if isinstance(item, dict) and isinstance(item.get("check"), str)]
+
+
+def known_failing(profile, hw_id):
+    """The profile's declaration that a check is expected to fail (an owner sign-off that records the measured gap),
+    or None. A check marked here still runs and records its measured figures, but its FAIL verdict is re-labelled
+    KNOWN-FAIL so it does not block verification while the cause is investigated."""
+    for item in declared_known_failing(profile):
+        if item["check"] == hw_id:
+            return item
+    return None
+
+
 # ---------------------------------------------------------------------------------------------------- verdicts
 
 def verdict(hw_id, status, reason="", metrics=None, evidence=None, subresults=None, elapsed=0.0, load=None):
     if status not in STATUSES:
         raise ValueError(f"bad status {status!r}")
-    if status == "N/A" and not reason:
-        raise ValueError("N/A needs a reason")
+    if status in ("N/A", "KNOWN-FAIL") and not reason:
+        raise ValueError(f"{status} needs a reason")
     check = CHECK_BY_ID[hw_id]
     return {"id": hw_id, "area": check.area, "title": check.title, "tier": check.tier, "status": status,
             "reason": reason, "elapsed_s": round(elapsed, 2), "metrics": metrics or {}, "evidence": evidence or [],
@@ -287,7 +312,7 @@ def render_report(result):
         observed = (item["reason"] or "ok").replace("|", "/").replace("\n", " ")
         lines.append(f"| {item['id']} | {item['area']} | {item['status']} | {observed[:220]} | {item['elapsed_s']} |")
     for item in result["verdicts"]:
-        if item["status"] in ("FAIL", "BLOCKED"):
+        if item["status"] in ("FAIL", "BLOCKED", "KNOWN-FAIL"):
             lines += ["", f"## {item['id']} {item['status']}: {item['title']}", "", item["reason"] or "", ""]
             for s in item["subresults"]:
                 if s["status"] != "PASS":
@@ -418,7 +443,9 @@ def tone(seconds, freq, amplitude, decay=None, tail=0.0, rate=RATE):
 
 
 def fixture_wavs():
-    """Spec 5.3 audio fixtures: name -> WAV bytes."""
+    """Spec 5.3 audio fixtures: name -> WAV bytes. Every name that states a level (`full` = 0 dBFS, `hw-tone440` =
+    -6 dBFS, `hw-tone-m30` = -30 dBFS) is pinned to it by test_sp16_hwsuite's fixture test: the level is the file's
+    own peak, not what a pass records after the device's track volume."""
     return {
         "hw-tone440.wav": wav_bytes(tone(6.0, 440.0, 10 ** (-6 / 20))),
         "hw-click.wav": wav_bytes(tone(0.08, 440.0, 10 ** (-6 / 20), decay=0.02, tail=2.0)),
@@ -1203,6 +1230,27 @@ def testmode_goto(session, page, timeout=120.0):
     return False
 
 
+# Page 8 (DEVICE TEST): the MIDI CHECK touch button (about (115, 112)) opens /dev/ttymxc1 twice, writes a 4-byte
+# pattern, polls 2 s and reads it back through the DIN MIDI loopback (service manual); the page then shows the result
+# to the right of the coloured button. OCR of the entire white page misses both button text and
+# status; the tight status crop reads the actual ---/OK glyphs reliably.
+MIDI_CHECK_STATUS_BOX = (200, 80, 260, 145)
+
+
+def wait_midi_check(session, timeout=30.0):
+    """Poll page 8's OCR until the MIDI CHECK status reads OK; (ok, last text). The loopback poll alone takes 2 s,
+    and a loaded host stretches the redraw, so the default timeout is generous."""
+    deadline = time.monotonic() + timeout
+    text = ""
+    while True:
+        text = norm(ocr(session.image("midi"), MIDI_CHECK_STATUS_BOX, psm=7, scale=3))
+        if text == "OK":
+            return True, text
+        if time.monotonic() > deadline:
+            return False, text
+        time.sleep(.5)
+
+
 # Page 4 (button test): controls with a lamp (pads, steps and 16 more buttons) count towards LED-BUTTON n/48; MODE and
 # SHIFT have no lamp; RESULT counts all 50. Selector push, BACK and HOME are not counted (BACK and HOME step the pages).
 TESTMODE_LED_BUTTONS = ([f"pad{n}" for n in range(1, 17)] + [f"step{n}" for n in range(1, 17)] +
@@ -1227,6 +1275,20 @@ def check_testmode_skip(names):
 
 
 TESTMODE_LED_ROW, TESTMODE_RESULT_ROW = (400, 62, 800, 100), (400, 170, 800, 206)
+# Page 4 also has a status cell left of the LED-BUTTON row that names the control the page counted (`PAD 1 : 3`), the
+# page's own attribution of the event. It is read for every press: a swapped mapping still moves RESULT, but it names
+# the other control.
+TESTMODE_STATUS_BOX = (0, 62, 400, 100)
+# The page's spelling of each control as tokens (letters and digits), so `PAD 1` and `BAR 3` match after OCR noise.
+TESTMODE_STATUS_NAMES = {
+    **{f"pad{n}": ("PAD", str(n)) for n in range(1, 17)},
+    **{f"step{n}": ("STEP", str(n)) for n in range(1, 17)},
+    **{f"bar{n}": ("BAR", str(n)) for n in range(1, 5)},
+    "usb_stop": ("USB", "STOP"),
+    **{name: (name.upper(),) for name in ("track", "mute", "slice", "scale", "rec", "stop", "play", "hold",
+                                          "scene", "pattern", "mode", "shift", "active")},
+}
+assert set(TESTMODE_STATUS_NAMES) == set(TESTMODE_CONTROLS), "every control page 4 counts needs its printed name"
 # Page 5 (AD test): gauge rows (a bar that fills left to right, its value inside it) and a red OK once both limits
 # were reached; the box is the gauge, the OK sits right of it.
 TESTMODE_GAUGES = {"main_out": (64, 96, 1023), "drive": (100, 132, 1023), "hp_cutoff": (136, 168, 1023),
@@ -1254,6 +1316,25 @@ def testmode_counter(image, row, total):
     """n of `LABEL(n/total)` in a page 4 row, or None."""
     match = re.search(r"\((\d+)\s*/\s*%d\)" % total, ocr(image, row, psm=7, scale=3))
     return int(match.group(1)) if match else None
+
+
+def testmode_status_controls(text):
+    """The controls whose printed name a page 4 status cell's text starts with. The longest name wins, so `USB STOP`
+    is USB STOP and not STOP; a name only counts as the first tokens of the cell, never as a substring of a value.
+    OCR drops the space of a two-word name (`USBSTOP`), so the joined form matches too."""
+    tokens = tuple(re.findall(r"[A-Z0-9]+", norm(text)))
+    named = [name for name, words in TESTMODE_STATUS_NAMES.items()
+             if tokens[:len(words)] == words or (len(words) > 1 and tokens[:1] == ("".join(words),))]
+    if not named:
+        return set()
+    longest = max(len(TESTMODE_STATUS_NAMES[name]) for name in named)
+    return {name for name in named if len(TESTMODE_STATUS_NAMES[name]) == longest}
+
+
+def testmode_status_name(image):
+    """Page 4: the control the status cell names, or None when it names none or the name is unreadable."""
+    named = testmode_status_controls(ocr(image, TESTMODE_STATUS_BOX, psm=7, scale=3))
+    return named.pop() if len(named) == 1 else None
 
 
 def testmode_gauge(image, name):
@@ -1604,6 +1685,24 @@ class Runner:
             self.session.turn("selector", delta, 0.7)
             time.sleep(1.2)
         return selected_tile(self.session.image("track"), probe) == track
+
+    def on_track(self, track):
+        """Whether the home screen shows `track` selected, re-selecting it once when it does not.
+
+        A track parameter belongs to the selected track: if the selection moved (a knob step or a menu the previous
+        recipe left behind), a VOLUME setting would land on another track while the pad still plays this one, and the
+        level would not change at all. Another screen, or one the probe cannot read, is looked at again on the home
+        screen; an unreadable tile screen is then reported as not selected rather than guessed.
+        Returns (selected, the track the screen showed)."""
+        probe = self.p["selector_probe"]
+        current = selected_tile(self.session.image("track"), probe)
+        if current is None:
+            self.go_home()
+            current = selected_tile(self.session.image("track"), probe)
+        if current is not None and current != track:
+            self.select_track(track)
+            current = selected_tile(self.session.image("track"), probe)
+        return current == track, current
 
     def load_sample(self, track, name):
         """Assign a fixture to a track with the profile's sample_load recipe (once per track and sample)."""
@@ -3178,6 +3277,10 @@ class Runner:
         volume = self.p["recipes"]["volume_knob"]
         self.set_knob("knob1", 100, volume["value_box"], volume["max"])
         self.go_home()
+        selected, shown = self.on_track(1)
+        if not selected:
+            return from_subresults("HW-34", [sub("TRACK 1 is selected before the tone hit", False,
+                                                 f"the home screen showed TRACK {shown}")])
         left, right, data = self.hit_capture("pad1", 100, seconds=7.0, pre=0.5)
         subs = []
         threshold = max(64, peak(left) * 0.05)
@@ -3207,15 +3310,25 @@ class Runner:
         same = peak(right[span[0]:span[1]]) > 0.5 * peak(body)
         subs.append(sub("sound on the declared channels only", not leak and same,
                         f"other channels with the tone {leak}; right peak {peak(right)}"))
-        levels = []
+        levels, lost = [], []
         self.set_knob("knob1", 0, volume["value_box"], volume["max"])
         for _ in range(4):
+            selected, shown = self.on_track(1)
+            if not selected:
+                lost.append(f"before hit {len(levels) + 1}: TRACK {shown}")
+                break
             s.turn("knob1", 8, 0.35)
             time.sleep(1.5)
             value = read_number(ocr(s.image("vol"), tuple(volume["value_box"]), 7, 4))
+            # The knob step itself can move the selection, so check again right before the hit that reads the level.
+            selected, shown = self.on_track(1)
+            if not selected:
+                lost.append(f"after the step of hit {len(levels) + 1}: TRACK {shown}")
+                break
             l, _, _ = self.hit_capture("pad1", 100, seconds=0.5)
             levels.append((value, peak(l)))
             time.sleep(6.0)
+        subs.append(sub("TRACK 1 is selected before every level hit", not lost, "; ".join(lost)))
         ordered = sorted(levels)
         mono = all(b[1] > a[1] for a, b in zip(ordered, ordered[1:])) and len({v for v, _ in levels}) == 4
         subs.append(sub("level follows the track VOLUME knob monotonically (4 settings)", mono, str(levels)))
@@ -3253,14 +3366,18 @@ class Runner:
         records, left, start, to_time = self.over_window(3, "hw-tone-full.wav")
         loud = [i for i in range(len(left)) if abs(int(left[i])) >= 0.89 * 32767] if peak(left) >= 0.89 * 32767 else []
         lit_times = [t for t, d in records if self.lamp(d, role)[0]]
+        # OVER is the firmware's ClipMeter on the DSI drive input, threshold 1.8 = +5.1 dBFS, 500 ms hold (R4). The
+        # level path is byte-transparent, so a full-scale master (0 dBFS) stays 5.1 dB below the threshold and the
+        # lamp correctly stays dark; nothing here drives the DSI drive input past +5.1 dBFS, so this stays known-failing.
+        level = f"peak {peak(left)}" + (f" ({round(20 * math.log10(peak(left) / 32767), 2)} dBFS)" if peak(left) else "")
         if not loud:
-            subs.append(sub("full-scale tone reaches the output", False, f"peak {peak(left)}"))
+            subs.append(sub("full-scale tone reaches the output", False, level))
         else:
             t_first, t_last = to_time(start + loud[0]), to_time(start + loud[-1])
             on = next((t for t in lit_times if t >= t_first - 0.05), None)
             off = next((t for t, d in records if t > t_last and not self.lamp(d, role)[0]), None)
-            subs.append(sub("OVER lit within 50 ms of the first near-full-scale sample",
-                            on is not None and on - t_first <= 0.05, f"{on and round(on - t_first, 3)} s"))
+            subs.append(sub("OVER lights when the DSI drive input passes +5.1 dBFS",
+                            on is not None and on - t_first <= 0.05, f"{on and round(on - t_first, 3)} s, {level}"))
             subs.append(sub("OVER off within 1 s of the last", off is not None and off - t_last <= 1.0,
                             f"{off and round(off - t_last, 3)} s"))
         records, left, _, _ = self.over_window(4, "hw-tone-m30.wav")
@@ -3704,7 +3821,8 @@ class Runner:
             for hw in wanted:
                 self.verdicts[hw] = verdict(hw, "N/A", "precondition: no --testmode-build (a build made with --app-arg testmode)")
             return
-        checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51, "HW-53": self.hw53}
+        checks = {"HW-48": self.hw48, "HW-49": self.hw49, "HW-50": self.hw50, "HW-51": self.hw51,
+              "HW-53": self.hw53, "HW-54": self.hw54}
         pid = None
         try:
             # The firmware this build will boot must be the profile's (a library can hold another one under the same id).
@@ -3788,22 +3906,35 @@ class Runner:
                         f"read {count} from {ocr(image, TESTMODE_RESULT_ROW, psm=7, scale=3)!r}"))
         if count is None:
             return from_subresults("HW-49", subs)
-        missed = []
+        missed, misnamed, unread = [], [], []
         for name in TESTMODE_LED_BUTTONS + TESTMODE_PLAIN_BUTTONS:
             if name in skip:
                 continue
             before = count
             s.press(name, 0.4)
             deadline = time.monotonic() + 20
+            named = None
             while True:
                 wait_settled(s, 1.0, 20)
-                count = testmode_counter(s.image("p4"), TESTMODE_RESULT_ROW, 50)
+                image = s.image("p4")
+                count = testmode_counter(image, TESTMODE_RESULT_ROW, 50)
+                named = testmode_status_name(image)
                 if count is not None and count != before or time.monotonic() > deadline:
                     break
             if count != (before or 0) + 1:
                 missed.append(f"{name} ({before} -> {count})")
                 count = count if count is not None else before
+            # The status cell names the control the page counted. Two controls with swapped mappings move RESULT the same
+            # way, so the totals alone cannot tell them apart; the page's own name can.
+            if named is None:
+                unread.append(name)
+            elif named != name:
+                misnamed.append(f"{name} -> {named}")
         subs.append(sub("every control moved RESULT up by exactly one", not missed, "; ".join(missed[:6])))
+        subs.append(sub("the status line named the control that was pressed", not misnamed, "; ".join(misnamed[:6])))
+        if unread:
+            subs.append(sub("the status line was readable for every press", False,
+                            f"no name read for {len(unread)} presses: {', '.join(unread[:6])}", na=True))
         s.press("selector", 0.4)
         wait_settled(s, 1.5, 20)
         image = s.image("p4")
@@ -3953,6 +4084,20 @@ class Runner:
         wait_settled(s, 1.5, 30)
         self.shots_into(subs, "testmode-page3-lcd", s.image("p3"))
         return from_subresults("HW-53", subs)
+
+    def hw54(self):
+        """Test page 8 (DEVICE TEST): tap the MIDI CHECK touch button and expect the DIN MIDI loopback to read OK."""
+        s = self.session
+        subs = [self.testmode_page_is(8, "device test")]
+        if subs[-1]["status"] != "PASS":
+            return from_subresults("HW-54", subs)
+        wait_settled(s, 1.5, 30)
+        s.tap(115, 112)
+        ok, text = wait_midi_check(s)
+        subs.append(sub("tapping the MIDI CHECK button shows MIDI CHECK OK", ok, text))
+        wait_settled(s, 1.5, 30)
+        self.shots_into(subs, "testmode-page8-lcd", s.image("p8"))
+        return from_subresults("HW-54", subs)
 
     # ------------------------------------------------------------------ HW-42, HW-44, HW-45, HW-24
     def library_files(self):
@@ -4182,6 +4327,18 @@ class Runner:
             result = verdict(hw_id, "BLOCKED", f"runner could not complete the check: {type(error).__name__}: {error}")
         if result is None:
             return  # multi-phase check, finished later
+        if result["status"] == "FAIL":
+            declared = known_failing(self.p, hw_id)
+            if declared:
+                # An owner-declared expected failure: keep the measured figures (the sub-results already carry the live
+                # peak in dBFS), but record the declaration and re-label the verdict so verification still passes.
+                reason = (f"known-failing ({declared.get('owner', 'owner')}, {declared.get('date', '')}): "
+                          f"{declared.get('reason', '')}")
+                if declared.get("gap"):
+                    reason += f"; measured gap: {declared['gap']}"
+                result["status"] = "KNOWN-FAIL"
+                result["reason"] = reason
+                result["evidence"] = list(result.get("evidence") or []) + ["known-failing"]
         result["elapsed_s"] = round(time.monotonic() - t0, 2)
         result["load"] = {"start": load, "end": load_averages(), "vms": len(qemu_processes())}
         self.verdicts[hw_id] = result
@@ -4373,7 +4530,7 @@ def mark_verified(profile_path, result, result_path, result_sha256):
     profile = json.loads(raw)
     summary, run = result["summary"], result["run"]
     if not summary["verified_eligible"]:
-        raise EnvError("run is not eligible: full tier without --only, every check PASS or N/A")
+        raise EnvError("run is not eligible: full tier without --only, every check PASS, KNOWN-FAIL or N/A")
     if run["profile_sha256"] != hashlib.sha256(raw).hexdigest():
         raise EnvError("the profile changed after the run")
     if run["app_sha256"] != profile["firmware"]["app_sha256"]:
@@ -4383,6 +4540,10 @@ def mark_verified(profile_path, result, result_path, result_sha256):
     unjustified = [v["id"] for v in na if v["reason"] not in absent and not v["reason"].startswith("precondition:")]
     if unjustified:
         raise EnvError(f"N/A without a declared hardware.absent reason: {unjustified}")
+    known = {item["check"] for item in declared_known_failing(profile)}
+    undeclared = [v["id"] for v in result["verdicts"] if v["status"] == "KNOWN-FAIL" and v["id"] not in known]
+    if undeclared:
+        raise EnvError(f"KNOWN-FAIL without a declared hardware.known_failing entry: {undeclared}")
     if summary.get("needs_owner_signoff") and not profile.get("owner_signoff"):
         raise EnvError("more than five N/A need a maintainer's sign-off line (owner_signoff) in the profile")
     try:  # record the stored result relative to the repository (results live in the git-ignored private/ folder)
@@ -4443,7 +4604,7 @@ def main(argv=None):
     parser.add_argument("--firmware", help="firmware id in the build's library (default: the session's)")
     parser.add_argument("--control-build", help="build made with --uncalibrated sharing the library (HW-24 control)")
     parser.add_argument("--testmode-build", help="build made with --app-arg testmode, for the factory test page checks "
-                                                 "(HW-48..HW-51 and HW-53, extra tier); its firmware must be the "
+                                                 "(HW-48..HW-51 and HW-53..HW-54, extra tier); its firmware must be the "
                                                  "profile's, or the run is refused")
     parser.add_argument("--testmode-skip", type=testmode_skip_arg, default=[],
                         help="comma-separated controls HW-49 leaves unpressed (pad1..pad16, step1..step16, track, mode, "

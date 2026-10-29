@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 typedef struct _snd_pcm snd_pcm_t;
@@ -91,14 +92,32 @@ int main(void) {
     assert(snd_pcm_readi(handle,buffer,0)==0);
     assert(snd_pcm_close(handle)==0);
     /* By default: the AK4452 codec lists S16_LE, S24_LE and S20_3LE, so FLOAT_LE
-     * and S32_LE are refused as the unit's driver would and the app's format search settles on S24_LE; the master
-     * codec stream is not filtered. */
+     * and S32_LE are refused as the unit's driver would and the app's format search settles on S24_LE; S20_3LE is
+     * refused too because the board model's sample path carries only 2- and 4-byte layouts. */
     assert(snd_pcm_open(&handle,"hw:ak4452audio,0",1,0)==0);
     assert(snd_pcm_hw_params_set_format(handle,p,14)<0);
     assert(snd_pcm_hw_params_set_format(handle,p,10)<0);
+    assert(snd_pcm_hw_params_set_format(handle,p,36)<0);
     assert(snd_pcm_hw_params_set_format(handle,p,6)==0);
     assert(snd_pcm_close(handle)==0);
     assert(snd_pcm_open(&handle,"hw:ak4458audio,0",0,0)==0);
+    assert(snd_pcm_hw_params_set_format(handle,p,2)==0);  /* S16_LE */
+    assert(snd_pcm_hw_params_set_format(handle,p,6)<0);  /* S24_LE */
+    assert(snd_pcm_hw_params_set_format(handle,p,10)<0); /* S32_LE */
+    assert(snd_pcm_hw_params_set_format(handle,p,14)<0); /* FLOAT_LE */
+    assert(snd_pcm_close(handle)==0);
+    assert(snd_pcm_open(&handle,"hw:ak4458audio,1",0,0)==0);
+    assert(snd_pcm_hw_params_set_format(handle,p,2)==0);
+    assert(snd_pcm_hw_params_set_format(handle,p,6)<0);
+    assert(snd_pcm_close(handle)==0);
+    assert(snd_pcm_open(&handle,"unmodeled",0,0)==0);
+    assert(snd_pcm_hw_params_set_format(handle,p,14)==0);
+    assert(snd_pcm_close(handle)==0);
+    assert(setenv("SP16_PCM_ANY_FORMAT","1",1)==0);
+    assert(snd_pcm_open(&handle,"hw:ak4458audio,0",0,0)==0);
+    assert(snd_pcm_hw_params_set_format(handle,p,14)==0);
+    assert(snd_pcm_close(handle)==0);
+    assert(snd_pcm_open(&handle,"hw:ak4452audio,0",1,0)==0);
     assert(snd_pcm_hw_params_set_format(handle,p,14)==0);
     assert(snd_pcm_close(handle)==0);
     /* Media node: an empty queue polls idle (a read would block like the kernel's); logged rate-limited. */

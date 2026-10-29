@@ -19,6 +19,7 @@ What every update of the product shares; used by the importer before a version h
 | `update.images_dir`, `update.tar_layers[]`, `update.squashfs_layers[]` | where the firmware layers are inside the update and where each is unpacked |
 | `update.revision_files[]` | small version files copied into the manifest |
 | `update.mount_points[]` | directories created in the assembled tree |
+| `update.max_boot_read_bytes`, `update.enforce_boot_read` | per layer, inside `update.tar_layers[]`: the hardware read-length limit for that layer's archive (`rootfs1`..`rootfs4`, `pdj`) and whether the limit is enforced at unpack and repack (`rootfs2`, `pdj`) |
 | `app_candidates[]`, `loader_candidates[]` | where the application and the ARM loader may be |
 
 ## Compatibility profile (`profiles/sp16-<version>.json`)
@@ -31,7 +32,8 @@ What every update of the product shares; used by the importer before a version h
 | `status` | `verified` or `candidate`; only `verified` makes a run verified, a candidate (or no profile, then the product's reference profile) runs unverified |
 | `firmware` | `version`, `app_path`, `app_sha256` (the identity that matches a profile to an import), `upd_sha256` (repository copy only), `app_revision`, `panel_revisions`, `loader_path` |
 | `runtime` | application working directory, emulated CPU, library path, data, storage and USB mount points, writable directories, allowed application arguments |
-| `panel` | `selector_window_frames`, `pad_curve`, `button_roles`, `buttons_inert`, `counters`, `analog_words`, `lamp_roles`, `lamp_groups`, `mono_dim_flag` |
+| `panel` | `selector_window_frames`, `pad_curve`, `button_roles`, `buttons_inert`, `counters`, `analog_words`, `lamp_roles` (SHIFT has no physical lamp), `lamp_groups`, `mono_dim_flag` |
+| `audio` | `audio.jacks` mapping jack names to stream channel pairs (MAIN, PHONES, OUT 3-4, OUT 5-6, OUT 7-8), validated against `audio-jack-map.json`. Dropped from shipped profiles (not a runtime field); the Output monitor menu uses the same mapping compiled into the app |
 | `calibration` | pad calibration file path, format, template, range and default; the guest writes a synthetic file in this format at boot |
 
 ### Hardware suite data (repository copy only)

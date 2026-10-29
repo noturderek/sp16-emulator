@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 from pathlib import Path
 import struct
 import sys
@@ -26,10 +27,10 @@ def all_pass(ids=None):
 
 class CheckTableTests(unittest.TestCase):
     def test_table_matches_the_spec(self):
-        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 54)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS], [f"HW-{n:02d}" for n in range(1, 55)])
         self.assertEqual(list(hwsuite.SMOKE_IDS), SPEC_SMOKE)
         self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "L"], ["HW-44"])
-        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 54)])
+        self.assertEqual([c.id for c in hwsuite.CHECKS if c.tier == "X"], [f"HW-{n}" for n in range(47, 55)])
 
     def test_tiers_and_only(self):
         self.assertEqual(hwsuite.select_checks("smoke"), SPEC_SMOKE)
@@ -39,7 +40,7 @@ class CheckTableTests(unittest.TestCase):
         self.assertEqual(hwsuite.select_checks("smoke", ["HW-02", "HW-05"]), ["HW-05"])
         # Extras stay out of full and core, and run by tier or by name.
         self.assertNotIn("HW-47", hwsuite.select_checks("full"))
-        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 54)])
+        self.assertEqual(hwsuite.select_checks("extra"), [f"HW-{n}" for n in range(47, 55)])
         self.assertEqual(hwsuite.select_checks("full", ["HW-47", "HW-05"]), ["HW-05", "HW-47"])
         with self.assertRaises(ValueError):
             hwsuite.select_checks("full", ["HW-99"])
@@ -86,6 +87,27 @@ class ProfileFieldTests(unittest.TestCase):
         self.assertEqual(hwsuite.absent_reason(profile, "usb_stop_lamp"), "no lamp on this version")
         self.assertIsNone(hwsuite.absent_reason(profile, "strip"))
 
+    def test_known_failing(self):
+        profile = {"hardware": {"known_failing": [{"check": "HW-35", "reason": "r", "owner": "owner",
+                                                    "date": "2026-10-28", "gap": "g"}]}}
+        self.assertEqual(hwsuite.known_failing(profile, "HW-35")["reason"], "r")
+        self.assertIsNone(hwsuite.known_failing(profile, "HW-36"))
+        self.assertIsNone(hwsuite.known_failing({}, "HW-35"))
+
+    def test_known_failing_tolerates_a_malformed_profile(self):
+        """A hand-edited or half-written profile must not raise out of a check: only usable entries are read."""
+        declaration = {"check": "HW-35", "reason": "r", "owner": "o", "date": "2026-10-28"}
+        for broken in ({}, {"hardware": None}, {"hardware": []}, {"hardware": "known"}, {"hardware": {}},
+                       {"hardware": {"known_failing": None}}, {"hardware": {"known_failing": "HW-35"}},
+                       {"hardware": {"known_failing": [None, 7, "HW-35", {}, {"reason": "r"}]}},
+                       {"hardware": {"known_failing": [{"check": 35, "reason": "r"}]}}):
+            with self.subTest(profile=broken):
+                self.assertEqual(hwsuite.declared_known_failing(broken), [])
+                self.assertIsNone(hwsuite.known_failing(broken, "HW-35"))
+        mixed = {"hardware": {"known_failing": [None, "HW-35", declaration]}}
+        self.assertEqual(hwsuite.known_failing(mixed, "HW-35"), declaration)
+        self.assertIsNone(hwsuite.known_failing(mixed, "HW-36"))
+
 
 class VerdictTests(unittest.TestCase):
     def test_na_needs_a_reason(self):
@@ -93,6 +115,8 @@ class VerdictTests(unittest.TestCase):
             hwsuite.verdict("HW-30", "N/A")
         with self.assertRaises(ValueError):
             hwsuite.verdict("HW-30", "MAYBE")
+        with self.assertRaises(ValueError):
+            hwsuite.verdict("HW-35", "KNOWN-FAIL")
 
     def test_aggregation(self):
         ok, bad = hwsuite.sub("a", True), hwsuite.sub("b", False, "lost a detent")
@@ -124,6 +148,14 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(hwsuite.exit_code(blocked + [hwsuite.verdict("HW-03", "FAIL", "x")]), hwsuite.EXIT_FAIL)
         self.assertEqual(hwsuite.exit_code(all_pass(), session_lost=True), hwsuite.EXIT_LOST)
 
+    def test_known_fail_is_expected_so_does_not_block_or_fail(self):
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r")
+        summary = hwsuite.summarize(verdicts, "full")
+        self.assertTrue(summary["verified_eligible"])
+        self.assertEqual(summary["counts"]["KNOWN-FAIL"], 1)
+        self.assertEqual(hwsuite.exit_code(verdicts), hwsuite.EXIT_OK)
+
     def test_report_lists_failures_and_na(self):
         verdicts = all_pass()
         verdicts[17] = hwsuite.from_subresults("HW-18", [hwsuite.sub("wrap", False, "16 -> 2")])
@@ -136,6 +168,45 @@ class VerdictTests(unittest.TestCase):
         self.assertIn("## HW-18 FAIL", text)
         self.assertIn("- HW-30: analog-only", text)
         self.assertEqual(text.count("| HW-"), len(verdicts))
+
+    def test_report_lists_known_fail_with_its_reason(self):
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r; measured gap: g",
+                                       subresults=[hwsuite.sub("full-scale tone reaches the output", False, "peak 17352")])
+        result = {"suite": {"version": "1", "checks_hash": "0" * 64,
+                            "hardware_fingerprint": {"sha256": "1" * 64, "hardware_epoch": 1}},
+                  "run": {"id": "r", "tier": "full", "start": "s", "end": "e", "firmware_version": "1.60"},
+                  "verdicts": verdicts, "summary": hwsuite.summarize(verdicts)}
+        text = hwsuite.render_report(result)
+        self.assertIn("## HW-35 KNOWN-FAIL", text)
+        self.assertIn("known-failing (owner, 2026-10-28)", text)
+
+
+class KnownFailingRecordTests(unittest.TestCase):
+    def runner(self, profile):
+        path = TOOLS / "profiles" / "sp16-1.60.json"
+        return hwsuite.Runner(profile, path, None, None, TOOLS, TOOLS, "full")
+
+    def test_a_declared_failure_is_relabelled_known_fail_and_keeps_the_measurement(self):
+        profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())
+        runner = self.runner(profile)
+        observed = "peak 17352 (-5.52 dBFS)"
+        runner.record("HW-35", lambda: hwsuite.verdict("HW-35", "FAIL", "",
+                                                       subresults=[hwsuite.sub("full-scale tone reaches the output",
+                                                                                False, observed)]))
+        result = runner.verdicts["HW-35"]
+        self.assertEqual(result["status"], "KNOWN-FAIL")
+        self.assertIn("known-failing (owner, 2026-10-28)", result["reason"])
+        self.assertIn("measured gap", result["reason"])
+        self.assertEqual(result["subresults"][0]["observed"], observed)
+        self.assertEqual(result["evidence"], ["known-failing"])
+
+    def test_an_undeclared_failure_stays_fail(self):
+        profile = json.loads((TOOLS / "profiles" / "sp16-1.60.json").read_text())
+        profile["hardware"]["known_failing"] = []
+        runner = self.runner(profile)
+        runner.record("HW-36", lambda: hwsuite.verdict("HW-36", "FAIL", "x"))
+        self.assertEqual(runner.verdicts["HW-36"]["status"], "FAIL")
 
 
 class FrameTests(unittest.TestCase):
@@ -202,6 +273,22 @@ class FixtureTests(unittest.TestCase):
             self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()),
                              (2, 2, 44100, 6 * 44100))
         self.assertEqual(wavs, hwsuite.fixture_wavs())  # deterministic
+
+    def test_each_fixture_measures_the_level_its_name_states(self):
+        """A fixture named for a level has to measure that level: the OVER probe's control plays the -30 dBFS one, so a
+        fixture that actually peaks 6.7 dB lower sends the reader hunting in the wrong file (the played-back level
+        also carries the track volume, which is the probe's business, not the fixture's)."""
+        import wave
+        wavs = hwsuite.fixture_wavs()
+        for name, stated in (("hw-tone-full.wav", 0.0), ("hw-tone440.wav", -6.0), ("hw-tone-m30.wav", -30.0)):
+            with self.subTest(name=name):
+                with wave.open(io.BytesIO(wavs[name])) as w:
+                    frames = w.readframes(w.getnframes())
+                peak = max(abs(value) for value in struct.unpack(f"<{len(frames) // 2}h", frames))
+                self.assertGreater(peak, 0)
+                measured = 20 * math.log10(peak / 32767.0)
+                self.assertAlmostEqual(measured, stated, delta=0.1,
+                                       msg=f"{name} peaks at {peak} ({measured:.2f} dBFS), not {stated:g} dBFS")
 
     def test_fat32_round_trip_and_dirty_flag(self):
         files = {"hw-a.wav": b"x" * 1500, "B.TXT": b"", "long name file.wav": bytes(range(256)) * 9}
@@ -313,6 +400,65 @@ class ImageTests(unittest.TestCase):
         ImageDraw.Draw(listing).rectangle((0, 30, 99, 44), fill=(225, 225, 230))
         self.assertEqual(hwsuite.highlighted_band(listing, (0, 0, 100, 60)), (30, 45))
         self.assertIsNone(hwsuite.highlighted_band(base, (0, 0, 100, 60)))
+
+
+class TrackSelectionTests(unittest.TestCase):
+    """`on_track`: HW-34 must not read a level from the VOLUME knob of a track nobody is playing."""
+
+    def runner(self, tmp):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        runner = hwsuite.Runner(json.loads(profile_path.read_text()), profile_path, tmp, None, tmp, tmp, "core",
+                                ["HW-34"])
+        runner.session = FakeSession()
+        return runner
+
+    def on_track(self, tiles):
+        """Run on_track with the tile screen reading `tiles` in turn; returns (result, calls made)."""
+        calls = []
+
+        def tile(image, probe):
+            calls.append("tile")
+            return tiles[min(len(calls) - 1, len(tiles) - 1)]
+
+        def select(track):
+            calls.append(("select", track))
+            return True
+
+        def home():
+            calls.append("home")
+            return True
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(tmp)
+            with mock.patch.object(hwsuite, "selected_tile", side_effect=tile), \
+                    mock.patch.object(hwsuite.Runner, "select_track", side_effect=select), \
+                    mock.patch.object(hwsuite.Runner, "go_home", side_effect=home):
+                return runner.on_track(1), calls
+
+    def test_a_track_that_is_selected_is_not_touched(self):
+        (selected, shown), calls = self.on_track([1])
+        self.assertEqual((selected, shown), (True, 1))
+        self.assertEqual(calls, ["tile"])
+
+    def test_the_wrong_track_is_selected_again(self):
+        """The reported bug: TRACK 7 was selected after the knob step, so the level never moved. on_track puts TRACK 1
+        back and says so."""
+        (selected, shown), calls = self.on_track([7, 1])
+        self.assertEqual((selected, shown), (True, 1))
+        self.assertEqual(calls, ["tile", ("select", 1), "tile"])
+
+    def test_a_track_that_stays_wrong_is_reported_not_guessed(self):
+        (selected, shown), _ = self.on_track([7, 7])
+        self.assertEqual((selected, shown), (False, 7))
+
+    def test_another_screen_is_looked_at_again_on_the_home_screen(self):
+        (selected, shown), calls = self.on_track([None, 1])
+        self.assertEqual((selected, shown), (True, 1))
+        self.assertEqual(calls, ["tile", "home", "tile"])
+
+    def test_an_unreadable_screen_is_not_selected_and_moves_nothing(self):
+        (selected, shown), calls = self.on_track([None, None])
+        self.assertEqual((selected, shown), (False, None))
+        self.assertEqual(calls, ["tile", "home", "tile"])
 
 
 class TestmodePageTests(unittest.TestCase):
@@ -462,6 +608,144 @@ class TestmodePageTests(unittest.TestCase):
         result, _ = self.run_hw53(self.GOOD_WALKS, start={pad: 242 if pad != 7 else 300 for pad in range(1, 17)})
         self.assertEqual(result["status"], "FAIL")
         self.assertIn("synthetic default", result["reason"])
+
+    def hw54_runner(self, tmp):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        runner = hwsuite.Runner(json.loads(profile_path.read_text()), profile_path, tmp, None, tmp, tmp, "extra",
+                                ["HW-54"], testmode_build=tmp)
+        runner.session = FakeSession()
+        return runner
+
+    def test_hw54_passes_when_the_loopback_reads_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw54_runner(tmp)
+            with mock.patch.object(hwsuite.Runner, "testmode_page_is", return_value=hwsuite.sub("stepped to page 8", True)), \
+                    mock.patch.object(hwsuite, "wait_settled"), \
+                    mock.patch.object(hwsuite, "wait_midi_check", return_value=(True, "MIDI CHECK : OK")), \
+                    mock.patch.object(hwsuite.Runner, "shots_into"):
+                result = runner.hw54()
+        self.assertEqual((result["status"], len(result["subresults"])), ("PASS", 2))
+        self.assertEqual(runner.session.calls, [("tap", 115, 112)])
+
+    def test_hw54_fails_when_the_page_never_reads_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw54_runner(tmp)
+            with mock.patch.object(hwsuite.Runner, "testmode_page_is", return_value=hwsuite.sub("stepped to page 8", True)), \
+                    mock.patch.object(hwsuite, "wait_settled"), \
+                    mock.patch.object(hwsuite, "wait_midi_check", return_value=(False, "MIDI CHECK : ---")), \
+                    mock.patch.object(hwsuite.Runner, "shots_into"):
+                result = runner.hw54()
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("MIDI CHECK OK", result["reason"])
+        self.assertIn("MIDI CHECK : ---", result["reason"])
+
+    def test_hw54_fails_when_page_8_never_shows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw54_runner(tmp)
+            with mock.patch.object(hwsuite.Runner, "testmode_page_is", return_value=hwsuite.sub("stepped to page 8", False, "the page never showed")):
+                result = runner.hw54()
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(runner.session.calls, [])
+
+    def test_wait_midi_check_reads_ok_and_reports_the_last_text_on_timeout(self):
+        session = FakeSession()
+        with mock.patch.object(hwsuite, "ocr", side_effect=["——", "OK"]) as reader, \
+                mock.patch.object(hwsuite.time, "sleep"):
+            ok, text = hwsuite.wait_midi_check(session, timeout=30)
+        self.assertTrue(ok)
+        self.assertEqual(text, "OK")
+        self.assertEqual(reader.call_args.args[1], hwsuite.MIDI_CHECK_STATUS_BOX)
+        with mock.patch.object(hwsuite, "ocr", return_value="---"), \
+                mock.patch.object(hwsuite.time, "sleep"), \
+                mock.patch.object(hwsuite.time, "monotonic", side_effect=[0.0, 0.0, 31.0]):
+            ok, text = hwsuite.wait_midi_check(session, timeout=30)
+        self.assertFalse(ok)
+        self.assertIn("---", text)
+
+    def test_the_page_4_status_cell_names_the_control_it_counted(self):
+        """The status cell prints the control the page counted (`PAD 1 : 3`); the reader must name that control and no
+        other, so a press the page misattributes is visible."""
+        self.assertEqual(hwsuite.testmode_status_controls("PAD 1 : 3"), {"pad1"})
+        self.assertEqual(hwsuite.testmode_status_controls("STEP 16 : 1"), {"step16"})
+        self.assertEqual(hwsuite.testmode_status_controls("STEP 1 : 1"), {"step1"})
+        self.assertEqual(hwsuite.testmode_status_controls("BAR 3 : 41"), {"bar3"})
+        self.assertEqual(hwsuite.testmode_status_controls("USB STOP : 2"), {"usb_stop"})   # not STOP
+        self.assertEqual(hwsuite.testmode_status_controls("USBSTOP : 2"), {"usb_stop"})    # OCR drops the space
+        self.assertEqual(hwsuite.testmode_status_controls("PAD12 : 1"), {"pad12"})
+        self.assertEqual(hwsuite.testmode_status_controls("STOP : 2"), {"stop"})
+        self.assertEqual(hwsuite.testmode_status_controls("SHIFT"), {"shift"})
+        self.assertEqual(hwsuite.testmode_status_controls("MODE : ---"), {"mode"})
+        # Not a name: the idle placeholder, an empty cell, and a name that is not the cell's first tokens.
+        self.assertEqual(hwsuite.testmode_status_controls("--------- : ---"), set())
+        self.assertEqual(hwsuite.testmode_status_controls(""), set())
+        self.assertEqual(hwsuite.testmode_status_controls("n/a : play"), set())
+
+    def test_every_control_page_4_counts_has_a_printed_name(self):
+        self.assertEqual(set(hwsuite.TESTMODE_STATUS_NAMES), set(hwsuite.TESTMODE_CONTROLS))
+        self.assertEqual(len({words for words in hwsuite.TESTMODE_STATUS_NAMES.values()}), 50)
+
+    def hw49_runner(self, tmp, skip=()):
+        profile_path = TOOLS / "profiles" / "sp16-1.60.json"
+        runner = hwsuite.Runner(json.loads(profile_path.read_text()), profile_path, tmp, None, tmp, tmp, "extra",
+                                ["HW-49"], testmode_build=tmp, testmode_skip=skip)
+        runner.session = FakeSession()
+        return runner
+
+    def run_hw49(self, misnaming=None, skip=()):
+        """hw49 against a page that counts every press, and names the control in `misnaming` (default: the one pressed)
+        as another control, which is what a swapped mapping looks like."""
+        misnaming = misnaming or {}
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.hw49_runner(tmp, skip)
+
+            def pressed():
+                names = [call[1] for call in runner.session.calls if call[0] == "press" and call[1] != "selector"]
+                return names[-1] if names else None
+
+            def counted(image, row, total):
+                presses = [call for call in runner.session.calls if call[0] == "press" and call[1] != "selector"]
+                return min(len(presses), 48) if row == hwsuite.TESTMODE_LED_ROW else len(presses)
+
+            def named(image):
+                name = pressed()
+                return None if name is None else misnaming.get(name, name)
+            with mock.patch.object(hwsuite, "wait_settled"), mock.patch.object(hwsuite, "ocr", return_value="OK"), \
+                    mock.patch.object(hwsuite, "testmode_counter", side_effect=counted), \
+                    mock.patch.object(hwsuite, "testmode_status_name", side_effect=named), \
+                    mock.patch.object(hwsuite.Runner, "testmode_page_is",
+                                      return_value=hwsuite.sub("stepped to page 4", True)):
+                return runner.hw49()
+
+    def test_hw49_passes_when_every_press_is_counted_and_named(self):
+        result = self.run_hw49()
+        self.assertEqual(result["status"], "PASS")
+        self.assertIn("the status line named the control that was pressed", [s["name"] for s in result["subresults"]])
+
+    def test_hw49_fails_when_the_page_names_another_control_for_a_press(self):
+        """Two controls with swapped mappings still move RESULT, so the totals pass; the page's own status line names
+        the other control and that must fail the check."""
+        result = self.run_hw49({"bar4": "bar3"})
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("bar4 -> bar3", result["reason"])
+        self.assertEqual([s["status"] for s in result["subresults"] if s["name"].startswith("every control moved")],
+                         ["PASS"])
+
+    def test_hw49_reports_an_unreadable_status_line_as_not_applicable(self):
+        """A cell the OCR cannot read is not proof of a wrong mapping: the totals still decide, and the gap is named."""
+        result = self.run_hw49({"pad7": None})
+        self.assertEqual(result["status"], "PASS")
+        unread = [s for s in result["subresults"] if s["name"] == "the status line was readable for every press"]
+        self.assertEqual([s["status"] for s in unread], ["N/A"])
+        self.assertIn("pad7", unread[0]["observed"])
+
+    def test_hw49_does_not_judge_a_control_it_was_told_to_skip(self):
+        """--testmode-skip leaves a control unpressed (the totals then fall short by design); its name is never judged."""
+        result = self.run_hw49({"bar4": "bar3"}, skip=("bar4",))
+        status = [s["status"] for s in result["subresults"]
+                  if s["name"] == "the status line named the control that was pressed"]
+        self.assertEqual(status, ["PASS"])
+        self.assertEqual(result["metrics"]["skipped"], ["bar4"])
+        self.assertNotIn("bar4 -> bar3", result["reason"])
 
     def test_testmode_skip_names_must_be_controls_hw49_presses(self):
         self.assertEqual(hwsuite.check_testmode_skip([]), ())
@@ -782,6 +1066,49 @@ class MarkVerifiedTests(unittest.TestCase):
         with self.assertRaises(hwsuite.EnvError):
             hwsuite.mark_verified(self.path, self.result(na), "r", "c")
         self.assertEqual(json.loads(self.path.read_text())["status"], self.profile["status"])
+
+    def declare_known_failing(self):
+        self.profile.setdefault("hardware", {})["known_failing"] = [
+            {"check": "HW-35", "reason": "r", "owner": "owner", "date": "2026-10-28"}]
+        self.path.write_text(json.dumps(self.profile, indent=2) + "\n")
+
+    def test_marks_a_declared_known_fail(self):
+        self.declare_known_failing()
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r")
+        block = hwsuite.mark_verified(self.path, self.result(verdicts), "/x/hwsuite-result.json", "c" * 64)
+        self.assertEqual(block["counts"]["KNOWN-FAIL"], 1)
+        self.assertEqual(json.loads(self.path.read_text())["status"], "verified")
+
+    def test_refuses_an_undeclared_known_fail(self):
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "x")
+        with self.assertRaises(hwsuite.EnvError):
+            hwsuite.mark_verified(self.path, self.result(verdicts), "r", "c")
+        self.assertEqual(json.loads(self.path.read_text())["status"], self.profile["status"])
+
+    def test_tolerates_a_malformed_known_failing_list(self):
+        # mark_verified reads the profile straight off disk: a declaration list with junk in it must not raise an
+        # AttributeError, and the junk must not count as a declaration for anything.
+        self.profile.setdefault("hardware", {})["known_failing"] = [None, "HW-35", {"reason": "r"}]
+        self.path.write_text(json.dumps(self.profile, indent=2) + "\n")
+        verdicts = all_pass()
+        verdicts[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "x")
+        with self.assertRaises(hwsuite.EnvError) as caught:
+            hwsuite.mark_verified(self.path, self.result(verdicts), "r", "c")
+        self.assertIn("KNOWN-FAIL without a declared hardware.known_failing entry: ['HW-35']", str(caught.exception))
+
+    def test_the_ineligible_message_names_known_fail(self):
+        # KNOWN-FAIL does not block eligibility (summarize leaves it out of the failing counts), so the message that
+        # lists what a full run may contain has to name it, or an owner reads a KNOWN-FAIL run as ineligible.
+        blocked = all_pass()
+        blocked[5] = hwsuite.verdict("HW-06", "BLOCKED", "x")
+        with self.assertRaises(hwsuite.EnvError) as caught:
+            hwsuite.mark_verified(self.path, self.result(blocked), "r", "c")
+        self.assertIn("KNOWN-FAIL", str(caught.exception))
+        declared = all_pass()
+        declared[34] = hwsuite.verdict("HW-35", "KNOWN-FAIL", "known-failing (owner, 2026-10-28): r")
+        self.assertTrue(hwsuite.summarize(declared, "full")["verified_eligible"])  # and it really does not block
 
 
 class ProcessTests(unittest.TestCase):

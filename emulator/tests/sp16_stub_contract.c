@@ -38,6 +38,14 @@ int main(void) {
     message.bytes=129;
     assert(ioctl(panel,0x40107000,&message)==-1 && errno==EINVAL);
     assert(ioctl(panel,0xdeadbeef,&bytes)==-1 && errno==ENOTTY);
+    int backlight=open("/dev/backlight",O_RDWR);
+    assert(backlight>=0);
+    uint32_t level=0;
+    assert(ioctl(backlight,0x40047000,&level)==0);
+    level=255;
+    assert(ioctl(backlight,0x40047000,&level)==0);
+    assert(ioctl(backlight,0x40047000,NULL)==-1 && errno==EFAULT);
+    assert(close(backlight)==0);
     int media=open("/proc/udev_usb1",O_RDONLY);
     assert(media>=0); event=(struct epoll_event){.events=EPOLLIN,.data.fd=media};
     assert(epoll_ctl(ep,EPOLL_CTL_ADD,media,&event)==0 && epoll_wait(ep,&event,1,0)==0);

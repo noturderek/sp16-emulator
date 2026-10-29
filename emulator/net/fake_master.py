@@ -22,10 +22,39 @@ import time
 
 MAGIC = b"Qspt1WmJOL"
 PORT_KEEPALIVE, PORT_BEAT, PORT_STATUS = 50000, 50001, 50002
+NAME_LENGTH = 20
+NAME_OFFSET_KEEPALIVE, NAME_OFFSET = 0x0c, 0x0b
 
 
 def name_field(name):
-    return name.encode("ascii")[:20].ljust(20, b"\0")
+    return name.encode("ascii")[:NAME_LENGTH].ljust(NAME_LENGTH, b"\0")
+
+
+def name_offset(payload, port=None):
+    """Where the 20-byte device name starts in a Pro DJ Link payload (the magic is 10 bytes, the type byte 0x0a).
+
+    Port-50000 packets (the 54-byte keep-alive, the join stages and the other 50000 types) carry one reserved zero
+    byte at 0x0b, so their name starts at 0x0c; the port-50001/50002 packets (beat 0x28, status 0x0a) put the name
+    at 0x0b. A payload whose port is not one of the three is placed by shape: a 54-byte type-0x06 keep-alive has the
+    50000 layout, anything else the 0x0b one.
+    """
+    if len(payload) < NAME_OFFSET:
+        raise ValueError(f"a Pro DJ Link payload carries a type byte at {NAME_OFFSET:#04x}, not {len(payload)} bytes")
+    if port == PORT_KEEPALIVE:
+        return NAME_OFFSET_KEEPALIVE
+    if port in (PORT_BEAT, PORT_STATUS):
+        return NAME_OFFSET
+    if len(payload) == 54 and payload[0x0a] == 0x06:
+        return NAME_OFFSET_KEEPALIVE
+    return NAME_OFFSET
+
+
+def packet_name(payload, port=None):
+    """The device name of a Pro DJ Link payload, read at its packet family's offset (see name_offset)."""
+    offset = name_offset(payload, port)
+    if len(payload) < offset + NAME_LENGTH:
+        raise ValueError(f"a {len(payload)}-byte payload has no {NAME_LENGTH}-byte name at {offset:#04x}")
+    return payload[offset:offset + NAME_LENGTH].split(b"\0")[0].decode("ascii", "replace")
 
 
 def keepalive(name, player, mac, ip):
@@ -46,12 +75,16 @@ def beat_packet(name, player, bpm, pitch, beat_in_bar, next_beat_ms):
     packet = bytearray(MAGIC + b"\x28" + name_field(name) + struct.pack(">HBBB", 256, player, 0, 0x3c))
     packet += struct.pack(">6I", *(int(round(d)) for d in distances)) + bytes(24)
     packet += struct.pack(">IHHBHB", int(round((1 + pitch) * 0x100000)), 0, int(round(bpm * 100)), beat_in_bar, 0, player)
+    # The trailing 12 bytes end 0x5d=0x00, 0x5e=0x00, 0x5f=player: the redundant device number the follower's beat
+    # handler reads at byte 0x5f and requires to be 1-4 and equal to the followed master.
     return bytes(packet)
 
 
-def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=True, counter=0):
-    """Player status (type 0x0a, 212 bytes) with the fields a follower needs: playing, master and sync flags, pitch,
-    BPM, beat counter and beat in bar (offsets from the public protocol write-up; see the header of this file)."""
+def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=True, counter=0, *, master=True):
+    """Player status (type 0x0a, 212 bytes) with the fields a follower needs: the P3 play state (0x9d, 0x0d while
+    playing so the follower's (P3 & 1) || (P3 & 8) gate passes), the master-meaningful and Mv multiplier bytes,
+    playing/master/sync flags, pitch, BPM, beat counter and beat in bar (offsets from the public protocol write-up;
+    see the header of this file)."""
     packet = bytearray(212)
     packet[0:10] = MAGIC
     packet[0x0a] = 0x0a
@@ -62,11 +95,13 @@ def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=Tru
     packet[0x27] = 1 if playing else 0
     packet[0x28] = player                                  # loaded player: own number
     packet[0x7b] = 3 if playing else 5                     # play state: playing / stopped
-    packet[0x89] = 0x84 | (0x40 if playing else 0) | 0x20 | 0x10 | 0x08   # play, master, sync, on-air
+    packet[0x89] = 0x84 | (0x40 if playing else 0) | (0x20 if master else 0) | 0x10 | 0x08   # play, master, sync, on-air
     struct.pack_into(">I", packet, 0x8c, int(round((1 + pitch) * 0x100000)))
-    packet[0x90] = 0
+    struct.pack_into(">H", packet, 0x90, 0x8000)          # Mv: rekordbox-track BPM multiplier (not the 0xffff sentinel)
     struct.pack_into(">H", packet, 0x92, int(round(bpm * 100)))
     struct.pack_into(">I", packet, 0x98, int(round((1 + pitch) * 0x100000)))
+    packet[0x9d] = 0x0d if playing else 0x00              # P3: playing forward (CDJ) / no track loaded
+    packet[0x9e] = 0x01                                   # Mm: master meaningful
     packet[0x9f] = 0xff                                    # no master hand-off pending
     struct.pack_into(">I", packet, 0xa0, beat_count)
     packet[0xa6] = beat_in_bar
@@ -159,7 +194,8 @@ def main():
             send(PORT_KEEPALIVE, keepalive(args.name, args.player, mac, ip_bytes))
             next_keepalive += 1.5
         if now >= next_status:
-            send(PORT_STATUS, status_packet(args.name, args.player, state["bpm"], pitch, beat_in_bar, beat_count, True, status_count))
+            send(PORT_STATUS, status_packet(args.name, args.player, state["bpm"], pitch, beat_in_bar, beat_count,
+                                            playing=True, counter=status_count, master=True))
             status_count += 1
             next_status += 0.2
         if now >= next_beat:

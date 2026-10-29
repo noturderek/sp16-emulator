@@ -21,6 +21,8 @@ mount -t sysfs sysfs /sys
 mount -t tmpfs -o mode=700 tmpfs /tmp
 ip link set lo up
 modprobe virtio_mmio || :
+# The USB stick sits on a PCIe root port as virtio-blk-pci so it can be hot-swapped (virtio-mmio cannot hot-plug).
+modprobe virtio_pci || :
 modprobe virtio_console
 # Name the virtio ports by their QEMU names: with a block device present the serial controller is no longer
 # virtio0, so /dev/vport0p1 (hard-coded in the bridge) must be a link to whichever node is "sp16.ui".
@@ -34,7 +36,19 @@ for sp16_port in /sys/class/virtio-ports/*; do
    sp16.ui) [ -e /dev/vport0p1 ] || ln -s "/dev/${sp16_port##*/}" /dev/vport0p1 ;;
    sp16.ctl) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-ctl ;;
    sp16.pcm) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-pcm ;;
+   sp16.din) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-din ;;
+   sp16.usb-midi) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-usb-midi ;;
    sp16.gdb) ln -sf "/dev/${sp16_port##*/}" /dev/sp16-gdb ;;
+  esac
+done
+# Network mode and optional static address (`./sp16 run --net MODE [--net-ip ADDR]`) travel in the kernel command
+# line, the only host -> guest-init channel. The mode tells a bridged run (real LAN subnet) from host/mcast.
+sp16_net_mode=
+sp16_net_ip=
+for sp16_token in $(cat /proc/cmdline); do
+  case "$sp16_token" in
+   sp16.net=*) sp16_net_mode=${sp16_token#sp16.net=} ;;
+   sp16.netip=*) sp16_net_ip=${sp16_token#sp16.netip=} ;;
   esac
 done
 # Network (./sp16 run --net): QEMU adds a virtio-net device only then. The app's Pro DJ Link sockets live on eth0, so bring
@@ -53,12 +67,28 @@ if [ -n "$sp16_have_nic" ]; then
     ip link set eth0 up
     # The unit's rc.local gives eth0 an address before the app starts (ifconfig from fw_printenv ipaddr); the app crashes
     # (SIGSEGV) on an eth0 that has none. So: a link-local address from the MAC, 169.254.A.B with A and B from its last
-    # two bytes and kept off .0 and .255. The MAC is random per start (net/qemu-net.sh), so instances differ.
+    # two bytes and kept off .0 and .255. The MAC is random per start (net/qemu-net.sh), so instances differ. This alias
+    # stays even on a bridged run: Pro DJ Link peers self-assign 169.254, and the unit's own Pro DJ Link socket lives there.
     sp16_mac=$(cat /sys/class/net/eth0/address)
     sp16_b5=$(echo "$sp16_mac" | cut -d: -f5); sp16_b6=$(echo "$sp16_mac" | cut -d: -f6)
     sp16_ip="169.254.$((0x$sp16_b5 % 254 + 1)).$((0x$sp16_b6 % 254 + 1))"
     ip addr add "$sp16_ip/16" broadcast 169.254.255.255 dev eth0
-    echo "SP16_NET eth0 $sp16_mac $sp16_ip"
+    # Bridged mode: the guest sits on the real LAN, so besides the link-local alias it needs a reachable address on the
+    # interface's subnet. --net-ip gives it directly (native.py validates and normalises it to a.b.c.d/prefix); without
+    # one, DHCP is tried when a client is present (the base guest ships none yet, so the run stays on the alias).
+    case "$sp16_net_mode" in
+     bridged:*)
+      if [ -n "$sp16_net_ip" ]; then
+        ip addr add "$sp16_net_ip" dev eth0 || echo "SP16_NET bad --net-ip $sp16_net_ip"
+        echo "SP16_NET eth0 $sp16_mac $sp16_ip + $sp16_net_ip (bridged $sp16_net_mode)"
+      elif command -v udhcpc >/dev/null 2>&1; then
+        udhcpc -i eth0 -q || :
+        echo "SP16_NET eth0 $sp16_mac $sp16_ip (bridged $sp16_net_mode, DHCP)"
+      else
+        echo "SP16_NET eth0 $sp16_mac $sp16_ip (bridged $sp16_net_mode, no DHCP client; add --net-ip for a real-subnet address)"
+      fi ;;
+     *) echo "SP16_NET eth0 $sp16_mac $sp16_ip" ;;
+    esac
   else
     sp16_have_nic=
     echo "SP16_NET no eth0 (virtio_net module missing from this guest image? rebuild with the current Dockerfile)"
@@ -133,6 +163,42 @@ if [ "$sp16_devlayer" = 1 ]; then
 fi
 : > /tmp/sp16-root/dev/null
 : > /tmp/sp16-root/dev/full
+# g_midi appears only while the app has the USB gadget in MIDI mode: the shim creates this marker when the app runs
+# usb_gadget.sh midi probe and removes it for mass storage. Nothing creates it at boot, so the sequencer inventory is
+# what the firmware asked for rather than an endpoint that is not there yet.
+# Publish the DIN sequencer client before the app probes its ALSA endpoints. The proc node is opened through
+# the preload shim, which reports the bridge's current queue capacity.
+if modprobe snd_seq; then
+  mkdir -p /tmp/sp16-root/dev/snd /tmp/sp16-root/proc/asound/snddinmidi
+  : > /tmp/sp16-root/proc/asound/snddinmidi/midi0
+  python3 - <<'PYDEV'
+import glob, os, stat
+for source in glob.glob('/dev/snd/*'):
+    mode = os.stat(source).st_mode
+    if stat.S_ISCHR(mode):
+        os.mknod('/tmp/sp16-root/dev/snd/' + os.path.basename(source), 0o600 | stat.S_IFCHR, os.stat(source).st_rdev)
+PYDEV
+  /opt/sp16/din-seq-bridge > /dev/console 2>&1 &
+  sp16_din_ready=0
+  for sp16_din_try in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -S /tmp/sp16-root/dev/sp16-din-control ] && [ -S /tmp/sp16-root/dev/sp16-seq-proxy ]; then sp16_din_ready=1; break; fi
+    sleep .1
+  done
+  if [ "$sp16_din_ready" = 1 ]; then
+    echo 'SP16_DIN sequencer=started' > /dev/console
+  else
+    echo 'SP16_DIN proxy=missing' > /dev/console
+    echo 'SP16_DIN sequencer=missing' > /dev/console
+  fi
+else
+  echo 'SP16_DIN sequencer=missing' > /dev/console
+fi
+# The normal ALSA snddinmidi card is shimmed over this full-duplex UART port; the factory-test nodes stay separate.
+if [ -e /dev/sp16-din ]; then
+  python3 -c 'import os, stat; os.mknod("/tmp/sp16-root/dev/sp16-din", 0o600 | stat.S_IFCHR, os.stat("/dev/sp16-din").st_rdev)'
+else
+  echo 'SP16_DIN port=missing' > /dev/console
+fi
 # Audio transport (native.py build --audio file): give the chroot the sp16.pcm port as a character node so the
 # stub's forwarder thread can stream the OEM's playback frames to the host file sink. Off unless asked for.
 sp16_audio_env=
@@ -145,7 +211,7 @@ case " $(cat /proc/cmdline) " in
     echo 'SP16_AUDIO port=missing' > /dev/console
   fi ;;
 esac
-printf 'pcm.null { type null }\n' > /tmp/sp16-root/etc/sp16-alsa.conf
+printf 'pcm.null { type null }\nseq.default { type hw }\n' > /tmp/sp16-root/etc/sp16-alsa.conf
 # Persistent eMMC (fullpanel builds only: native.py adds sp16.data=1 with a virtio block device). This is our
 # trusted init, not the OEM: it formats the card once (only when it has no filesystem), repairs an unclean shutdown
 # with fsck.vfat -a, and mounts it at the chroot's /mnt/emmc before the app starts. The OEM's own mkfs/mount stay
@@ -228,6 +294,15 @@ if [ -n "$sp16_app_arg" ]; then
   sp16_midi_env="-E SP16_MIDI_LOOPBACK=1"
   # A real eth0 (--net) is answered by the kernel; the fake one is only for runs without a NIC.
   [ -n "$sp16_have_nic" ] || sp16_midi_env="$sp16_midi_env -E SP16_FAKE_ETH0=1"
+fi
+# Only a configured virtio NIC gets synthetic carrier and real ARP traffic.
+sp16_net_env=
+if [ -n "$sp16_have_nic" ]; then
+  sp16_net_env="-E SP16_NET_GLINK=1 -E SP16_NET_ARP=1"
+  # The GDB trace build is research-only; keep socket diagnostics off in ordinary sessions.
+  case " $(cat /proc/cmdline) " in
+    *" sp16.trace=gdb "*) sp16_net_env="$sp16_net_env -E SP16_NET_DIAG=1" ;;
+  esac
 fi
 # Research builds only (native.py --research --trace): opt-in QEMU user-mode tracing, default off.
 sp16_trace_args=
@@ -581,7 +656,7 @@ fi
     SP16_APP_CWD=$sp16_app_cwd python3 /opt/sp16/enter.py /tmp/sp16-root /qemu-arm-static $sp16_trace_args -cpu $sp16_cpu \
      -E DISPLAY=127.0.0.1:99 -E LD_LIBRARY_PATH=$sp16_ldpath \
      -E LD_PRELOAD=$sp16_preload -E ALSA_CONFIG_PATH=/etc/sp16-alsa.conf \
-     -E SP16_PANEL_INPUT=1 $sp16_tap_env $sp16_audio_env $sp16_midi_env \
+     -E SP16_PANEL_INPUT=1 -E SP16_USB_OC_PATH=/dev/sp16-usb-oc $sp16_tap_env $sp16_audio_env $sp16_midi_env $sp16_net_env \
      $sp16_app_path $sp16_app_arg >> /output/application.txt 2>&1 &
     echo $! > /run/sp16-app.pid
     echo "SP16_APP_STARTED pid=$!" > /dev/console

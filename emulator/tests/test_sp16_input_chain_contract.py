@@ -18,7 +18,7 @@ import analog_laws  # noqa: E402
 import service_stimulus  # noqa: E402
 import arm_contract  # noqa: E402
 
-LEVELS = ("[sp16-ui-stub] analog levels limiter=1 in_peak=0.9770 in_dbu=15.8 out_peak=0.2500 out_dbu=4.0 limited=412 "
+LEVELS = ("[sp16-ui-stub] analog levels limiter=1 in_peak=0.9770 in_dbu_peak=15.8 out_peak=0.2500 out_dbu_peak=4.0 limited=412 "
           "main_out_gain=0.2500 input_gain=1.0000 source=tone")
 
 
@@ -35,7 +35,7 @@ class InputChainTests(unittest.TestCase):
         key, value = load_board_line()(LEVELS)
         self.assertEqual(key, "analog_levels")
         self.assertIs(value["limiter_active"], True)
-        self.assertEqual((value["in_dbu"], value["out_dbu"], value["limited_samples"], value["source"]), (15.8, 4.0, 412, "tone"))
+        self.assertEqual((value["in_dbu_peak"], value["out_dbu_peak"], value["limited_samples"], value["source"]), (15.8, 4.0, 412, "tone"))
         self.assertIs(load_board_line()(LEVELS.replace("limiter=1", "limiter=0"))[1]["limiter_active"], False)
         self.assertIsNone(load_board_line()("[sp16-ui-stub] analog levels garbage"))
 
@@ -84,12 +84,12 @@ class InputChainTests(unittest.TestCase):
             service_stimulus.main(["--dry-run"])
         printed = out.getvalue()
         self.assertIn("after INPUT LEVEL", printed)
-        self.assertIn("in_dbu near +4.3", printed)
+        self.assertIn("in_dbu_peak near +4.3", printed)
         self.assertNotIn("before INPUT LEVEL", printed)
 
     @unittest.skipUnless(arm_contract.docker_works(), "docker not available")
     def test_shim_meters_the_service_stimulus_where_the_preset_says(self):
-        """The shim's own in_dbu for the preset's tone and INPUT LEVEL matches what service_stimulus.py tells the user."""
+        """The shim's own in_dbu_peak for the preset's tone and INPUT LEVEL matches what service_stimulus.py tells the user."""
         with arm_contract.ArmContract() as arm:
             try:
                 out = arm.run("sp16_input_chain_contract", [
@@ -98,7 +98,7 @@ class InputChainTests(unittest.TestCase):
             except subprocess.CalledProcessError as exc:
                 self.fail((exc.stdout or "")[-1500:] + (exc.stderr or "")[-1500:])
             self.assertIn("PASS-service", out)
-            readings = [float(m) for m in re.findall(r"analog levels limiter=0 in_peak=[0-9.]+ in_dbu=(-?[0-9.]+) .*source=tone", out)]
+            readings = [float(m) for m in re.findall(r"analog levels limiter=0 in_peak=[0-9.]+ in_dbu_peak=(-?[0-9.]+) .*source=tone", out)]
             self.assertTrue(readings, out[-1500:])
             self.assertAlmostEqual(max(readings), service_stimulus.expected_in_dbu(-10.0), delta=0.2)
 

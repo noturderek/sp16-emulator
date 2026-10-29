@@ -49,12 +49,140 @@ var uiInputDisabled = false
 /// `--no-audio-files`: an audio build's sink still reads every PCM packet from the guest and keeps its counters (the
 /// guest's audio path and timing stay those of a file build) but opens no WAV. For unattended runs that read no audio.
 var audioFilesDisabled = false
+/// True when this launch attached a virtual USB stick (`--usb-image`): the QMP socket and the hot-plug path exist.
+var usbImageAttached = false
+/// The backing image of the currently attached virtual USB stick, so a failed hot-swap can re-attach it. Set at launch
+/// and updated on every successful swap.
+var currentUSBImagePath: String?
 
 /// Host <-> guest message kinds; see protocol.py for the authoritative description.
 enum Kind {
     static let frame: UInt8 = 1, touch: UInt8 = 2, ack: UInt8 = 3, control: UInt8 = 6
     static let inputResult: UInt8 = 7, feedback: UInt8 = 8, research: UInt8 = 9
-    static let txFrame: UInt8 = 10, stats: UInt8 = 11
+    static let txFrame: UInt8 = 10, stats: UInt8 = 11, standby: UInt8 = 12
+}
+
+/// Host power state machine (QRT1001 p15): BOOT (boot overlay) → RUN at the first LCD frame. Standby (OFF: dark panel,
+/// WAKE UP lit) and the power fault (dark panel, WAKE UP blinking red) are two independent overlays held as separate
+/// flags (`standby` and `faultActive` below) and combined when the panel is drawn, so any order of standby/wake and
+/// fault on/off ends in the same drawn state.
+enum PowerState { case boot, run }
+
+/// Minimal synchronous QMP (QEMU Machine Protocol) client over a unix socket, used only to hot-swap the virtual USB
+/// stick's backing image while QEMU runs. One connection per swap; QMP messages are newline-delimited JSON, and a
+/// command's reply is the first `return` or `error` object (events are skipped).
+enum QMP {
+    static func connect(_ socketPath: String) throws -> Int32 {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw DataImageError.io("cannot open the QMP socket") }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(socketPath.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
+            close(fd); throw DataImageError.io("QMP socket path too long")
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { raw in for (i, b) in bytes.enumerated() { raw[i] = b } }
+        let rc = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        guard rc == 0 else { close(fd); throw DataImageError.io("cannot connect to the QMP socket (errno \(errno))") }
+        return fd
+    }
+
+    /// One newline-delimited JSON message, or nil on EOF.
+    static func readLine(_ fd: Int32) -> String? {
+        var buffer = Data()
+        var byte = [UInt8](repeating: 0, count: 1)
+        while buffer.count < 1 << 20 {
+            let n = read(fd, &byte, 1)
+            if n <= 0 { return nil }
+            if byte[0] == 10 { return String(decoding: buffer, as: UTF8.self) }
+            buffer.append(byte[0])
+        }
+        return nil
+    }
+
+    static func object(_ line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj
+    }
+
+    /// Send one command and return its `return`/`error` reply; throws on a QMP error.
+    @discardableResult
+    static func command(_ fd: Int32, _ execute: String, _ arguments: [String: Any]) throws -> [String: Any] {
+        var payload: [String: Any] = ["execute": execute]
+        if !arguments.isEmpty { payload["arguments"] = arguments }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            throw DataImageError.io("cannot encode QMP command \(execute)")
+        }
+        var line = data; line.append(10)
+        let written = line.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
+        guard written == line.count else { throw DataImageError.io("QMP write failed for \(execute)") }
+        while true {
+            guard let text = readLine(fd) else { throw DataImageError.io("QMP closed during \(execute)") }
+            guard let obj = object(text) else { continue }
+            if let error = obj["error"] as? [String: Any] {
+                let desc = (error["desc"] as? String) ?? "unknown error"
+                throw DataImageError.io("\(execute): \(desc)")
+            }
+            if obj["return"] != nil { return obj }
+        }
+    }
+
+    /// Wait for the `DEVICE_DELETED` event for `id` (a `device_del` only frees its block nodes once the guest acks).
+    static func waitDeviceDeleted(_ fd: Int32, id: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let remaining = Int32(max(1, deadline.timeIntervalSinceNow * 1000))
+            guard poll(&poller, 1, remaining) > 0 else { return false }
+            guard let text = readLine(fd), let obj = object(text) else { continue }
+            if obj["event"] as? String == "DEVICE_DELETED",
+               let data = obj["data"] as? [String: Any], data["device"] as? String == id { return true }
+        }
+        return false
+    }
+
+    /// Add the file/raw block nodes for `imagePath` and plug the virtio-blk device back onto its root port.
+    static func addUSB(_ fd: Int32, imagePath: String) throws {
+        try command(fd, "blockdev-add", ["driver": "file", "filename": imagePath, "node-name": "sp16usb-file"])
+        try command(fd, "blockdev-add", ["driver": "raw", "file": "sp16usb-file", "node-name": "sp16usb"])
+        try command(fd, "device_add", ["driver": "virtio-blk-pci", "drive": "sp16usb", "serial": "sp16usb",
+                                       "id": "sp16usb-dev", "bus": "sp16usb-port"])
+    }
+
+    /// Swap the virtual USB stick's backing image for `imagePath` in one QMP session: unplug the device (waiting for
+    /// the guest's acknowledgement), drop the old block nodes, add the new file and format nodes, plug the new device.
+    static func swapUSB(socketPath: String, imagePath: String) throws {
+        let fd = try connect(socketPath)
+        defer { close(fd) }
+        _ = readLine(fd)                       // the QMP greeting
+        try command(fd, "qmp_capabilities", [:])
+        try command(fd, "device_del", ["id": "sp16usb-dev"])
+        guard waitDeviceDeleted(fd, id: "sp16usb-dev", timeout: 10) else {
+            throw DataImageError.io("the USB device did not unplug in time")
+        }
+        try command(fd, "blockdev-del", ["node-name": "sp16usb"])
+        try command(fd, "blockdev-del", ["node-name": "sp16usb-file"])
+        try addUSB(fd, imagePath: imagePath)
+    }
+
+    /// Re-attach the previous stick after a failed swap. The failed swap left the device and block nodes in some
+    /// unknown part-removed state, so remove whatever remains (a missing device or node is not an error) and then add
+    /// the old image back. Throws when even the restore fails, which hotAttachUSB reports as a retryable state.
+    static func restoreUSB(socketPath: String, imagePath: String) throws {
+        let fd = try connect(socketPath)
+        defer { close(fd) }
+        _ = readLine(fd)
+        try command(fd, "qmp_capabilities", [:])
+        if (try? command(fd, "device_del", ["id": "sp16usb-dev"])) != nil {
+            _ = waitDeviceDeleted(fd, id: "sp16usb-dev", timeout: 5)
+        }
+        _ = try? command(fd, "blockdev-del", ["node-name": "sp16usb"])
+        _ = try? command(fd, "blockdev-del", ["node-name": "sp16usb-file"])
+        try addUSB(fd, imagePath: imagePath)
+    }
 }
 
 /// Fixed-size sample window for latency percentiles.
@@ -81,6 +209,16 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     var window: NSWindow!
     var socketFD: Int32 = -1
     var stopping = false
+    /// True once `applicationShouldTerminate` has started teardown: a second quit request (a second SIGTERM, Cmd-Q)
+    /// must not spawn a second teardown thread or wedge the reply. Read and written under `lock`.
+    var terminating = false
+    /// The power/boot state machine, driven on the main thread from the TX standby flag and the first LCD frame.
+    var powerState: PowerState = .boot
+    /// The standby overlay: the firmware's TX standby flag (byte 0x67 bit 0) latched. Independent of `faultActive`;
+    /// the panel combines the two (`panelDark` = standby, `fault` = faultActive) when it draws.
+    var standby = false
+    /// The forced power-fault overlay (QRT1001 p24). Independent of `standby`.
+    var faultActive = false
     var pendingFrame: Data?
     var drawing = false
     var lastPixels: Data?
@@ -100,7 +238,17 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     var log: FileHandle?
     var stderrCapture: StderrCapture?
     var audioSink: AudioSink?
+    /// Held for the life of the app: App Nap must not throttle a build without an audio sink (audio builds already
+    /// take their own assertions). User-initiated tier, but idle system sleep stays allowed for a silent app.
+    var panelActivity: NSObjectProtocol?
+    /// The research TX log (`tx-frames.jsonl`): only the timestamp and a copy of the raw frame are taken on the bridge
+    /// reader thread; every hex conversion and the line write happen on this serial queue, so a slow disk cannot stall
+    /// panel-frame reception (pt-i44.78). Only this queue touches `txLog`; `started` and `config` are immutable, so the
+    /// timestamp needs no lock.
+    let txLogQueue = DispatchQueue(label: "sp16.native.txlog")
     var txLog: FileHandle?
+    /// Hex digits for the TX log: 128 bytes become 256 characters without 128 `String(format:)` calls.
+    static let hexDigits: [UInt8] = Array("0123456789abcdef".utf8)
     var lastCapture = 0.0
     let started = ProcessInfo.processInfo.systemUptime
 
@@ -121,6 +269,11 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // App Nap otherwise delays every thread of a background or occluded app by tens to hundreds of milliseconds,
+        // stalling the panel frame transport (docs/changes/l2-audio-timing.md section 6). Audio builds hold their own
+        // assertions in AudioSink/AudioOutput; this one covers builds without a sink, for the life of the app.
+        panelActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
+                                                              reason: "SP-16 panel transport")
         NSApp.setActivationPolicy(.regular)
         installMenus()
         loadSkinOverlay()
@@ -185,6 +338,14 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             if mode == "coreaudio" || mode == "both" {
                 output = AudioOutput(deviceUID: device, offline: device.flatMap { OfflineSpec($0) })
                 output?.start()
+                // Power-on mute: the firmware holds xMUTE for about 19.5 s after power-on (QRT1001 p15), so the host
+                // output stays silent through the boot-time codec noise instead of playing it.
+                output?.muted = true
+                let out = output
+                DispatchQueue.global().asyncAfter(deadline: .now() + 19.5) {
+                    out?.muted = false
+                    AppLog.log("audio: power-on mute released")
+                }
             }
             let sink = AudioSink(socketPath: config.socket + ".pcm", directory: config.session,
                                  writeFiles: (mode == "file" || mode == "both") && !audioFilesDisabled, output: output,
@@ -273,16 +434,106 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         glow.target = self
         viewMenu.addItem(glow)
         viewItem.submenu = viewMenu
+        let outputItem = NSMenuItem(); menu.addItem(outputItem)
+        let outputMenu = NSMenu(title: "Output")
+        for jack in [AudioSink.OutputJack.main, .phones, .out34, .out56, .out78] {
+            let item = NSMenuItem(title: jack.rawValue, action: #selector(monitorChosen(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = jack.rawValue
+            outputMenu.addItem(item)
+        }
+        outputItem.submenu = outputMenu
+        let usbItem = NSMenuItem(); menu.addItem(usbItem)
+        let usbMenu = NSMenu(title: "USB")
+        let attachImage = NSMenuItem(title: "Attach USB Image…", action: #selector(attachUSBImageChosen(_:)), keyEquivalent: "")
+        attachImage.target = self
+        usbMenu.addItem(attachImage)
+        let eject = NSMenuItem(title: "Eject USB Stick", action: #selector(ejectUSBChosen(_:)), keyEquivalent: "")
+        eject.target = self
+        usbMenu.addItem(eject)
+        usbItem.submenu = usbMenu
         let inputItem = NSMenuItem(); menu.addItem(inputItem)
         let inputMenu = NSMenu(title: "Input")
         let release = NSMenuItem(title: "Release All Holds", action: #selector(releaseAllHolds), keyEquivalent: ".")
         release.target = self
         inputMenu.addItem(release)
         inputItem.submenu = inputMenu
+        let midiItem = NSMenuItem(); menu.addItem(midiItem)
+        let midiMenu = NSMenu(title: "MIDI")
+        let routing = NSMenuItem(title: "Routing…", action: #selector(showMidiRouting), keyEquivalent: "")
+        routing.target = self
+        midiMenu.addItem(routing)
+        midiItem.submenu = midiMenu
         NSApp.mainMenu = menu
     }
 
     @objc func releaseAllHolds() { panel.releaseAll() }
+
+    // MARK: MIDI routing
+
+    private var midiRouting: MidiRoutingPreferences?
+
+    /// The MIDI routing preferences window (one live window; the notify proc reaches it through the window's own
+    /// active reference).
+    @objc func showMidiRouting() {
+        if midiRouting == nil { midiRouting = MidiRoutingPreferences() }
+        midiRouting?.showWindow(nil)
+        midiRouting?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: Output monitor
+
+    /// Choose which output jack pair the CoreAudio output plays (MAIN by default). The WAV files never change.
+    @objc func monitorChosen(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String, let jack = AudioSink.OutputJack(rawValue: name) else { return }
+        audioSink?.monitor = jack
+        AppLog.log("output monitor: \(jack.rawValue)")
+    }
+
+    // MARK: USB stick
+
+    /// Pick a raw image and hot-attach it while QEMU runs (the QMP path swaps the virtio-blk backing).
+    @objc func attachUSBImageChosen(_ sender: NSMenuItem) {
+        let chooser = NSOpenPanel()
+        chooser.message = "Choose a raw USB stick image to hot-attach"
+        chooser.canChooseFiles = true
+        chooser.canChooseDirectories = false
+        chooser.allowsMultipleSelection = false
+        guard chooser.runModal() == .OK, let url = chooser.url else { return }
+        let path = url.path
+        panel.setStatus("Attaching \(path)…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let reply = self.hotAttachUSB(path: path)
+            DispatchQueue.main.async { self.noteUSBReply(reply) }
+        }
+    }
+
+    @objc func ejectUSBChosen(_ sender: NSMenuItem) {
+        guard config.data != nil, usbImageAttached else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let result = DataImage.requestControl(socketPath: self.config.socket + ".ctl", message: "usb-eject",
+                                                  until: ["usb-ejected", "usb-busy"], timeout: 30)
+            let reply = result == "usb-ejected"
+                ? "{\"ok\":true,\"result\":\"usb-ejected\"}"
+                : "{\"error\":\"usb-eject: " + (result ?? "no reply") + "\"}"
+            DispatchQueue.main.async { self.noteUSBReply(reply) }
+        }
+    }
+
+    /// Show a hot-attach/eject reply: the status line on success, an alert on failure. Main thread only.
+    func noteUSBReply(_ reply: String) {
+        guard let data = reply.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let error = obj["error"] as? String {
+            let alert = NSAlert()
+            alert.messageText = "USB"
+            alert.informativeText = error
+            alert.runModal()
+        } else if let result = obj["result"] as? String {
+            panel.setStatus("USB: \(result)")
+        }
+    }
 
     // MARK: Power on with keys held
 
@@ -395,6 +646,11 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         case #selector(toggleSkin(_:)):
             item.state = panel.showSkin ? .on : .off
             return panel.hasSkin     // greyed out when private/skin/overlay.png is absent
+        case #selector(monitorChosen(_:)):
+            item.state = (audioSink?.monitor.rawValue == item.representedObject as? String) ? .on : .off
+            return audioSink != nil
+        case #selector(attachUSBImageChosen(_:)), #selector(ejectUSBChosen(_:)):
+            return config.data != nil && usbImageAttached
         default: break
         }
         return true
@@ -531,25 +787,172 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 self.panel.setFeedback(generation: generation, live: live, lamps: lamps)
             }
         case Kind.txFrame:
+            // Cheap by design: this hands the queue a copy of the raw bytes; no hex conversion happens on this thread.
             writeTxLog(body.dropFirst())
+            if let standby = txStandbyFlag(body) {
+                DispatchQueue.main.async { [weak self] in self?.applyStandby(standby) }
+            }
+        case Kind.standby:
+            // The guest forwards the TX standby flag on its own always-on message, so an ordinary (non-research) launch
+            // reaches here too; applyStandby ignores the start-up frames' flag until the home screen has settled.
+            guard size == 2, let flag = body.last, flag <= 1 else {
+                throw NSError(domain: "Invalid standby flag", code: 8)
+            }
+            DispatchQueue.main.async { [weak self] in self?.applyStandby(flag == 1) }
         case Kind.stats:
             if let object = try? JSONSerialization.jsonObject(with: body.dropFirst()) as? [String: Any] {
                 lock.lock(); guestStats = object; lock.unlock()
+                if let board = object["board"] as? [String: Any], let level = board["backlight"] as? Int,
+                   (0...255).contains(level) {
+                    DispatchQueue.main.async { [weak self] in self?.panel.lcdBacklight = CGFloat(level) / 255 }
+                }
             }
         default: throw NSError(domain: "Unknown native message", code: 4)
         }
     }
 
+    /// The TX standby flag (byte 0x67 bit 0 of the 128-byte OEM frame) from a txFrame message, or nil when the frame
+    /// is not complete. The payload after the kind byte is `multi, part, parts` then the frame; panel_map.py decode_tx
+    /// reads the same layout.
+    func txStandbyFlag(_ body: Data) -> Bool? {
+        let payload = body.dropFirst()                       // [multi, part, parts] + 128-byte frame
+        guard payload.count >= 3 + 128 else { return nil }
+        let frame = payload.startIndex + 3
+        guard payload[frame] == 2, payload[frame + 0x77] == 0xaa else { return nil }   // TX_HEADER, TX_MARKER
+        return payload[frame + 0x67] & 1 == 1
+    }
+
+    /// Drive the panel from the firmware's standby flag: latch the standby overlay on (dark, WAKE UP lit) and off.
+    /// Standby and the power fault are two independent overlays (`standby` / `faultActive`), and the panel derives the
+    /// drawn state from both, so a fault during standby and standby during a fault each survive the other. Main thread
+    /// only.
+    func applyStandby(_ standby: Bool) {
+        guard standby != self.standby else { return }
+        if standby && !screenSeen {
+            // The firmware sets the standby flag in its start-up frames too; ignore a true flag until the home screen
+            // has settled, so booting never latches the standby overlay. Wake (a false flag) is always applied.
+            return
+        }
+        self.standby = standby
+        if standby {
+            panel.releaseAll()
+            panel.setPanelDark(true)
+            screenSeen = false
+            AppLog.log("panel: standby — dark with WAKE UP lit")
+        } else {
+            powerState = .boot   // the next content frame re-arms RUN
+            panel.setPanelDark(false)
+            screenSeen = false
+            AppLog.log("panel: wake from standby")
+        }
+    }
+
+    /// Force or clear the power-fault display (QRT1001 p24). Main thread only; the firmware keeps running behind the
+    /// veil, so clearing only drops the fault overlay and returns to the state the panel was already in (standby still
+    /// dark, otherwise live). Independent of `standby`.
+    func setFault(_ on: Bool) {
+        guard on != faultActive else { return }
+        faultActive = on
+        if on {
+            panel.releaseAll()
+            panel.setFault(true)
+            AppLog.log("panel: fault — dark with WAKE UP blinking red")
+        } else {
+            panel.setFault(false)
+            AppLog.log("panel: fault cleared")
+        }
+    }
+
+    /// Hot-attach a different virtual USB stick image while QEMU runs: eject the current stick, swap the virtio-blk
+    /// backing via QMP, then ask the guest to mount and announce the new one. Runs on any thread; returns a JSON reply.
+    func hotAttachUSB(path: String) -> String {
+        guard usbImageAttached else {
+            return "{\"error\":\"this session has no virtual USB stick (launch with --usb-image)\"}"
+        }
+        do { try DataImage.validateUSBImage(path) }
+        catch { return "{\"error\":\"\(error)\"}" }
+        // Eject first so the guest unmounts and announces the removal (a raw device_del would leave a stale mount).
+        // Refuse the swap unless the guest confirmed the eject: a nil reply must not fall through to the QMP swap.
+        guard let ejectResult = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-eject",
+                                                         until: ["usb-ejected", "usb-busy"], timeout: 30) else {
+            return "{\"error\":\"usb eject got no reply from the guest; refusing to swap the stick\"}"
+        }
+        if ejectResult == "usb-busy" {
+            return "{\"error\":\"usb stick is busy; eject it first\"}"
+        }
+        let oldImage = currentUSBImagePath
+        do { try QMP.swapUSB(socketPath: config.socket + ".qmp", imagePath: path) }
+        catch {
+            // The swap can fail after device_del/blockdev-del, leaving the VM with no USB device. Re-add the old stick
+            // so the session is not left without one; if that too fails, report the retryable state honestly.
+            AppLog.log("usb hot attach: QMP swap failed: \(error)")
+            var message = "QMP swap failed: \(error)"
+            if let oldImage = oldImage {
+                do {
+                    try QMP.restoreUSB(socketPath: config.socket + ".qmp", imagePath: oldImage)
+                    AppLog.log("usb hot attach: re-attached the previous stick")
+                    message += "; re-attached the previous stick"
+                    // The eject made the guest unmount and unannounce the stick; the QMP restore only re-adds the
+                    // device, so ask the guest to mount and announce the restored stick again (a silent re-add
+                    // would leave it unmounted despite the "re-attached" report above).
+                    if let result = DataImage.requestControl(socketPath: config.socket + ".ctl",
+                                                             message: "usb-attach",
+                                                             until: ["usb-attached", "usb-error"], timeout: 30) {
+                        message += result == "usb-attached" ? "; the guest remounted the previous stick"
+                                                            : "; the guest could not remount the previous stick"
+                        AppLog.log("usb hot attach: restored stick usb-attach: \(result)")
+                    } else {
+                        message += "; the guest gave no reply to remounting the previous stick"
+                    }
+                } catch {
+                    AppLog.log("usb hot attach: could not re-attach the previous stick: \(error)")
+                    message += "; could not re-attach the previous stick either (retry ctl usb attach)"
+                }
+            }
+            return "{\"error\":\"\(message)\"}"
+        }
+        currentUSBImagePath = path
+        guard let result = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-attach",
+                                                    until: ["usb-attached", "usb-error"], timeout: 30) else {
+            return "{\"error\":\"usb attach got no reply from the guest\"}"
+        }
+        if result == "usb-attached" {
+            AppLog.log("usb hot attach: \(path) attached")
+            return "{\"ok\":true,\"result\":\"usb-attached\"}"
+        }
+        return "{\"error\":\"the guest could not mount \(path) (unsupported media?)\"}"
+    }
+
+    /// `bytes` as lowercase hex, built from the table above. Pure formatting: it runs on `txLogQueue`, never on the
+    /// bridge reader thread.
+    static func hexString(_ bytes: [UInt8]) -> String {
+        var out = [UInt8]()
+        out.reserveCapacity(bytes.count * 2)
+        for byte in bytes {
+            out.append(hexDigits[Int(byte >> 4)])
+            out.append(hexDigits[Int(byte & 0x0f)])
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    /// Append one panel frame to the research TX log. The caller is the bridge reader thread, which does only two
+    /// things: it takes the timestamp (before any lock and before the hop to `txLogQueue`, so `t` is when the frame
+    /// arrived rather than when the write finished) and it copies the raw bytes into a value the queue owns. All 128
+    /// hex conversions and the disk write happen on `txLogQueue`. One reader thread and one serial queue keep the lines
+    /// in arrival order.
     func writeTxLog(_ frame: Data) {
         guard config.research == true else { return }
-        lock.lock(); defer { lock.unlock() }
-        if txLog == nil {
-            let path = config.session + "/tx-frames.jsonl"
-            FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
-            txLog = try? FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        let stamp = ProcessInfo.processInfo.systemUptime - started
+        let bytes = [UInt8](frame)
+        txLogQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.txLog == nil {
+                let path = self.config.session + "/tx-frames.jsonl"
+                FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
+                self.txLog = try? FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            }
+            self.txLog?.write(Data("{\"t\":\(stamp),\"hex\":\"\(NativeApplication.hexString(bytes))\"}\n".utf8))
         }
-        let line = "{\"t\":\(ProcessInfo.processInfo.systemUptime - started),\"hex\":\"\(frame.map { String(format: "%02x", $0) }.joined())\"}\n"
-        txLog?.write(Data(line.utf8))
     }
 
     // MARK: Display
@@ -602,6 +1005,10 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                 return
             }
             screenSeen = true
+            if powerState == .boot {
+                powerState = .run
+                AppLog.log("panel: running (first LCD frame)")
+            }
         }
         panel.setLCD(image)
         frameCount += 1
@@ -818,6 +1225,18 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             var note = ""
             DispatchQueue.main.sync { note = self.powerOn(mode) }
             return "{\"ok\":true,\"note\":\"\(note)\"}"
+        case "fault":
+            // Power fault (QRT1001 p24): FAULT_DET low -> dark panel, WAKE UP blinking red; off restores.
+            guard let on = command["on"] as? Bool else { return "{\"error\":\"fault needs on true|false\"}" }
+            DispatchQueue.main.sync { self.setFault(on) }
+            return "{\"ok\":true}"
+        case "monitor":
+            // Which output jack pair the CoreAudio output plays; the WAV files never change.
+            guard let name = command["name"] as? String, let jack = AudioSink.OutputJack(rawValue: name) else {
+                return "{\"error\":\"monitor needs name MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8\"}"
+            }
+            audioSink?.monitor = jack
+            return "{\"ok\":true,\"monitor\":\"\(jack.rawValue)\"}"
         case "view":
             // View toggles for screenshots: rear on|off, glow on|off.
             guard let name = command["name"] as? String, ["rear", "glow", "skin"].contains(name),
@@ -832,13 +1251,20 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
         case "period":
             guard let ms = int("ms"), (1...50).contains(ms) else { return "{\"error\":\"period needs ms 1-50\"}" }
             sendBody([Kind.research, 5, UInt8(ms)]); return "{\"ok\":true}"
+        case "usb-oc":
+            guard let on = command["on"] as? Bool else { return "{\"error\":\"usb-oc needs on|off\"}" }
+            sendBody([Kind.research, 6, on ? 1 : 0]); return "{\"ok\":true}"
         case "snapshot":
             guard let name = command["name"] as? String, snapshot(named: name) else { return "{\"error\":\"snapshot failed\"}" }
             return "{\"ok\":true}"
         case "usb":
-            // Virtual USB stick: "eject" (flush, unmount, announce removal) or "attach" (remount and announce again).
+            // Virtual USB stick: "eject" (flush, unmount, announce removal), "attach" (remount and announce again), or
+            // "attach" with a path (hot-swap to a different image while QEMU runs).
             guard config.data != nil, let action = command["action"] as? String, ["eject", "attach"].contains(action) else {
                 return "{\"error\":\"usb needs action eject|attach and a persistent build\"}"
+            }
+            if action == "attach", let path = command["path"] as? String {
+                return hotAttachUSB(path: path)
             }
             let tokens = action == "eject" ? ["usb-ejected", "usb-busy"] : ["usb-attached", "usb-error"]
             guard let result = DataImage.requestControl(socketPath: config.socket + ".ctl", message: "usb-" + action,
@@ -907,12 +1333,30 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         AppLog.log("quit requested (VM \(process.isRunning ? "running" : "not running"))")
         panel.releaseAll()
-        lock.lock(); stopping = true
+        lock.lock()
+        if terminating {
+            // A second quit request while the first teardown runs: it owns the reply and the bounded exit below.
+            lock.unlock()
+            return .terminateLater
+        }
+        terminating = true
+        stopping = true
         // With a data image the UI socket stays open until the guest confirms its unmount: closing it makes the
         // guest bridge exit, and the guest powers off before it can sync.
         let keepUIOpen = config.data != nil && process.isRunning
         if socketFD >= 0 && !keepUIOpen { shutdown(socketFD, SHUT_RDWR) }
         lock.unlock()
+        // Bounded exit: the 2026-10-27 hang wedged teardown after a clean guest stop and ignored further SIGTERMs.
+        // Whatever blocks (a slow clean stop, a stuck `waitUntilExit`, or a reply the run loop never services), the
+        // app must be gone inside the acceptance window (10 s). The clean stop is 5 s and the terminate ladder 3 s,
+        // so 9 s fires on a hang; on a very slow host it can also fire while a clean stop is still syncing, cutting
+        // it short rather than letting the app outlive the window.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 9) { [weak self] in
+            guard let self = self else { return }
+            AppLog.log("quit: teardown still running at the 9 s bound; forcing exit")
+            self.log?.write(Data("SP16_HOST_FORCED_EXIT\n".utf8))
+            _exit(0)
+        }
         guard process.isRunning else { return .terminateNow }
         let controlPath = config.data != nil ? config.socket + ".ctl" : nil
         DispatchQueue.global().async { [weak self] in
@@ -928,19 +1372,39 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
             for _ in 0..<30 { if !self.process.isRunning { break }; Thread.sleep(forTimeInterval: 0.1) }
             if self.process.isRunning { Darwin.kill(self.process.processIdentifier, SIGKILL) }
             self.process.waitUntilExit()
-            // The termination loop does not service plain main-queue blocks; post to the common run-loop modes.
-            CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
-            CFRunLoopWakeUp(CFRunLoopGetMain())
+            self.replyTerminate()
         }
         return .terminateLater
     }
 
+    /// Post `reply(toApplicationShouldTerminate:)` to the main run loop, then force the exit if the reply is never
+    /// processed. The termination loop does not service plain main-queue blocks, so the reply goes through
+    /// `CFRunLoopPerformBlock` in the common modes; that path only runs while the run loop spins, so a wedged loop
+    /// (the observed hang) still needs the hard `_exit` fallback.
+    func replyTerminate() {
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self = self else { return }
+            AppLog.log("quit: reply not processed within 2 s; forcing exit")
+            self.log?.write(Data("SP16_HOST_FORCED_EXIT\n".utf8))
+            _exit(0)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         AppLog.markCleanExit("quit")
+        if let held = panelActivity { ProcessInfo.processInfo.endActivity(held); panelActivity = nil }
         audioSink?.stop()
         audioSink?.output?.stop()
+        // Flush the frames still queued for the TX log and close its handle: the session directory is left in place for
+        // diagnostics, and a half-written tail would be read as a truncated line by timing_probe.py.
+        txLogQueue.sync {
+            try? txLog?.close()
+            txLog = nil
+        }
         // Only the launcher-created IPC directory; diagnostic session files persist.
         let parent = URL(fileURLWithPath: config.socket).deletingLastPathComponent()
         if parent.path.hasPrefix("/tmp/sp16-") { try? FileManager.default.removeItem(at: parent) }
@@ -974,9 +1438,16 @@ func attachData(_ config: Configuration, ephemeral: Bool, usbImage: String? = ni
         var extra: [String] = []
         if let usb = usbImage {
             try DataImage.validateUSBImage(usb)
-            // Virtual USB stick: a second virtio disk told apart by its serial; the guest formats it only if blank.
-            extra = ["-drive", "file=\(usb),format=raw,if=none,id=sp16usb",
-                     "-device", "virtio-blk-device,drive=sp16usb,serial=sp16usb"]
+            usbImageAttached = true
+            currentUSBImagePath = usb
+            // Virtual USB stick, on a PCIe root port so its backing image can be hot-swapped while QEMU runs
+            // (virtio-mmio does not hot-plug). The guest recognises it by serial `sp16usb`; QMP over the session
+            // socket drives the swap (`ctl usb attach PATH`).
+            extra = ["-device", "pcie-root-port,id=sp16usb-port,chassis=1",
+                     "-blockdev", "driver=file,filename=\(usb),node-name=sp16usb-file",
+                     "-blockdev", "driver=raw,file=sp16usb-file,node-name=sp16usb",
+                     "-device", "virtio-blk-pci,drive=sp16usb,serial=sp16usb,id=sp16usb-dev,bus=sp16usb-port",
+                     "-qmp", "unix:\(config.socket).qmp,server=on,wait=off"]
         }
         return Configuration(qemu: config.qemu, arguments: config.arguments.map { $0.replacingOccurrences(of: "@DATA@", with: image) } + extra,
                              session: config.session, socket: config.socket, variant: config.variant,

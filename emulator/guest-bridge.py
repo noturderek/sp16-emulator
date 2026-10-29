@@ -13,7 +13,7 @@ import time
 
 import panel_map
 from protocol import (ACK, CONTROL, FRAME, INPUT_FAILED, INPUT_INVALID, INPUT_UNSUPPORTED, KEY,
-                      RESEARCH, TOUCH, TX_FRAME, WHEEL, decode_control, decode_key,
+                      RESEARCH, STANDBY, TOUCH, TX_FRAME, WHEEL, decode_control, decode_key,
                       decode_research, decode_touch, decode_wheel, encode_feedback,
                       encode_result, encode_stats, frame_pixels, message, receive)
 from panel import AnalogStateFile, PanelModel, StartOff, crc16
@@ -151,10 +151,11 @@ IOCTL_SEEN = re.compile(r"\[sp16-ui-stub\] ioctl accepted request=(0x[0-9a-f]{1,
 DAC_WORD = re.compile(r"\[sp16-ui-stub\] dac hpf word=0x([0-9a-f]{4}) ctrl=(\d+) code=(\d+) writes=(\d+)$")
 FILTER_LOOP = re.compile(r"\[sp16-ui-stub\] filter loop send_peak=([0-9.]+) return_peak=([0-9.]+) frames=(\d+) "
                          r"underruns=(\d+) drops=(\d+) lp_hz=(\d+) hp=(dac|off)$")
-ANALOG_LEVELS = re.compile(r"\[sp16-ui-stub\] analog levels limiter=([01]) in_peak=([0-9.]+) in_dbu=(-?[0-9.]+) out_peak=([0-9.]+) "
-                           r"out_dbu=(-?[0-9.]+) limited=(\d+) main_out_gain=([0-9.]+) input_gain=([0-9.]+) source=(off|tone|wav)$")
+ANALOG_LEVELS = re.compile(r"\[sp16-ui-stub\] analog levels limiter=([01]) in_peak=([0-9.]+) in_dbu_peak=(-?[0-9.]+) out_peak=([0-9.]+) "
+                           r"out_dbu_peak=(-?[0-9.]+) limited=(\d+) main_out_gain=([0-9.]+) input_gain=([0-9.]+) source=(off|tone|wav)$")
 TX_DROPPED = re.compile(r"\[sp16-ui-stub\] panel TX frames dropped=(\d+) errno=(\d+)$")
 GPIO_LINE = re.compile(r"\[sp16-ui-stub\] gpio (GPIO\d_IO\d\d)=([01]) ([A-Za-z_/?]+)$")
+BACKLIGHT_LEVEL = re.compile(r"\[sp16-ui-stub\] backlight level=(\d+)$")
 MIDI_LOOP = re.compile(r"\[sp16-ui-stub\] midi loopback (/dev/[a-z0-9_]+) first bytes=(\d+)$")
 
 
@@ -171,10 +172,11 @@ def board_line(line):
                                "drops": int(match.group(5)), "lp_hz": int(match.group(6)), "hp": match.group(7)}
     match = ANALOG_LEVELS.match(line)
     if match:
-        # in/out: peak over the report window (1.0 = converter full scale); dBu = dBFS + 16 (grade I, not measured)
+        # in/out: peak over the report window (1.0 = converter full scale); *_dbu_peak = dBFS + 16 from that peak
+        # (peak-equivalent dBu, grade I, not measured on a unit; dBu proper is RMS).
         return "analog_levels", {"limiter_active": match.group(1) == "1", "in_peak": float(match.group(2)),
-                                 "in_dbu": float(match.group(3)), "out_peak": float(match.group(4)),
-                                 "out_dbu": float(match.group(5)), "limited_samples": int(match.group(6)),
+                                 "in_dbu_peak": float(match.group(3)), "out_peak": float(match.group(4)),
+                                 "out_dbu_peak": float(match.group(5)), "limited_samples": int(match.group(6)),
                                  "main_out_gain": float(match.group(7)), "input_gain": float(match.group(8)),
                                  "source": match.group(9)}
     match = MIDI_LOOP.match(line)
@@ -186,7 +188,20 @@ def board_line(line):
     match = GPIO_LINE.match(line)
     if match:
         return "gpio", (match.group(1), int(match.group(2)))
+    match = BACKLIGHT_LEVEL.match(line)
+    if match:
+        level = int(match.group(1))
+        return ("backlight", level) if 0 <= level <= 255 else None
     return None
+
+
+def standby_flag(frame):
+    """The standby transition flag (byte 0x67 bit 0) of a complete OEM TX frame, or None when the frame is not one.
+
+    The flag rides the panel TX frame, which the firmware also sets in its start-up frames, so callers act on it only
+    after the home screen has settled. Kept separate from panel_map.decode_tx so the bridge can read this one bit
+    without decoding every lamp channel on every frame."""
+    return bool(frame[panel_map.TX_STANDBY_OFFSET] & 1) if len(frame) == 128 else None
 
 
 def main():
@@ -209,6 +224,8 @@ def main():
     counters = Counters()
     link = LinkTiming(counters)
     state = {"txlog": False, "generation": 0, "lamps": {}, "live": False}
+    usb_oc_path = Path(f"{ROOT}/dev/sp16-usb-oc")
+    usb_oc_path.write_bytes(b"1")
     logged_lines = 0
 
     def diagnostics():
@@ -380,6 +397,7 @@ def main():
 
         threading.Thread(target=sender, daemon=True).start()
         last_frame = None
+        last_standby = None
         try:
             while not stopped.is_set():
                 try:
@@ -404,6 +422,14 @@ def main():
                             outbox.put((TX_FRAME, bytes((multi, part, parts)) + frame))
                             link.outbox(depth + 1)
                             wake.set()
+                    # Standby must reach the window on an ordinary launch too: TX_FRAME above is research logging only,
+                    # so the flag is sent as its own transition on the always-on port. The window ignores the flag until
+                    # the home screen has settled, which makes the start-up frames' flag harmless.
+                    standby = standby_flag(frame)
+                    if standby is not None and standby != last_standby:
+                        last_standby = standby
+                        outbox.put((STANDBY, bytes((int(standby),))))
+                        wake.set()
                     if frame == last_frame:
                         continue  # the OEM resends unchanged lamp state continuously
                     last_frame = frame
@@ -476,12 +502,16 @@ def main():
                         model.clear_overrides()
                     elif op == "period":
                         timing["period"] = offset / 1000
+                    elif op == "usb-oc":
+                        temporary = usb_oc_path.with_suffix(".next")
+                        temporary.write_bytes(b"0" if offset else b"1")
+                        temporary.replace(usb_oc_path)
                     else:
                         state["txlog"] = bool(offset)
                     continue
                 if kind == TOUCH:
                     x, y, action = decode_touch(payload)
-                    controls.touch(x, y, action)
+                    model.lcd_touch(x, y, action)
                 elif kind == WHEEL:
                     x, y, steps = decode_wheel(payload)
                     model.apply(panel_map.CONTROL_IDS["selector"], "delta", steps)

@@ -269,6 +269,48 @@ class SessionctlTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("standby needs the argument yes", result.stderr)
 
+    def test_fault_sends_on_and_off(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        self.assertEqual(session.fault(True), {"ok": True})
+        self.assertEqual(session.fault(False), {"ok": True})
+        self.assertEqual(app.received, [{"op": "fault", "on": True}, {"op": "fault", "on": False}])
+
+    def test_fault_on_the_command_line_accepts_only_on_and_off(self):
+        session = mock.Mock()
+        sessionctl.run_command(session, "fault", ["on"])
+        sessionctl.run_command(session, "fault", ["off"])
+        self.assertEqual([c.args for c in session.fault.call_args_list], [(True,), (False,)])
+        for bad in ([], ["OF"], ["yes"], ["on", "off"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeError):
+                    sessionctl.run_command(session, "fault", bad)
+
+    def test_monitor_sends_the_jack_name(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        self.assertEqual(session.monitor("PHONES"), {"ok": True})
+        self.assertEqual(app.received, [{"op": "monitor", "name": "PHONES"}])
+
+    def test_monitor_on_the_command_line_refuses_an_unknown_jack(self):
+        runtime = self.runtime(self.app("answer"))
+        result = subprocess.run([sys.executable, str(TOOLS / "sessionctl.py"), "--runtime", str(runtime), "monitor", "X"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("monitor needs MAIN", result.stderr)
+
+    def test_usb_attach_with_a_path_passes_the_path(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        self.assertEqual(session.usb("attach", "/tmp/stick.img"), {"ok": True})
+        self.assertEqual(app.received, [{"op": "usb", "action": "attach", "path": "/tmp/stick.img"}])
+
+    def test_usb_without_a_path_omits_the_path_field(self):
+        app = self.app("answer")
+        session = self.session(self.runtime(app))
+        self.assertEqual(session.usb("eject"), {"ok": True})
+        self.assertEqual(app.received, [{"op": "usb", "action": "eject"}])
+
 
 if __name__ == "__main__":
     unittest.main()

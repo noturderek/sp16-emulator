@@ -535,6 +535,22 @@ class PersistenceArgumentTests(unittest.TestCase):
                 native.launch("/b", no_ui_input=bench, no_audio_files=True)
                 run.assert_called_once_with(expected)
 
+    def test_midi_helpers_start_only_when_midi_is_requested(self):
+        from unittest import mock
+        assets = {"app_bundle": "/b/SP16.app", "decoupled": True, "research": True}
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(native, "host_check"), \
+                mock.patch.object(native, "private_path", side_effect=Path), \
+                mock.patch.object(native, "validated_assets", return_value=assets), \
+                mock.patch.object(native, "run"), mock.patch("subprocess.Popen") as helper, \
+                mock.patch("builtins.print"):
+            native.launch(folder)
+            helper.assert_not_called()
+            native.launch(folder, midi=True)
+            self.assertEqual(helper.call_count, 2)
+            self.assertEqual([call.args[0][2] for call in helper.call_args_list], ["midi.din", "midi.usb"])
+            for call in helper.call_args_list:
+                self.assertIn("--wait-for-session", call.args[0])
+
     def test_the_app_keeps_the_audio_sink_without_files_when_asked(self):
         """--no-audio-files: the sink still reads every PCM packet from the guest and keeps its counters (the guest's audio
         path and timing are the same as a file build's); it opens no WAV, and metrics say so."""
@@ -781,10 +797,24 @@ class VirtualUsbStickTests(unittest.TestCase):
 
     def test_eject_is_a_research_command(self):
         sessionctl = (TOOLS / "sessionctl.py").read_text()
-        self.assertIn('op="usb"', sessionctl)
+        self.assertIn('"op": "usb"', sessionctl)
         window = (TOOLS / "native-window.swift").read_text()
         self.assertIn('case "usb":', window)
         self.assertIn("usb-ejected", window)
+
+    def test_hot_attach_restores_the_previous_stick_when_the_swap_fails(self):
+        """A failed QMP swap (after device_del/blockdev-del) must not leave the VM without a USB device: the old
+        stick is re-attached, and the eject guard refuses a swap the guest never confirmed."""
+        window = (TOOLS / "native-window.swift").read_text()
+        self.assertIn("let oldImage = currentUSBImagePath", window)
+        self.assertIn("QMP.restoreUSB(socketPath:", window)
+        self.assertIn("re-attached the previous stick", window)
+        self.assertIn("could not re-attach the previous stick either (retry ctl usb attach)", window)
+        self.assertIn("usb eject got no reply from the guest; refusing to swap the stick", window)
+        self.assertIn('if ejectResult == "usb-busy"', window)
+        # The QMP restore tolerates the part-removed state a failed swap leaves behind.
+        self.assertIn("static func restoreUSB(socketPath:", window)
+        self.assertIn('_ = try? command(fd, "blockdev-del"', window)
 
 
 if __name__ == "__main__":

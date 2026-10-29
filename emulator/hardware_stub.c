@@ -11,7 +11,9 @@
 #include <net/if_arp.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,9 +24,10 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <sound/asequencer.h>
 
 #define MAX_FDS 1024
-enum device { NONE, PANEL, CDC, DAC, BACKLIGHT, MEDIA, PACKET, MIDI, GPIO };
+enum device { NONE, PANEL, CDC, DAC, BACKLIGHT, MEDIA, PACKET, MIDI, GPIO, MIDI_CONTROL, SEQUENCER };
 /* media: 1 = /proc/udev_usb1, 2 = /proc/udev_usbctn1 (only meaningful when kind==MEDIA). */
 struct state { enum device kind; int peer; uint32_t interval, bytes, offset; uint16_t bits; uint8_t timer, endian, input, media; };
 struct spi_message { uint8_t multi_id, reserved, part_id, part_num; uint32_t bytes; uint64_t tx_buf; };
@@ -36,13 +39,116 @@ static int (*original_close)(int);
 static ssize_t (*original_read)(int, void *, size_t);
 static ssize_t (*original_write)(int, const void *, size_t);
 static int (*original_ioctl)(int, unsigned long, ...);
+static int network_diag_enabled(void);
+static int network_diag_port(const struct sockaddr *address, socklen_t length);
+static int usb_midi_enabled(void) {
+    const char *path=getenv("SP16_USB_MIDI_MODE_PATH");
+    return access(path?path:"/dev/sp16-usb-midi-enabled",F_OK)==0;
+}
 static char panel_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static char cdc_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+/* The sequencer bridge owns the sole DIN output queue. Each request is one packet and gets
+ * an explicit acceptance/capacity response; no second virtio reader is opened here. */
+static int din_control_request(uint32_t request) {
+    const char *path=getenv("SP16_DIN_CONTROL");
+    if (!path) path="/dev/sp16-din-control";
+    if (!*path || strlen(path)>=sizeof(((struct sockaddr_un *)0)->sun_path)) { errno=EINVAL; return -1; }
+    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);
+    if (fd<0) return -1;
+    struct timeval timeout={.tv_sec=1};
+    (void)setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof timeout);
+    struct sockaddr_un address={.sun_family=AF_UNIX};
+    strcpy(address.sun_path,path);
+    int32_t result=-EIO;
+    int error=0;
+    if (connect(fd,(struct sockaddr *)&address,sizeof address)<0) error=errno;
+    else {
+        ssize_t n=send(fd,&request,sizeof request,MSG_NOSIGNAL);
+        if (n!=(ssize_t)sizeof request) error=n<0 ? errno : EIO;
+        else {
+            n=recv(fd,&result,sizeof result,0);
+            if (n!=(ssize_t)sizeof result) error=n<0 ? errno : EIO;
+        }
+    }
+    original_close(fd);
+    if (error) { errno=error; return -1; }
+    if (result<0) { errno=-result; return -1; }
+    return result;
+}
+static int din_capacity_file(void) {
+    int available=din_control_request(UINT32_MAX);
+    if (available<0) return -1;
+    int fd=(int)syscall(SYS_memfd_create,"sp16-din-capacity",MFD_CLOEXEC);
+    if (fd<0) return -1;
+    char report[64];
+    int length=snprintf(report,sizeof report,"Avail        : %d\n",available);
+    if (length<0 || length>=(int)sizeof report || original_write(fd,report,(size_t)length)!=length ||
+        lseek(fd,0,SEEK_SET)<0) {
+        int error=errno ? errno : EIO; original_close(fd); errno=error; return -1;
+    }
+    return fd;
+}
 static uint64_t mono_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)t.tv_sec*1000000000ULL+(uint64_t)t.tv_nsec;
 }
 static void dac_write(const void *buffer,size_t count);
+
+/* The OEM's JUCE MIDI path uses ALSA sequencer subscriptions. Record the result at the
+ * API boundary so a registered device cannot be mistaken for a connected route. */
+typedef struct _snd_seq snd_seq_t;
+typedef struct snd_seq_event snd_seq_event_t;
+static void *midi_alsa_symbol(const char *name) {
+    static void *alsa;
+    void *handle=__atomic_load_n(&alsa,__ATOMIC_ACQUIRE);
+    if (!handle) {
+        void *candidate=dlopen("libasound.so.2",RTLD_NOW|RTLD_LOCAL);
+        if (!candidate) {
+            fprintf(stderr,"[sp16-ui-stub] MIDI ALSA load failed: %s\n",dlerror());
+            return NULL;
+        }
+        void *empty=NULL;
+        if (__atomic_compare_exchange_n(&alsa,&empty,candidate,0,__ATOMIC_RELEASE,__ATOMIC_ACQUIRE))
+            handle=candidate;
+        else { dlclose(candidate); handle=empty; }
+    }
+    void *symbol=dlsym(handle,name);
+    if (!symbol) fprintf(stderr,"[sp16-ui-stub] MIDI ALSA symbol missing: %s (%s)\n",name,dlerror());
+    return symbol;
+}
+int snd_seq_open(snd_seq_t **handle,const char *name,int streams,int mode) {
+    int (*real)(snd_seq_t **,const char *,int,int)=midi_alsa_symbol("snd_seq_open");
+    if (!real) return -ENOSYS;
+    int result=real(handle,name,streams,mode);
+    fprintf(stderr,"[sp16-ui-stub] MIDI seq open name=%s streams=%d result=%d\n",name,streams,result);
+    return result;
+}
+int snd_seq_connect_from(snd_seq_t *handle,int my_port,int client,int port) {
+    int (*real)(snd_seq_t *,int,int,int)=midi_alsa_symbol("snd_seq_connect_from");
+    if (!real) return -ENOSYS;
+    int result=real(handle,my_port,client,port);
+    fprintf(stderr,"[sp16-ui-stub] MIDI seq connect_from local=%d peer=%d:%d result=%d\n",my_port,client,port,result);
+    return result;
+}
+int snd_seq_connect_to(snd_seq_t *handle,int my_port,int client,int port) {
+    int (*real)(snd_seq_t *,int,int,int)=midi_alsa_symbol("snd_seq_connect_to");
+    if (!real) return -ENOSYS;
+    int result=real(handle,my_port,client,port);
+    fprintf(stderr,"[sp16-ui-stub] MIDI seq connect_to local=%d peer=%d:%d result=%d\n",my_port,client,port,result);
+    return result;
+}
+int snd_seq_event_input(snd_seq_t *handle,snd_seq_event_t **event) {
+    int (*real)(snd_seq_t *,snd_seq_event_t **)=midi_alsa_symbol("snd_seq_event_input");
+    if (!real) return -ENOSYS;
+    int result=real(handle,event);
+    static unsigned events;
+    if (result>=0 && event && *event && __atomic_fetch_add(&events,1,__ATOMIC_RELAXED)<16)
+        fprintf(stderr,"[sp16-ui-stub] MIDI seq input event=%d type=%u source=%u:%u dest=%u:%u channel=%u note=%u velocity=%u\n",
+                result,(*event)->type,(*event)->source.client,(*event)->source.port,
+                (*event)->dest.client,(*event)->dest.port,(*event)->data.note.channel,
+                (*event)->data.note.note,(*event)->data.note.velocity);
+    return result;
+}
 
 /* Bind a native-only datagram endpoint (panel RX or CDC strip). `input` is 1 for the
  * panel and 2 for the CDC controller, which closes/unlinks its own path. */
@@ -100,6 +206,51 @@ static int idle_socket(enum device kind) {
     devices[pair[0]]=(struct state){ .kind=kind,.peer=pair[1],.interval=kind==DAC?1:3,
         .bytes=kind==DAC?16:32,.bits=kind==DAC?16:32 };
     return pair[0];
+}
+
+/* The native DIN bridge owns ALSA and the UART. The ARM process keeps a real
+ * pollable socket fd; fixed-size 32-bit sequencer events cross it unchanged. */
+/* Wait, bounded, for a nonblocking connect to settle. EINPROGRESS means the attempt is in flight (POLLOUT reports
+ * completion, SO_ERROR the outcome); EAGAIN means the listener's backlog is full and nothing is in flight, so the
+ * connect itself is retried. Returning early on either hands the app a socket whose first write fails, which drops
+ * the proxy client; the bound keeps a wedged bridge from hanging the sequencer open. */
+static int connect_wait(int fd,const struct sockaddr *address,socklen_t length) {
+    uint64_t deadline=mono_ns()+1000000000ULL;
+    int state;
+    for (;;) {
+        if (connect(fd,address,length)==0) return 0;
+        state=errno;
+        if (state!=EAGAIN) break;
+        if (mono_ns()>=deadline) { errno=EAGAIN; return -1; }
+        struct timespec pause={.tv_sec=0,.tv_nsec=1000000};
+        nanosleep(&pause,NULL);
+    }
+    if (state!=EINPROGRESS) { errno=state; return -1; }
+    struct pollfd waiting={ .fd=fd, .events=POLLOUT };
+    int ready;
+    do { ready=poll(&waiting,1,1000); } while (ready<0 && errno==EINTR);
+    if (ready<0) return -1;
+    if (ready==0) { errno=ETIMEDOUT; return -1; }
+    int error=0;
+    socklen_t size=sizeof error;
+    if (getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&size)<0) return -1;
+    if (error) { errno=error; return -1; }
+    return 0;
+}
+static int sequencer_socket(void) {
+    const char *path=getenv("SP16_SEQ_PROXY");
+    if (!path) path="/dev/sp16-seq-proxy";
+    if (!*path || strlen(path)>=sizeof(((struct sockaddr_un *)0)->sun_path)) { errno=EINVAL; return -1; }
+    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
+    if (fd<0) return -1;
+    if (fd>=MAX_FDS) { original_close(fd); errno=EMFILE; return -1; }
+    struct sockaddr_un address={.sun_family=AF_UNIX};
+    strcpy(address.sun_path,path);
+    if (connect_wait(fd,(struct sockaddr *)&address,sizeof address)<0) {
+        int error=errno; original_close(fd); errno=error; return -1;
+    }
+    devices[fd]=(struct state){.kind=SEQUENCER,.peer=-1};
+    return fd;
 }
 
 __attribute__((constructor)) static void initialize(void) {
@@ -207,16 +358,18 @@ static int media_socket(int node) {
 }
 
 static enum device classify(const char *path) {
+    if (!strcmp(path, "/dev/snd/seq")) return SEQUENCER;
     if (!strcmp(path, "/dev/subucom_spi0.1")) return PANEL;
     if (!strcmp(path, "/dev/cdc_spi2.0")) return CDC;
     if (!strcmp(path, "/dev/dac_spi4.0")) return DAC;
     if (!strcmp(path, "/dev/backlight")) return BACKLIGHT;
     if (!strcmp(path, "/proc/udev_usb1") || !strcmp(path, "/proc/udev_usbctn1")) return MEDIA;
     if (!strcmp(path, "/dev/gpiodrv")) return GPIO;
-    /* DIN MIDI (UART2 and the din_midi driver) only when a loopback cable is asked for (factory test mode). */
+    /* The factory cable and normal app ioctl endpoint have separate semantics. */
     if (!strcmp(path, "/dev/ttymxc1") || !strcmp(path, "/dev/din_midi")) {
         const char *loop=getenv("SP16_MIDI_LOOPBACK");
-        return loop && !strcmp(loop,"1") ? MIDI : NONE;
+        if (loop && !strcmp(loop,"1")) return MIDI;
+        return !strcmp(path,"/dev/din_midi") ? MIDI_CONTROL : NONE;
     }
     return NONE;
 }
@@ -248,12 +401,30 @@ static int gpio_open(void) {
     devices[pair[0]]=(struct state){ .kind=GPIO,.peer=pair[1] };
     return pair[0];
 }
+static uint8_t usb_oc_level(void) {
+    const char *path=getenv("SP16_USB_OC_PATH");
+    if (!path || !*path) return 1;
+    int fd=original_open(path,O_RDONLY|O_CLOEXEC);
+    if (fd<0) return 1;
+    char value=0;
+    ssize_t count=original_read(fd,&value,1);
+    original_close(fd);
+    return count==1 && value=='0' ? 0 : 1;
+}
 static ssize_t gpio_io(struct state *s,void *buffer,size_t count,int writing) {
     uint8_t *b=buffer;
     size_t n=0;
     for (;n<count && s->offset<GPIO_LINES;n++,s->offset++) {
         unsigned line=s->offset;
-        if (!writing) { b[n]=gpio_level[line]; continue; }
+        if (!writing) {
+            if (line==3*32+14) {
+                uint8_t level=usb_oc_level();
+                if (__atomic_exchange_n(&gpio_level[line],level,__ATOMIC_ACQ_REL)!=level)
+                    fprintf(stderr,"[sp16-ui-stub] gpio GPIO4_IO14=%u USBPWR_OC\n",level);
+            }
+            b[n]=__atomic_load_n(&gpio_level[line],__ATOMIC_ACQUIRE);
+            continue;
+        }
         uint8_t level=b[n]&1;
         __atomic_add_fetch(&gpio_writes,1,__ATOMIC_RELAXED);
         int first=!__atomic_exchange_n(&gpio_written[line],1,__ATOMIC_ACQ_REL);
@@ -297,6 +468,150 @@ static ssize_t midi_write(struct state *s,const void *buffer,size_t count) {
     return n;
 }
 
+/* The rawmidi UART backend complements the native guest sequencer client. Each app uses one ALSA API.
+ * The one full-duplex virtio port is the UART wire: reads are DIN IN, writes are DIN OUT. An absolute monotonic
+ * deadline is kept across calls so a 31,250 baud UART consumes one 10-bit byte every 320 us. Each byte takes the
+ * lock separately, allowing a real-time write from another thread to use the next wire slot. */
+typedef struct _snd_rawmidi snd_rawmidi_t;
+#define RAWMIDI_MAGIC 0x534d4944u
+#define MIDI_BYTE_NS 320000ULL
+struct fake_rawmidi { uint32_t magic; int fd, input, nonblock; };
+static volatile int rawmidi_wire_lock;
+static uint64_t rawmidi_next_ns;
+static int rawmidi_fd=-1;
+static int rawmidi_is_fake(const snd_rawmidi_t *handle) {
+    return handle && ((const struct fake_rawmidi *)handle)->magic==RAWMIDI_MAGIC;
+}
+static int rawmidi_open_port(void) {
+    if (rawmidi_fd>=0) return rawmidi_fd;
+    const char *path=getenv("SP16_DIN_PORT");
+    if (!path) path="/dev/sp16-din";
+    int fd=original_open(path,O_RDWR|O_CLOEXEC|O_NONBLOCK);
+    if (fd>=0) rawmidi_fd=fd;
+    return fd;
+}
+int snd_rawmidi_open(snd_rawmidi_t **input,snd_rawmidi_t **output,const char *name,int mode) {
+    int (*real)(snd_rawmidi_t **,snd_rawmidi_t **,const char *,int)=dlsym(RTLD_NEXT,"snd_rawmidi_open");
+    if (!name || !strstr(name,"snddinmidi"))
+        return real?real(input,output,name,mode):-ENOSYS;
+    if ((!input && !output) || (input && output && input==output)) return -EINVAL;
+    int port=rawmidi_open_port();
+    if (port<0) return -errno;
+    struct fake_rawmidi *in=NULL,*out=NULL;
+    if (input) { in=calloc(1,sizeof(*in)); if (!in) return -ENOMEM; }
+    if (output) { out=calloc(1,sizeof(*out)); if (!out) { free(in); return -ENOMEM; } }
+    if (in) { in->magic=RAWMIDI_MAGIC; in->fd=port; in->input=1; in->nonblock=!!(mode&1); *input=(snd_rawmidi_t *)in; }
+    if (out) { out->magic=RAWMIDI_MAGIC; out->fd=port; out->nonblock=!!(mode&1); *output=(snd_rawmidi_t *)out; }
+    fprintf(stderr,"[sp16-ui-stub] rawmidi %s -> %s input=%d output=%d\n",name,
+            getenv("SP16_DIN_PORT")?getenv("SP16_DIN_PORT"):"/dev/sp16-din",!!input,!!output);
+    return 0;
+}
+int snd_rawmidi_close(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_close");
+    if (!rawmidi_is_fake(handle)) return real?real(handle):-ENOSYS;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    fake->magic=0; free(fake);
+    /* The port remains open for the other direction and future rawmidi opens in this app process. */
+    return 0;
+}
+int snd_rawmidi_nonblock(snd_rawmidi_t *handle,int nonblock) {
+    int (*real)(snd_rawmidi_t *,int)=dlsym(RTLD_NEXT,"snd_rawmidi_nonblock");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,nonblock):-ENOSYS;
+    __atomic_store_n(&((struct fake_rawmidi *)handle)->nonblock,!!nonblock,__ATOMIC_RELEASE);
+    return 0;
+}
+static int rawmidi_write_byte(int fd,uint8_t byte,int nonblock) {
+    while (__sync_lock_test_and_set(&rawmidi_wire_lock,1)) sched_yield();
+    uint64_t now=mono_ns();
+    uint64_t target=(rawmidi_next_ns>now?rawmidi_next_ns:now)+MIDI_BYTE_NS;
+    int error=0;
+    if (nonblock) {
+        /* A nonblocking write must not spend the wire slot before it knows the port can take the byte, and it must not
+         * burst successful writes out back to back past the UART's 320 us/byte rate: when the previous byte's slot has
+         * not elapsed, hand back EAGAIN at once, leaving the slot for the byte that does go out. */
+        if (now<rawmidi_next_ns) error=EAGAIN;
+        else {
+            ssize_t wrote=original_write(fd,&byte,1);
+            if (wrote!=1) error=wrote==0 ? EIO : errno;
+        }
+    } else {
+        struct timespec deadline={ .tv_sec=(time_t)(target/1000000000ULL),.tv_nsec=(long)(target%1000000000ULL) };
+        int slept;
+        do { slept=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&deadline,NULL); } while (slept==EINTR);
+        error=slept;
+        if (!error) for (;;) {
+            ssize_t wrote=original_write(fd,&byte,1);
+            if (wrote==1) break;
+            error=wrote==0 ? EIO : errno;
+            if (error!=EAGAIN) break;
+            struct pollfd ready={ .fd=fd,.events=POLLOUT };
+            if (poll(&ready,1,-1)<0 && errno!=EINTR) { error=errno; break; }
+            error=0;
+        }
+    }
+    if (!error) rawmidi_next_ns=target; /* only a byte that went out takes the UART slot */
+    __sync_lock_release(&rawmidi_wire_lock);
+    return error ? -error : 0;
+}
+ssize_t snd_rawmidi_read(snd_rawmidi_t *handle,void *buffer,size_t count) {
+    ssize_t (*real)(snd_rawmidi_t *,void *,size_t)=dlsym(RTLD_NEXT,"snd_rawmidi_read");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,buffer,count):-ENOSYS;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    if (!fake->input) return -EBADF;
+    ssize_t n;
+    for (;;) {
+        n=original_read(fake->fd,buffer,count);
+        if (n>=0 || errno!=EAGAIN || __atomic_load_n(&fake->nonblock,__ATOMIC_ACQUIRE)) break;
+        struct pollfd ready={ .fd=fake->fd,.events=POLLIN };
+        if (poll(&ready,1,-1)<0 && errno!=EINTR) return -errno;
+    }
+    if (n>0 && gpio_ready && __atomic_load_n(&gpio_level[5],__ATOMIC_ACQUIRE)==1) {
+        /* MIDI_PASS is the hardware THRU gate. Echo incoming bytes to the host, not back to the app. */
+        const uint8_t *bytes=buffer;
+        for (ssize_t i=0;i<n;i++) (void)rawmidi_write_byte(fake->fd,bytes[i],0);
+    }
+    return n<0?-errno:n;
+}
+ssize_t snd_rawmidi_write(snd_rawmidi_t *handle,const void *buffer,size_t count) {
+    ssize_t (*real)(snd_rawmidi_t *,const void *,size_t)=dlsym(RTLD_NEXT,"snd_rawmidi_write");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,buffer,count):-ENOSYS;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    if (fake->input) return -EBADF;
+    const uint8_t *bytes=buffer;
+    for (size_t i=0;i<count;i++) {
+        int result=rawmidi_write_byte(fake->fd,bytes[i],__atomic_load_n(&fake->nonblock,__ATOMIC_ACQUIRE));
+        if (result) return i?(ssize_t)i:result;
+    }
+    return (ssize_t)count;
+}
+int snd_rawmidi_drain(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_drain");
+    return rawmidi_is_fake(handle)?0:real?real(handle):-ENOSYS;
+}
+int snd_rawmidi_drop(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_drop");
+    return rawmidi_is_fake(handle)?0:real?real(handle):-ENOSYS;
+}
+int snd_rawmidi_poll_descriptors_count(snd_rawmidi_t *handle) {
+    int (*real)(snd_rawmidi_t *)=dlsym(RTLD_NEXT,"snd_rawmidi_poll_descriptors_count");
+    return rawmidi_is_fake(handle)?1:real?real(handle):-ENOSYS;
+}
+int snd_rawmidi_poll_descriptors(snd_rawmidi_t *handle,struct pollfd *fds,unsigned int space) {
+    int (*real)(snd_rawmidi_t *,struct pollfd *,unsigned int)=dlsym(RTLD_NEXT,"snd_rawmidi_poll_descriptors");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,fds,space):-ENOSYS;
+    if (!fds || !space) return -EINVAL;
+    struct fake_rawmidi *fake=(struct fake_rawmidi *)handle;
+    fds[0]=(struct pollfd){ .fd=fake->fd,.events=fake->input?POLLIN:POLLOUT };
+    return 1;
+}
+int snd_rawmidi_poll_descriptors_revents(snd_rawmidi_t *handle,struct pollfd *fds,unsigned int count,unsigned short *revents) {
+    int (*real)(snd_rawmidi_t *,struct pollfd *,unsigned int,unsigned short *)=dlsym(RTLD_NEXT,"snd_rawmidi_poll_descriptors_revents");
+    if (!rawmidi_is_fake(handle)) return real?real(handle,fds,count,revents):-ENOSYS;
+    if (!fds || !count || !revents) return -EINVAL;
+    *revents=(unsigned short)fds[0].revents;
+    return 0;
+}
+
 /* Driver coverage (hardware suite HW-45, docs/architecture.md M5): a device node the shim does not serve is reported once
  * per path, so a firmware version that uses another driver is diagnosable; the open itself is passed through. */
 static int unknown_device_node(const char *path) {
@@ -320,6 +635,7 @@ static void note_unknown_device(const char *path) {
 static int open_device(const char *path, int flags, mode_t mode) {
     if (!original_open) original_open=dlsym(RTLD_NEXT,"open");
     if (!original_close) original_close=dlsym(RTLD_NEXT,"close");
+    if (path && !strcmp(path,"/proc/asound/snddinmidi/midi0")) return din_capacity_file();
     enum device kind = classify(path);
     if (!kind) {
         if (path && unknown_device_node(path)) note_unknown_device(path);
@@ -332,6 +648,11 @@ static int open_device(const char *path, int flags, mode_t mode) {
     if (native && kind==PANEL) fd=input_socket(PANEL,"SP16_PANEL_SOCKET","/dev/sp16-panel-input",panel_path);
     else if (native && kind==CDC) fd=input_socket(CDC,"SP16_CDC_SOCKET","/dev/sp16-cdc-input",cdc_path);
     else if (kind==MIDI) fd=midi_socket(!strcmp(path,"/dev/din_midi")?2:1);
+    else if (kind==MIDI_CONTROL) {
+        if (din_control_request(UINT32_MAX)<0) return -1;
+        fd=idle_socket(kind);
+    }
+    else if (kind==SEQUENCER) fd=sequencer_socket();
     else if (kind==GPIO) fd=gpio_open();
     else if (kind==MEDIA) {
         int node=!strcmp(path,"/proc/udev_usbctn1")?2:1;
@@ -342,6 +663,11 @@ static int open_device(const char *path, int flags, mode_t mode) {
         }
     }
     else fd=idle_socket(kind);
+    if (fd>=0 && kind==SEQUENCER) {
+        static unsigned next_client=130;
+        devices[fd].offset=__atomic_fetch_add(&next_client,1,__ATOMIC_RELAXED);
+        devices[fd].bytes=0;
+    }
     fprintf(stderr, "[sp16-ui-stub] open %s => fd=%d\n", path, fd);
     return fd;
 }
@@ -372,6 +698,13 @@ int64_t lseek64(int fd,int64_t offset,int whence) {
 
 int close(int fd) {
     if (!original_close) original_close=dlsym(RTLD_NEXT,"close");
+    int port=0;
+    if (network_diag_enabled()) {
+        struct sockaddr_in local;
+        socklen_t length=sizeof local;
+        if (getsockname(fd,(struct sockaddr *)&local,&length)==0)
+            port=network_diag_port((const struct sockaddr *)&local,length);
+    }
     struct state *s = device(fd);
     if (s) {
         int peer=s->peer;
@@ -391,7 +724,13 @@ int close(int fd) {
         memset(s, 0, sizeof(*s));
         if (peer>=0) original_close(peer);
     }
-    return original_close(fd);
+    int result=original_close(fd);
+    int saved_errno=errno;
+    if (port)
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG close fd=%d port=%d result=%d errno=%d\n",
+                fd,port,result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
 }
 
 ssize_t write(int fd, const void *buffer, size_t count) {
@@ -403,6 +742,25 @@ ssize_t write(int fd, const void *buffer, size_t count) {
         if (s->peer<0) return media_write(s,fd,buffer,count);
     }
     if (s->kind==MIDI) return midi_write(s,buffer,count);
+    if (s->kind==SEQUENCER) {
+        if (!buffer || count%sizeof(struct snd_seq_event)) { errno=EINVAL; return -1; }
+        const struct snd_seq_event *events=buffer;
+        size_t done=0;
+        for (; done<count; done+=sizeof *events) {
+            const struct snd_seq_event *event=(const void *)((const uint8_t *)buffer+done);
+            if (event->flags & SNDRV_SEQ_EVENT_LENGTH_MASK) { errno=EOPNOTSUPP; break; }
+            if (event->type==SNDRV_SEQ_EVENT_NOTEON || event->type==SNDRV_SEQ_EVENT_NOTEOFF)
+                fprintf(stderr,"[sp16-ui-stub] MIDI seq output type=%u source=%u:%u dest=%u:%u note=%u velocity=%u\n",
+                        event->type,event->source.client,event->source.port,event->dest.client,event->dest.port,
+                        event->data.note.note,event->data.note.velocity);
+            uint8_t packet[1+sizeof *event];
+            packet[0]='E'; memcpy(packet+1,event,sizeof *event);
+            if (send(fd,packet,sizeof packet,MSG_NOSIGNAL)!=sizeof packet) break;
+        }
+        if (done) return (ssize_t)done;
+        return -1;
+    }
+    if (s->kind==MIDI_CONTROL) { errno=ENOTSUP; return -1; }
     if (s->kind==GPIO) return gpio_io(s,(void *)buffer,count,1);
     if (s->kind == MEDIA || s->kind==PACKET) { errno=ENOTSUP; return -1; }
     if (s->timer) { errno=EFAULT; return -1; }
@@ -433,6 +791,8 @@ ssize_t read(int fd, void *buffer, size_t count) {
         return result;
     }
     if (s->kind==MIDI) return original_read(fd,buffer,count); /* the loopback cable */
+    if (s->kind==SEQUENCER) return original_read(fd,buffer,count);
+    if (s->kind==MIDI_CONTROL) { errno=ENOTSUP; return -1; }
     if (s->kind==GPIO) return gpio_io(s,buffer,count,0);
     if (s->kind==MEDIA) {
         media_note(s,"read");
@@ -449,7 +809,7 @@ ssize_t read(int fd, void *buffer, size_t count) {
 static void note_ioctl(unsigned long request, enum device kind) {
     static unsigned long seen[32];
     static int count;
-    static const char *names[] = {"none", "panel", "cdc", "dac", "backlight", "media", "packet", "midi", "gpio"};
+    static const char *names[] = {"none", "panel", "cdc", "dac", "backlight", "media", "packet", "midi", "gpio", "din-control", "sequencer"};
     int known = __atomic_load_n(&count, __ATOMIC_ACQUIRE);
     for (int i=0; i<known && i<32; i++) if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED)==request) return;
     int slot = __atomic_fetch_add(&count, 1, __ATOMIC_ACQ_REL);  /* a racing duplicate line is harmless */
@@ -461,13 +821,50 @@ static void note_ioctl(unsigned long request, enum device kind) {
 /* Fake eth0 (SP16_FAKE_ETH0=1, set with the factory test mode): the guest has only lo, but the DEVICE TEST page
  * (page 8) reads the MAC (retrying with 250 ms sleeps until bytes 3..5 are not all zero) and the IP of eth0 on the
  * UI thread, so without an interface it never returns. Every value below is fake: a locally administered MAC
- * (02:00:5e:10:00:01), 192.0.2.16/24 (TEST-NET-1) and an interface that is up. Link data (SIOCETHTOOL) is not
- * faked: it fails with EOPNOTSUPP. Off in normal runs, where eth0 stays absent. */
+ * (02:00:5e:10:00:01), 192.0.2.16/24 (TEST-NET-1) and an interface that is up. Link data is fake for the carrier
+ * query only: with SP16_NET_GLINK set, SIOCETHTOOL ETHTOOL_GLINK answers 0/1 for eth0, because QEMU user-mode can
+ * reject a networked guest's own link query; every other SIOCETHTOOL request on the fake interface fails with
+ * EOPNOTSUPP. Off in normal runs, where eth0 stays absent. */
 #define SP16_SIOCGIFFLAGS 0x8913UL
 #define SP16_SIOCGIFADDR 0x8915UL
 #define SP16_SIOCGIFNETMASK 0x891bUL
 #define SP16_SIOCGIFHWADDR 0x8927UL
 #define SP16_SIOCETHTOOL 0x8946UL
+/* A networked guest has a real eth0, but QEMU user-mode can reject its carrier
+ * query. Only an explicit opt-in supplies the ETHTOOL_GLINK result. */
+static int network_glink_ioctl(unsigned long request, void *arg, int *result) {
+    const char *value=getenv("SP16_NET_GLINK");
+    if (!value || (strcmp(value,"0") && strcmp(value,"1")) ||
+        request!=SP16_SIOCETHTOOL || !arg) return 0;
+    struct ifreq *ifr=arg;
+    if (strncmp(ifr->ifr_name,"eth0",IFNAMSIZ)) return 0;
+    if (!ifr->ifr_data) { errno=EFAULT; *result=-1; return 1; }
+    uint32_t *ethtool=(uint32_t *)ifr->ifr_data;
+    if (ethtool[0]!=10) return 0; /* ETHTOOL_GLINK only */
+    ethtool[1]=value[0]=='1' ? 1U : 0U;
+    static int logged;
+    if (!__atomic_exchange_n(&logged,1,__ATOMIC_RELAXED))
+        fprintf(stderr,"[sp16-ui-stub] network eth0 GLINK=%u\n",ethtool[1]);
+    *result=0;
+    return 1;
+}
+
+static int network_arp_enabled(void) {
+    const char *value=getenv("SP16_NET_ARP");
+    return value && !strcmp(value,"1");
+}
+
+static int network_diag_enabled(void) {
+    const char *value=getenv("SP16_NET_DIAG");
+    return value && !strcmp(value,"1");
+}
+
+static int network_diag_port(const struct sockaddr *address, socklen_t length) {
+    if (!address || length<sizeof(struct sockaddr_in) || address->sa_family!=AF_INET) return 0;
+    unsigned port=ntohs(((const struct sockaddr_in *)address)->sin_port);
+    return port>=50000 && port<=50002 ? (int)port : 0;
+}
+
 static int fake_eth0_enabled(void) {
     static int enabled=-1;
     if (enabled<0) { const char *v=getenv("SP16_FAKE_ETH0"); enabled = v && !strcmp(v,"1"); }
@@ -522,8 +919,23 @@ int ioctl(int fd, unsigned long request, ...) {
     struct state *s = device(fd);
     if (!s) {
         int fake_result;
+        if (network_glink_ioctl(request, arg, &fake_result)) return fake_result;
         if (fake_eth0_ioctl(request, arg, &fake_result)) return fake_result;
-        return original_ioctl(fd, request, arg);
+        int result=original_ioctl(fd, request, arg);
+        int saved_errno=errno;
+        if (network_diag_enabled() && (request==SP16_SIOCGIFADDR || request==SP16_SIOCGIFNETMASK)) {
+            int nonzero=0;
+            if (result==0 && arg) {
+                const struct ifreq *ifr=arg;
+                const struct sockaddr_in *in=(const struct sockaddr_in *)&ifr->ifr_addr;
+                nonzero=in->sin_family==AF_INET && in->sin_addr.s_addr!=0;
+            }
+            fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG ioctl request=0x%lx result=%d errno=%d %s=%d\n",
+                    request,result,result<0?saved_errno:0,
+                    request==SP16_SIOCGIFADDR?"address_nonzero":"mask_nonzero",nonzero);
+        }
+        errno=saved_errno;
+        return result;
     }
     int result = device_ioctl(s, fd, request, arg);
     if (result==0) note_ioctl(request, s->kind);
@@ -531,7 +943,122 @@ int ioctl(int fd, unsigned long request, ...) {
 }
 
 static int device_ioctl(struct state *s, int fd, unsigned long request, void *arg) {
-    if (s->kind==BACKLIGHT && request==0x40047000UL) return arg?0:(errno=EFAULT,-1);
+    if (s->kind==SEQUENCER) {
+        static unsigned long seq_seen[32];
+        static unsigned seq_count;
+        int known=0;
+        for (unsigned i=0;i<seq_count;i++) if (seq_seen[i]==request) known=1;
+        if (!known && seq_count<32) {
+            seq_seen[seq_count++]=request;
+            fprintf(stderr,"[sp16-ui-stub] MIDI seq ioctl request=0x%lx\n",request);
+        }
+        if (!arg) { errno=EFAULT; return -1; }
+        if (request==SNDRV_SEQ_IOCTL_PVERSION) { *(int *)arg=SNDRV_SEQ_VERSION; return 0; }
+        if (request==SNDRV_SEQ_IOCTL_CLIENT_ID) { *(int *)arg=(int)s->offset; return 0; }
+        if (request==SNDRV_SEQ_IOCTL_RUNNING_MODE) {
+            struct snd_seq_running_info *info=arg;
+            info->client=(uint8_t)s->offset; info->big_endian=0; info->cpu_mode=4;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_SYSTEM_INFO) {
+            struct snd_seq_system_info *info=arg;
+            memset(info,0,sizeof *info);
+            info->queues=32; info->clients=256; info->ports=32; info->channels=16;
+            info->cur_clients=3;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_QUERY_NEXT_CLIENT) {
+            struct snd_seq_client_info *info=arg;
+            int after=info->client;
+            if (after>=129 || (after>=128 && !usb_midi_enabled())) { errno=ENOENT; return -1; }
+            int peer=after<128?128:129;
+            memset(info,0,sizeof *info);
+            info->client=peer; info->type=KERNEL_CLIENT;
+            strcpy(info->name,peer==128?"snd-din-midi":"g_midi"); info->num_ports=1;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_QUERY_NEXT_PORT) {
+            struct snd_seq_port_info *info=arg;
+            int peer=info->addr.client;
+            if ((peer!=128 && peer!=129) || (peer==129 && !usb_midi_enabled()) ||
+                info->addr.port!=255) { errno=ENOENT; return -1; }
+            memset(info,0,sizeof *info);
+            info->addr.client=(uint8_t)peer; info->addr.port=0;
+            strcpy(info->name,peer==128?"DIN MIDI":"USB MIDI Gadget");
+            info->capability=SNDRV_SEQ_PORT_CAP_READ|SNDRV_SEQ_PORT_CAP_WRITE|
+                SNDRV_SEQ_PORT_CAP_SUBS_READ|SNDRV_SEQ_PORT_CAP_SUBS_WRITE;
+            info->type=SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC|SNDRV_SEQ_PORT_TYPE_HARDWARE;
+            info->midi_channels=16;
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_GET_CLIENT_INFO) {
+            struct snd_seq_client_info *info=arg;
+            if ((info->client!=128 && info->client!=129 && info->client!=(int)s->offset) ||
+                (info->client==129 && !usb_midi_enabled())) { errno=ENOENT; return -1; }
+            int client=info->client;
+            memset(info,0,sizeof *info);
+            info->client=client; info->type=client==128 || client==129?KERNEL_CLIENT:USER_CLIENT;
+            strcpy(info->name,client==128?"snd-din-midi":client==129?"g_midi":"SP-16 MIDI");
+            info->num_ports=client==128 || client==129?1:__builtin_popcount((unsigned)s->bits);
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_SET_CLIENT_INFO) return 0;
+        if (request==SNDRV_SEQ_IOCTL_CREATE_PORT) {
+            struct snd_seq_port_info *info=arg;
+            unsigned port=0;
+            while (port<16 && (s->bits&(1u<<port))) port++;
+            if (port==16) { errno=ENOSPC; return -1; }
+            /* The kernel assigns both address fields. ALSA passes an unset
+             * client address when creating a simple port. */
+            info->addr.client=(uint8_t)s->offset;
+            info->addr.port=(uint8_t)port;
+            s->bits|=(uint16_t)(1u<<port);
+            fprintf(stderr,"[sp16-ui-stub] MIDI seq client=%u port=%u name=%s caps=0x%x\n",
+                    s->offset,info->addr.port,info->name,info->capability);
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_DELETE_PORT) {
+            struct snd_seq_port_info *info=arg;
+            unsigned port=info->addr.port;
+            if (info->addr.client!=(uint8_t)s->offset || port>=16 || !(s->bits&(1u<<port))) {
+                errno=ENOENT; return -1;
+            }
+            uint8_t command[3]={'D',(uint8_t)s->offset,(uint8_t)port};
+            if (send(fd,command,sizeof command,MSG_NOSIGNAL)!=sizeof command) return -1;
+            s->bits&=(uint16_t)~(1u<<port);
+            fprintf(stderr,"[sp16-ui-stub] MIDI seq delete client=%u port=%u\n",s->offset,port);
+            return 0;
+        }
+        if (request==SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT || request==SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT) {
+            struct snd_seq_port_subscribe *sub=arg;
+            int peer_in=(sub->sender.client==128 || sub->sender.client==129) && sub->sender.port==0 &&
+                sub->dest.client==s->offset && sub->dest.port<16 && (s->bits&(1u<<sub->dest.port));
+            int peer_out=(sub->dest.client==128 || sub->dest.client==129) && sub->dest.port==0 &&
+                sub->sender.client==s->offset && sub->sender.port<16 && (s->bits&(1u<<sub->sender.port));
+            if (!peer_in && !peer_out) { errno=EINVAL; return -1; }
+            int usb=peer_in?sub->sender.client==129:sub->dest.client==129;
+            if (usb && !usb_midi_enabled()) { errno=ENODEV; return -1; }
+            uint8_t command[3]={peer_in?(usb?'U':'I'):(usb?'V':'O'),(uint8_t)s->offset,
+                                peer_in?sub->dest.port:sub->sender.port};
+            if (request==SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT) command[0]=(uint8_t)(command[0]+('a'-'A'));
+            if (send(fd,command,sizeof command,MSG_NOSIGNAL)!=sizeof command) return -1;
+            fprintf(stderr,"[sp16-ui-stub] MIDI seq %s %u:%u -> %u:%u\n",
+                    request==SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT?"subscribe":"unsubscribe",
+                    sub->sender.client,sub->sender.port,sub->dest.client,sub->dest.port);
+            return 0;
+        }
+        errno=ENOTTY; return -1;
+    }
+    if (s->kind==BACKLIGHT && request==0x40047000UL) {
+        if (!arg) { errno=EFAULT; return -1; }
+        uint32_t level=*(const uint32_t *)arg;
+        static uint32_t last_level=UINT32_MAX;
+        if (level!=last_level) {
+            last_level=level;
+            fprintf(stderr,"[sp16-ui-stub] backlight level=%u\n",level);
+        }
+        return 0;
+    }
     if (s->kind==MIDI) {
         /* A UART line setting has no meaning on the cable: TCGETS reports a zeroed kernel termios (36 bytes on
          * ARM), the TCSETS family and TCFLSH are accepted, FIONREAD is answered by the socket. */
@@ -541,6 +1068,11 @@ static int device_ioctl(struct state *s, int fd, unsigned long request, void *ar
         if (request==0x5402UL || request==0x5403UL || request==0x5404UL || request==0x540bUL) return 0;
         fprintf(stderr, "[sp16-ui-stub] unsupported ioctl fd=%d request=0x%lx\n", fd, request);
         errno=ENOTTY; return -1;
+    }
+    if (s->kind==MIDI_CONTROL) {
+        if (request!=0x40047000UL) { errno=ENOTTY; return -1; }
+        if (!arg) { errno=EFAULT; return -1; }
+        return din_control_request(*(const uint32_t *)arg);
     }
     if (s->kind!=PANEL && s->kind!=CDC && s->kind!=DAC) { errno=ENOTTY; return -1; }
     if (!arg) { errno=EFAULT; return -1; }
@@ -637,7 +1169,8 @@ static const char *access_label(int access) {
 }
 int snd_pcm_open(snd_pcm_t **handle, const char *name, int stream, int mode) {
     int (*real)(snd_pcm_t **,const char *,int,int)=dlsym(RTLD_NEXT,"snd_pcm_open");
-    int matched=!strcmp(name,"hw:ak4452audio,0") || !strcmp(name,"hw:ak4452audio,1") || !strcmp(name,"hw:ak4458audio,0");
+    int matched=!strcmp(name,"hw:ak4452audio,0") || !strcmp(name,"hw:ak4452audio,1") ||
+                !strncmp(name,"hw:ak4458audio,",15);
     int result=real(handle,matched?"null":name,stream,mode);
     if (matched) {
         fprintf(stderr,"[sp16-ui-stub] PCM %s -> null stream=%d result=%d\n",name,stream,result);
@@ -663,14 +1196,19 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *handle,snd_pcm_hw_params_t *params,i
                                       s->name,access,access_label(access),result);
     return result;
 }
-/* The AK4452 codec driver of the SP-16 kernel declares S16_LE, S24_LE and S20_3LE only (its DAI stream tables); the
+/* The AK4458 master codec advertises S16_LE only. The AK4452 codec driver declares S16_LE, S24_LE and S20_3LE
+ * (its DAI stream tables); the
  * null plugin also takes FLOAT_LE, which the app's format search tries first, so without a restriction the board
  * streams run a sample path the unit never runs. The shim therefore refuses the formats the codec lacks by default, so
- * the app settles on S24_LE as on the unit. SP16_PCM_ANY_FORMAT=1 (research) restores the null plugin's answer. */
+ * the app settles on S24_LE as on the unit. S20_3LE (three packed bytes) is refused too: the board model's sample
+ * path (bm_width/bm_get/bm_put) carries only 2- and 4-byte layouts, so a 3-byte layout would leave the loop and input
+ * buffers untouched. SP16_PCM_ANY_FORMAT=1 (research) restores the null plugin's answer. */
 static int codec_refuses(const struct pcm_state *s,int format) {
     const char *any=getenv("SP16_PCM_ANY_FORMAT");
-    if (!s || (any && !strcmp(any,"1")) || strncmp(s->name,"hw:ak4452audio,",15)) return 0;
-    return format!=2 && format!=6 && format!=36;
+    if (!s || (any && !strcmp(any,"1"))) return 0;
+    if (!strncmp(s->name,"hw:ak4458audio,",15)) return format!=2;
+    if (!strncmp(s->name,"hw:ak4452audio,",15)) return format!=2 && format!=6;
+    return 0;
 }
 /* The codec master clock is 1024 x 44.1 kHz and has no other setting (service manual clock tree), so every board PCM
  * accepts 44100 Hz only. set_rate refuses anything else as a driver restricted to one rate would; set_rate_near
@@ -895,8 +1433,7 @@ static void ax_init(struct pcm_state *s,unsigned channels,int format) {
     unsigned width=tap_width(format);
     if (id>=AX_STREAMS || !width || width*channels>32) return;
     struct ax_ring *r=&ax_rings[id];
-    unsigned first=0, count=channels;
-    if (id==0 && channels==16) { first=12; count=4; } /* ch12/14 carry the metronome and samples; ch13/15 are not audio-like */
+    unsigned first=0, count=channels;   /* by default the whole stream travels, so the host output monitor can pick any pair */
     const char *env=id==0?getenv("SP16_PCM_PORT_CHANNELS"):NULL; /* research override "first:count" */
     char from_share[32];
     if (id==0 && !env && original_open && original_read) { /* the same override from the developer share, for a build whose environment is fixed */
@@ -1024,7 +1561,7 @@ static void *ax_forwarder(void *unused) {
  *  - The filter is an insert loop: the "Send & Return" playback (send DAC) goes through an analog low-pass (CUTOFF,
  *    RESONANCE pots, never seen by any MCU) and a high-pass whose cutoff is a control voltage from a DAC7811 on
  *    /dev/dac_spi4.0, and comes back on the "Send & Return" capture (return ADC). Here the send frames are queued and
- *    returned one period later through a two-pole low-pass and a two-pole high-pass.
+ *    drained by the return capture through a two-pole low-pass and a two-pole high-pass.
  *  - MAIN OUT is an analog volume after the master DAC (its pot position also reaches the firmware as an ADC word),
  *    INPUT LEVEL an analog gain before the input ADC (no MCU sees it).
  * Host-only state (MAIN OUT gain, INPUT LEVEL, CUTOFF, RESONANCE, a test tone on the input) comes from the bridge
@@ -1058,7 +1595,8 @@ static float bm_log2(float x) { /* log2 for x > 0, error < 1e-4: exponent from t
     return (float)e+2.8853901f*t*(1+t2/3*(1+t2*3/5*(1+t2*5/7)));
 }
 /* Level scale (grade I, not measured on a unit): the converters' full scale is the rated maximum level of the jacks,
- * +16 dBu (input and output). The dBu readouts in the metrics are dBFS + 16. */
+ * +16 dBu (input and output). The dBu readouts in the metrics are peak-equivalent (dBFS + 16 from the peak level);
+ * dBu proper is an RMS unit, so the fields are named *_dbu_peak to keep peak and RMS distinct. */
 #define FS_DBU 16.0f
 static float to_dbu(float peak) { return peak>1e-6f?FS_DBU+6.0205999f*bm_log2(peak):-99.0f; }
 
@@ -1165,8 +1703,9 @@ static float svf_run(struct svf *f,unsigned c,float x,int high) {
     return high?x-f->k*v1-v2:v2;
 }
 
-/* The loop: the send playback is queued as stereo float; the return capture takes it one period later. A capture
- * that finds the queue empty returns silence (counted), a full queue drops the newest send frames (counted). */
+/* The loop: the send playback is queued as stereo float and the return capture drains it on demand (a FIFO, no fixed
+ * one-period delay). A capture that finds the queue empty returns silence (counted), a full queue drops the newest
+ * send frames (counted). */
 #define LOOP_FRAMES 8192u
 static float loop_buf[LOOP_FRAMES][2];
 static uint32_t loop_head, loop_tail;
@@ -1391,7 +1930,7 @@ static void meter_report(uint64_t now,int force) {
     static const char *const names[]={"off","tone","wav"};
     float in=meter_in_peak, out=meter_out_peak;
     meter_report_ns=now; meter_limiter_logged=lim;
-    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu=%.1f out_peak=%.4f out_dbu=%.1f limited=%lu "
+    fprintf(stderr,"[sp16-ui-stub] analog levels limiter=%d in_peak=%.4f in_dbu_peak=%.1f out_peak=%.4f out_dbu_peak=%.1f limited=%lu "
             "main_out_gain=%.4f input_gain=%.4f source=%s\n",lim,(double)in,(double)to_dbu(in),(double)out,(double)to_dbu(out),
             meter_limited,(double)a.main_gain,(double)a.input_gain,names[meter_source]);
     meter_in_peak=meter_out_peak=0; meter_limited=0;
@@ -1543,7 +2082,27 @@ static int sync_allowed(const char *path,char *const argv[]) {
     }
     return 0;
 }
+static int usb_mode_request(const char *path,char *const argv[]) {
+    if (!path || !argv || !argv[0] || !argv[1] || !argv[2] || argv[3] || strcmp(argv[1],"-c")) return -1;
+    if (strcmp(path,"/bin/sh") && strcmp(path,"sh")) return -1;
+    if (!strcmp(argv[2],"/root/pdj/usb_gadget.sh mass_storage probe")) return 0;
+    if (!strcmp(argv[2],"/root/pdj/usb_gadget.sh midi probe")) return 1;
+    return -1;
+}
 static int exec_policy(const char *path,char *const argv[],int complete) {
+    int usb_mode=complete && getpid()!=owner_pid ? usb_mode_request(path,argv) : -1;
+    if (usb_mode>=0) {
+        const char *mode_path=getenv("SP16_USB_MIDI_MODE_PATH");
+        if (!mode_path) mode_path="/dev/sp16-usb-midi-enabled";
+        int result=0;
+        if (usb_mode) {
+            int fd=original_open(mode_path,O_CREAT|O_WRONLY|O_CLOEXEC,0600);
+            if (fd<0) result=1;
+            else original_close(fd);
+        } else if (unlink(mode_path)<0 && errno!=ENOENT) result=1;
+        fprintf(stderr,"[sp16-ui-stub] USB MIDI mode=%s result=%d\n",usb_mode?"midi":"mass-storage",result);
+        _exit(result);
+    }
     if (complete && getpid()!=owner_pid && sync_allowed(path,argv)) {
         fprintf(stderr,"[sp16-ui-stub] allowed sync no-op exec: %.120s\n",path);
         sync();
@@ -1581,7 +2140,7 @@ int poll(struct pollfd *fds,nfds_t count,int timeout) {
 
 int socket(int domain,int type,int protocol) {
     int (*real)(int,int,int)=dlsym(RTLD_NEXT,"socket");
-    if (domain==AF_PACKET && (type&0xf)==SOCK_DGRAM && protocol==1544) {
+    if (domain==AF_PACKET && (type&0xf)==SOCK_DGRAM && protocol==1544 && !network_arp_enabled()) {
         int fd=idle_socket(PACKET);
         fprintf(stderr,"[sp16-ui-stub] ARP socket -> isolated idle fd=%d\n",fd);
         return fd;
@@ -1592,11 +2151,36 @@ int bind(int fd,const struct sockaddr *address,socklen_t length) {
     int (*real)(int,const struct sockaddr *,socklen_t)=dlsym(RTLD_NEXT,"bind");
     struct state *s=device(fd);
     if (s && s->kind==PACKET && address && address->sa_family==AF_PACKET) return 0;
-    return real(fd,address,length);
+    int result=real(fd,address,length);
+    int saved_errno=errno;
+    int port=network_diag_port(address,length);
+    if (network_diag_enabled() && port)
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG bind fd=%d port=%d result=%d errno=%d\n",
+                fd,port,result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
+}
+int setsockopt(int fd,int level,int option,const void *value,socklen_t length) {
+    int (*real)(int,int,int,const void *,socklen_t)=dlsym(RTLD_NEXT,"setsockopt");
+    int result=real(fd,level,option,value,length);
+    int saved_errno=errno;
+    if (network_diag_enabled() && level==SOL_SOCKET && (option==SO_REUSEADDR || option==SO_BROADCAST))
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG setsockopt fd=%d option=%s result=%d errno=%d\n",
+                fd,option==SO_REUSEADDR?"SO_REUSEADDR":"SO_BROADCAST",
+                result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
 }
 ssize_t sendto(int fd,const void *buffer,size_t length,int flags,const struct sockaddr *address,socklen_t address_length) {
     ssize_t (*real)(int,const void *,size_t,int,const struct sockaddr *,socklen_t)=dlsym(RTLD_NEXT,"sendto");
     struct state *s=device(fd);
     if (s && s->kind==PACKET) return (ssize_t)length; /* discarded; never sent on a network */
-    return real(fd,buffer,length,flags,address,address_length);
+    ssize_t result=real(fd,buffer,length,flags,address,address_length);
+    int saved_errno=errno;
+    int port=network_diag_port(address,address_length);
+    if (network_diag_enabled() && port)
+        fprintf(stderr,"[sp16-ui-stub] SP16_NET_DIAG sendto fd=%d port=%d bytes=%zu result=%zd errno=%d\n",
+                fd,port,length,result,result<0?saved_errno:0);
+    errno=saved_errno;
+    return result;
 }

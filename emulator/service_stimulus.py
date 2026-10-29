@@ -6,9 +6,10 @@ knobs at the top).
     python3 emulator/service_stimulus.py --build NAME [--dbv -10] [--dry-run]
 
 The level is turned into the host tone slot with the converter scale of analog_laws.py (full scale = +16 dBu, grade I)
-and sent with `./sp16 ctl event`. Then read metrics.json (guest.board.analog_levels: in_dbu, out_dbu, limiter_active)
-to compare against the manual's check points. The scale is an assumption until measured on a unit. The input meter sits
-after INPUT LEVEL (and before the limiter), so with the knob at the top (+12 dB) in_dbu reads 12 dB above the tone's own
+and sent with `./sp16 ctl event`. Then read metrics.json (guest.board.analog_levels: in_dbu_peak, out_dbu_peak,
+limiter_active) to compare against the manual's check points. The dBu fields are peak-equivalent (dBFS + 16 from the peak
+level, grade I; dBu proper is RMS). The input meter sits
+after INPUT LEVEL (and before the limiter), so with the knob at the top (+12 dB) in_dbu_peak reads 12 dB above the tone's own
 level; expected_in_dbu() gives the figure to expect.
 """
 import argparse
@@ -43,8 +44,9 @@ def events(dbv):
 
 
 def expected_in_dbu(dbv, input_level_slot=INPUT_LEVEL_SLOT):
-    """What guest.board.analog_levels.in_dbu should read for this stimulus. The shim meters the input after INPUT LEVEL and
-    before the limiter, at the tone level the slot really gives (the slot rounds the level to 0.06 dB)."""
+    """What guest.board.analog_levels.in_dbu_peak should read for this stimulus (peak-equivalent dBu). The shim meters the
+    input after INPUT LEVEL and before the limiter, at the tone level the slot really gives (the slot rounds the level to
+    0.06 dB)."""
     tone_dbfs = -60 + 60 * tone_slot(dbv_to_dbfs(dbv)) / laws.SLOT_MAX
     return tone_dbfs + 20 * math.log10(laws.input_level_gain(input_level_slot)) + laws.FULL_SCALE_DBU
 
@@ -63,7 +65,7 @@ def main(argv=None):
             return 1
     gain_db = 20 * math.log10(laws.input_level_gain(INPUT_LEVEL_SLOT))
     print(f"input {args.dbv:+.1f} dBV = {dbv_to_dbfs(args.dbv):+.1f} dBFS (assumed scale). The meter sits after INPUT LEVEL "
-          f"({gain_db:+.1f} dB here), so expect in_dbu near {expected_in_dbu(args.dbv):+.1f}")
+          f"({gain_db:+.1f} dB here), so expect in_dbu_peak near {expected_in_dbu(args.dbv):+.1f}")
     return 0
 
 

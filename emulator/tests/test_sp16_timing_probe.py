@@ -104,6 +104,106 @@ class OnsetTests(unittest.TestCase):
             self.assertEqual(list(np.round(ch2 * 32768).astype(int)), [2 * f for f in range(10, 20)])
 
 
+class FollowPhaseTests(unittest.TestCase):
+    def master_beats(self, bpm=120.0, n_beats=64):
+        beat_ns = int(60 / bpm * 1e9)
+        return [(j * beat_ns, (j % 4) + 1) for j in range(n_beats)]
+
+    def test_aligned_playback_from_step_3_has_zero_step_phase(self):
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)      # 500 ms
+        step_ns = beat_ns // 4             # 125 ms
+        step = step_ns / 1e9 * probe.RATE  # samples per step (5512.5)
+        onsets = [i * step for i in range(40)]
+        window_t0_ns = 2 * step_ns         # the window opens at step 3, two steps after a downbeat
+        report = probe.follow_phase(onsets, self.master_beats(bpm), window_t0_ns, bpm)
+        self.assertAlmostEqual(report["step_phase_median_ms"], 0.0, delta=0.1)
+        self.assertAlmostEqual(report["step_phase_max_ms"], 0.0, delta=0.1)
+        self.assertEqual(report["onsets"], 40)
+        self.assertNotIn("downbeats", report)  # no downbeat delay is claimed
+
+    def test_a_real_phase_error_is_still_measured(self):
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step_ns = beat_ns // 4
+        step = step_ns / 1e9 * probe.RATE
+        onsets = [i * step for i in range(40)]
+        # The follower is a quarter step late: the window opens at step 1 but one quarter step after the downbeat.
+        report = probe.follow_phase(onsets, self.master_beats(bpm), step_ns // 4, bpm)
+        self.assertAlmostEqual(report["step_phase_median_ms"], (step_ns // 4) / 1e6, delta=0.1)
+
+    def test_a_follower_a_whole_step_late_reads_zero_step_phase(self):
+        # At 120 BPM a step is 125 ms. A follower delayed a full step lands its clicks exactly on the master's steps,
+        # so the residual modulo one step is 0; the report must not present that as a downbeat delay.
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step_ns = beat_ns // 4
+        step = step_ns / 1e9 * probe.RATE
+        onsets = [i * step for i in range(40)]
+        report = probe.follow_phase(onsets, self.master_beats(bpm), step_ns, bpm)  # one step after the downbeat
+        self.assertAlmostEqual(report["step_phase_median_ms"], 0.0, delta=0.1)
+        self.assertNotIn("downbeats", report)
+        self.assertNotIn("phase_median_ms", report)  # the downbeat-phase name is gone
+
+    def test_a_master_log_without_a_downbeat_is_insufficient_data(self):
+        # Sol's input: two master beats numbered 2 and 3 (no beat_in_bar 1) and 16 onsets, with the window covering
+        # where beat 1 would fall. The measurement cannot locate the step grid, so it is a structured result, not a
+        # min() over an empty downbeat list.
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step = beat_ns // 4 / 1e9 * probe.RATE
+        onsets = [i * step for i in range(16)]
+        beats = [(0, 2), (beat_ns, 3)]
+        report = probe.follow_phase(onsets, beats, -1000_000_000, bpm)
+        self.assertEqual(report, {"error": "no downbeat in master log"})
+
+
+class DownbeatErrorTests(unittest.TestCase):
+    def master(self, bpm=120.0, n_bars=16):
+        """Master beats in seconds: (t, beat_in_bar) over `n_bars` bars at `bpm`."""
+        beat = 60.0 / bpm
+        return [(bar * 4 * beat + i * beat, i + 1) for bar in range(n_bars) for i in range(4)]
+
+    def step0(self, beats, shift=0.0):
+        """Synthetic playhead changes: step 0 at each bar start, shifted by `shift` seconds."""
+        return [(t + shift, 0) for t, b in beats if b == 1]
+
+    def test_aligned_bars_have_zero_downbeat_error(self):
+        beats = self.master()
+        report = probe.downbeat_error(self.step0(beats), beats)
+        self.assertAlmostEqual(report["median"], 0.0, delta=0.001)
+        self.assertAlmostEqual(report["max"], 0.0, delta=0.001)
+        self.assertEqual(report["n"], 16)
+
+    def test_a_constant_late_offset_is_reported_in_ms(self):
+        beats = self.master()
+        report = probe.downbeat_error(self.step0(beats, shift=0.495), beats)
+        self.assertAlmostEqual(report["median"], 495.0, delta=0.5)
+        self.assertAlmostEqual(report["max"], 495.0, delta=0.5)
+        self.assertEqual(report["n"], 16)
+
+    def test_an_early_offset_is_signed_negative(self):
+        beats = self.master()
+        report = probe.downbeat_error(self.step0(beats, shift=-0.010), beats)
+        self.assertAlmostEqual(report["median"], -10.0, delta=0.5)
+
+    def test_a_follower_a_whole_bar_late_reads_zero(self):
+        beats = self.master(n_bars=17)  # one extra bar so the last step-0 still has a downbeat ahead of it
+        bar = 4 * 60.0 / 120.0
+        report = probe.downbeat_error(self.step0([b for b in beats if b[1] == 1][:16], shift=bar), beats)
+        self.assertAlmostEqual(report["median"], 0.0, delta=0.001)
+        self.assertAlmostEqual(report["max"], 0.0, delta=0.001)
+
+    def test_only_step0_changes_are_measured(self):
+        beats = self.master()
+        report = probe.downbeat_error([(t + 0.1, 3) for t, _ in beats], beats)
+        self.assertEqual(report, {"error": "no playhead step-0 entries in the window"})
+
+    def test_too_few_downbeats_is_insufficient_data(self):
+        self.assertEqual(probe.downbeat_error([(0.0, 0)], [(0.0, 1)]),
+                         {"error": "too few downbeats in master log"})
+
+
 class TxTests(unittest.TestCase):
     def test_steady_frames_have_no_stalls(self):
         report = probe.tx_stalls([i * 0.015 for i in range(1000)])
@@ -156,6 +256,38 @@ class TxTests(unittest.TestCase):
         self.assertEqual(probe.verdict(at_limit)["tx_stall_max_below_40ms"], False)
         self.assertEqual(probe.verdict(under)["onset_sigma_below_1ms"], True)
         self.assertEqual(probe.verdict(under)["tx_stall_max_below_40ms"], True)
+
+    def test_a_stall_only_the_bridge_saw_sits_at_or_before_its_receive(self):
+        report = {"tx": {"stalls_over_limit": 0}, "link": {"gaps_over_limit": 1, "gap_max_ms": 76.5}}
+        self.assertEqual(probe.stall_hop(report), "guest-to-bridge")
+
+    def test_a_stall_only_the_app_logged_sits_after_the_bridge(self):
+        report = {"tx": {"stalls_over_limit": 1}, "link": {"gaps_over_limit": 0, "gap_max_ms": None}}
+        self.assertEqual(probe.stall_hop(report), "bridge-to-app")
+
+    def test_a_window_with_both_kinds_is_mixed_not_wholly_upstream(self):
+        """A stall the bridge saw does not account for one it did not, so the window is not entirely guest-to-bridge."""
+        report = {"tx": {"stalls_over_limit": 2}, "link": {"gaps_over_limit": 1, "gap_max_ms": 76.5}}
+        self.assertEqual(probe.stall_hop(report), "mixed")
+
+    def test_a_clean_window_says_none_and_a_blind_one_says_nothing(self):
+        self.assertEqual(probe.stall_hop({"tx": {"stalls_over_limit": 0}, "link": {"gaps_over_limit": 0}}), "none")
+        self.assertIsNone(probe.stall_hop({"tx": {"error": "too few frames"}, "link": {"gaps_over_limit": 0}}))
+        self.assertIsNone(probe.stall_hop({"tx": {"stalls_over_limit": 2}, "link": None}))
+
+    def test_the_link_window_takes_counter_differences_and_a_growing_maximum(self):
+        before = {"tx_recv": 4000, "tx_gaps_over_40ms": 2, "tx_gap_max_ms": 50.0, "lock_wait_max_ms": 3.0,
+                  "frame_write_max_ms": 9.0, "outbox_dropped": 0}
+        after = {"tx_recv": 4100, "tx_gaps_over_40ms": 3, "tx_gap_max_ms": 76.5, "lock_wait_max_ms": 3.0,
+                 "frame_write_max_ms": 9.0, "outbox_dropped": 0}
+        window = probe.link_window(before, after)
+        self.assertEqual(window["tx_recv"], 100)
+        self.assertEqual(window["gaps_over_limit"], 1)
+        self.assertEqual(window["gap_max_ms"], 76.5)          # it grew, so this is the window's own maximum
+        self.assertEqual(window["gap_max_ms_at_session_start"], 50.0)
+        self.assertIsNone(probe.link_window(before, {**after, "tx_gap_max_ms": 50.0})["gap_max_ms"])
+        self.assertIsNone(probe.link_window(None, after))
+        self.assertEqual(probe.link_window(before, {**after, "tx_recv": 4100})["tx_recv"], 100)
 
     def test_a_lost_frame_makes_the_window_unclean_whichever_counter_shows_it(self):
         base = {"jitter_sigma_ms": 0.0}
@@ -212,7 +344,7 @@ class LinkTimingTests(unittest.TestCase):
         link.arrival(0.0); link.write(1_536_000, 0.1, 0.1); link.report(5.0)
         for line in ("[sp16-ui-stub] dac hpf word=0x1abc ctrl=1 code=2748 writes=7",
                      "[sp16-ui-stub] filter loop send_peak=0.5000 return_peak=0.2500 frames=44100 underruns=0 drops=0 lp_hz=1000 hp=dac",
-                     "[sp16-ui-stub] analog levels limiter=1 in_peak=0.9770 in_dbu=15.8 out_peak=0.2500 out_dbu=4.0 limited=412 "
+                     "[sp16-ui-stub] analog levels limiter=1 in_peak=0.9770 in_dbu_peak=15.8 out_peak=0.2500 out_dbu_peak=4.0 limited=412 "
                      "main_out_gain=0.2500 input_gain=1.0000 source=wav",
                      "[sp16-ui-stub] gpio GPIO5_IO05=1 SEL_xTHRU/DSF", "[sp16-ui-stub] gpio GPIO5_IO06=1 LMT_xOFF/ON",
                      "[sp16-ui-stub] panel TX frames dropped=1048576 errno=11"):

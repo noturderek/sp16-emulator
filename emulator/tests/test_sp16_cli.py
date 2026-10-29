@@ -472,6 +472,70 @@ class OtherCommandTests(CliCase):
         with self.assertRaises(cli.CliError):
             self.argv("smoke", "--build", "plain")
 
+    def test_ctl_power_standby_pressure_and_calibrate(self):
+        """The session commands the mod and calibration lanes added are reachable from ./sp16 ctl."""
+        for command in (("power",), ("power", "0.5"), ("standby", "yes"), ("pressure", "3", "300"),
+                        ("calibrate", "3", "300")):
+            with self.subTest(command=command):
+                argv, _ = self.argv("ctl", "--runtime", "r.json", *command)
+                self.assertEqual(argv[2:], ["--runtime", "r.json", *command])
+        with self.assertRaisesRegex(cli.UsageError, "./sp16 help ctl"):
+            self.argv("ctl", "--runtime", "r.json", "powered")
+
+    def test_midi_maps_each_subcommands_options(self):
+        argv, _ = self.argv("midi", "ports")
+        self.assertEqual(argv, [PYTHON, "-m", "emulator.midi_bridge", "ports", "--build-dir", str(self.build)])
+        argv, _ = self.argv("midi", "preset", "--name", "p", "--channel", "3", "--note-base", "48",
+                            "--cc-page", "2", "--out-dir", "d")
+        self.assertEqual(argv[3:], ["preset", "--name", "p", "--channel", "3", "--note-base", "48",
+                                    "--cc-page", "2", "--out-dir", "d"])
+        argv, _ = self.argv("midi", "learn", "--in", "nano", "--name", "n", "--controls", "pad1,knob1",
+                            "--timeout", "5", "--no-leds")
+        self.assertEqual(argv[3:], ["learn", "--build-dir", str(self.build), "--in", "nano", "--name", "n",
+                                    "--controls", "pad1,knob1", "--timeout", "5", "--no-leds"])
+        argv, _ = self.argv("midi", "run", "--in", "nano", "--preset", "sp16", "--seconds", "30", "--no-leds")
+        self.assertEqual(argv[3:], ["run", "--build-dir", str(self.build), "--in", "nano", "--preset", "sp16",
+                                    "--no-leds", "--seconds", "30"])
+        argv, _ = self.argv("midi", "run", "--in", "nano", "--runtime", "r.json", "--build-dir", "elsewhere")
+        self.assertEqual(argv[3:], ["run", "--runtime", "r.json", "--build-dir", "elsewhere", "--in", "nano"])
+
+    def test_midi_runs_the_bridge_from_the_repository_root(self):
+        """`python3 -m emulator.midi_bridge` needs the repository on PYTHONPATH whatever the caller's directory."""
+        run = cli.BY_NAME["midi"]
+        plan = run.handler(self.ctx, run.parser().parse_args(["ports"]), [])
+        self.assertEqual(plan.steps[0].env["PYTHONPATH"].split(os.pathsep)[0], str(self.root))
+
+    def test_midi_refuses_options_a_subcommand_does_not_have(self):
+        with self.assertRaisesRegex(cli.UsageError, "ports: --in is not an option"):
+            self.argv("midi", "ports", "--in", "nano")
+        with self.assertRaisesRegex(cli.UsageError, "preset: --build-dir is not an option"):
+            self.argv("midi", "preset", "--name", "p", "--build-dir", "x")
+        with self.assertRaisesRegex(cli.UsageError, "midi learn: --in is required"):
+            self.argv("midi", "learn", "--name", "n")
+        with self.assertRaisesRegex(cli.UsageError, "midi run: --in is required"):
+            self.argv("midi", "run")
+        with self.assertRaisesRegex(cli.UsageError, "./sp16 help midi"):
+            self.argv("midi", "play")
+
+    def test_hwsuite_extra_tier_and_testmode_build(self):
+        library = self.make_library(self.build / "library")
+        self.make_build("sp16-dev", research=True, audio="file", library=library)
+        testmode = self.make_build("sp16-dev-testmode", research=True, audio="file", library=library)
+        argv, notes = self.argv("hwsuite", "--tier", "extra")
+        self.assertEqual(argv[argv.index("--testmode-build") + 1], str(testmode))     # the build next to it
+        self.assertEqual(argv[-2:], ["--tier", "extra"])
+        self.assertFalse(any("testmode" in note for note in notes))
+        shutil.rmtree(testmode)
+        other = self.make_build("other-testmode", research=True, audio="file", library=library)
+        argv, notes = self.argv("hwsuite", "--tier", "extra", "--testmode-build", other.name)
+        self.assertEqual(argv[argv.index("--testmode-build") + 1], str(other))
+        shutil.rmtree(other)
+        argv, notes = self.argv("hwsuite", "--tier", "extra")
+        self.assertNotIn("--testmode-build", argv)
+        self.assertTrue(any("factory-test checks are N/A" in note for note in notes))
+        self.assertTrue(any("--app-arg testmode" in note for note in notes))
+        self.assertNotIn("--testmode-build", self.argv("hwsuite")[0])   # a normal run does not need one
+
     def test_coverage_measures_then_reports(self):
         run = cli.BY_NAME["test"]
         plan = run.handler(self.ctx, run.parser().parse_args(["--coverage"]), ["-k", "panel"])
@@ -707,8 +771,8 @@ class HelpTests(CliCase):
         for command in cli.COMMANDS:
             self.assertRegex(out, rf"(?m)^  {command.name}\s+\S")
         self.assertEqual(cli.main([], ctx=self.make_ctx()), 0)
-        wanted = {"help", "doctor", "build", "run", "firmware", "diagnostics", "hwsuite", "mod", "ctl", "audio",
-                  "builds", "doctor", "test", "clean", "usb", "bootstrap", "smoke"}
+        wanted = {"help", "doctor", "build", "run", "firmware", "diagnostics", "hwsuite", "mod", "ctl", "midi",
+                  "audio", "builds", "test", "clean", "usb", "bootstrap", "smoke"}
         self.assertEqual(wanted, set(cli.BY_NAME))
 
     def test_every_command_documents_every_option_and_an_example(self):
@@ -724,6 +788,21 @@ class HelpTests(CliCase):
                 for pos in command.positionals:
                     for choice in pos.choices or ():
                         self.assertIn(choice, out)
+
+    def test_the_testmode_help_lists_every_testmode_check(self):
+        """--testmode-build names the checks it serves; the list drifted once and left HW-54 out."""
+        sys.path.insert(0, str(TOOLS))
+        try:
+            import hwsuite
+        finally:
+            sys.path.pop(0)
+        code, out, _ = self.main("help", "hwsuite")
+        self.assertEqual(code, 0)
+        named = set(re.findall(r"HW-\d+", out))
+        for first, last in re.findall(r"HW-(\d+)\.\.HW-(\d+)", out):
+            named |= {f"HW-{number}" for number in range(int(first), int(last) + 1)}
+        self.assertEqual(sorted(named & set(hwsuite.TESTMODE_IDS)), sorted(hwsuite.TESTMODE_IDS))
+        self.assertEqual(named - {check.id for check in hwsuite.CHECKS}, set(), f"help names unknown checks: {named}")
 
     def test_unknown_command_suggests_a_fix(self):
         code, _, err = self.main("biuld")

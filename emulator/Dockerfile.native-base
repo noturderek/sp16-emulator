@@ -4,19 +4,19 @@
 FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends linux-image-arm64 kmod cpio gzip iproute2 \
- qemu-user-static xvfb x11-utils dosfstools python3 gcc-arm-linux-gnueabi libc6-dev-armel-cross libxtst6 \
+ qemu-user-static xvfb x11-utils dosfstools python3 gcc libc6-dev gcc-arm-linux-gnueabi libc6-dev-armel-cross libasound2-dev libxtst6 \
  dmsetup squashfs-tools xorriso \
  && rm -rf /var/lib/apt/lists/*
 # Kept modules: virtio (console, blk), VFAT/NLS (data and USB images), dm-crypt and the kernel crypto modules (import and
-# repack), ISO9660 (update payload), squashfs + overlayfs (firmware image), 9p (developer overlay), binfmt_misc (a
-# firmware's apl_start hook that runs child programs, see guest-init.sh).
+# repack), ISO9660 (update payload), squashfs + overlayfs (firmware image), 9p (developer overlay), ALSA sequencer and
+# MIDI event support, binfmt_misc (firmware apl_start child programs, see guest-init.sh).
 RUN find /lib/modules -type f -name '*.ko*' ! -path '*/drivers/virtio/*' ! -name virtio_console.ko \
- ! -name 'virtio_blk.ko*' ! -name 'binfmt_misc.ko*' ! -name 'virtio_net.ko*' ! -name 'net_failover.ko*' ! -name 'failover.ko*' ! -path '*/fs/fat/*' ! -path '*/fs/nls/*' \
+ ! -name 'virtio_blk.ko*' ! -name 'binfmt_misc.ko*' ! -name 'virtio_net.ko*' ! -name 'net_failover.ko*' ! -name 'failover.ko*' ! -path '*/sound/*' ! -path '*/fs/fat/*' ! -path '*/fs/nls/*' \
  ! -path '*/drivers/md/*' ! -path '*/drivers/dax/*' ! -path '*/drivers/cdrom/*' ! -path '*/crypto/*' ! -path '*/fs/isofs/*' ! -path '*/fs/squashfs/*' \
  ! -path '*/fs/overlayfs/*' ! -path '*/fs/9p/*' ! -path '*/net/9p/*' ! -path '*/fs/netfs/*' ! -path '*/fs/fscache/*' \
  ! -path '*/kernel/lib/*' -delete \
  && for sp16_kernel in /lib/modules/*; do sp16_kernel=${sp16_kernel##*/}; depmod "$sp16_kernel"; \
-    sp16_need='virtio_blk virtio_net vfat dm_crypt isofs squashfs overlay 9p 9pnet_virtio'; \
+    sp16_need='virtio_blk virtio_net snd_seq vfat dm_crypt isofs squashfs overlay 9p 9pnet_virtio'; \
     while set -- $sp16_need; [ $# -gt 0 ]; do sp16_module=$1; shift; sp16_need="$*"; \
       sp16_deps=$(modinfo -k "$sp16_kernel" -F depends "$sp16_module") || exit 1; \
       sp16_need="$sp16_need $(echo "$sp16_deps" | tr , ' ')"; done; done
@@ -25,6 +25,8 @@ RUN arm-linux-gnueabi-gcc -std=c11 -O2 -Wall -Wextra -fPIC -shared -nostdlib \
  -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp -fno-stack-protector \
  /opt/sp16/hardware_stub.c -Wl,--no-as-needed -l:libdl.so.2 -lgcc -o /opt/sp16/libsp16-ui.so
 COPY guest-init.sh /init
+COPY midi/seq-bridge.c /opt/sp16/seq-bridge.c
+RUN gcc -O2 -Wall -Wextra /opt/sp16/seq-bridge.c -lasound -o /opt/sp16/din-seq-bridge
 COPY guest-bridge.py /opt/sp16/guest-bridge.py
 COPY input.py /opt/sp16/input.py
 COPY enter.py /opt/sp16/enter.py

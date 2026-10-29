@@ -159,7 +159,8 @@ LAMP_NAMES = {
 LAMP_IDS = {name: lamp for lamp, name in LAMP_NAMES.items()}
 
 # E8/E10: lamp roles -> ("rgb"|"mono", channel), from the firmware profile. The service manual's LED matrix has 8
-# ribbon LEDs (Ribbon0..7), no LED on SHIFT or MODE (mono 4 drives nothing), the STBY LED on the USB STOP/WAKE UP key
+# ribbon LEDs (Ribbon0..7), no LED on SHIFT or MODE (mono 4 drives nothing, so it has no role here; the profiles list
+# it under lamp_unassigned and the channel stays decoded), the STBY LED on the USB STOP/WAKE UP key
 # (mono 24), and four LEDs M1 drives directly: ACTIVE (23), STBY (24), OVER (34) and USB CONNECT (25).
 # Evidence for the 1.60 profile: E8 buttons; E13 USB LED = mono 25 (lit while the virtual stick is mounted, blinking
 # during USB STOP hold and file writes); E14 OVER LED = mono 34 (master output peaks at or above about -0.9 dBFS,
@@ -237,6 +238,41 @@ def PAD_CURVE(velocity):
         return 0, 0
     velocity = min(127, velocity)
     return PAD_A_MIN + round((velocity - 1) * (PAD_A_MAX - PAD_A_MIN) / 126), PAD_B_CONTACT
+
+
+# The resistive LCD touch panel (research 2026-10-28-sp16-firmware-gates/03-lcd-touch.md): RX words 0x2c/0x2e are the
+# panel's X/Y, unsigned big-endian, 0..1023. There is no separate contact bit: the firmware's UITouchPanel derives
+# contact from an in-bounds, stable history (four good samples; a jump from idle can consume one more). The capacitive
+# ribbon strip is the separate CDC path (decode_strip).
+LCD_TOUCH_X_OFFSET = 0x2c
+LCD_TOUCH_Y_OFFSET = 0x2e
+# The firmware's default calibration (03-lcd-touch.md, S/2): screenX = round((940 - rawX) * 720/868) + 40,
+# screenY = round((rawY - 87) * 405/779) + 29. A screen-coordinate API inverts this; the contact rectangle's inclusive
+# raw bounds (X 45..967, Y 45..908) are what UITouchPanel tests against, and (0, 0) is always outside them.
+LCD_TOUCH_CALIBRATION = {
+    "screen": (800, 480),
+    "raw_x": (940, 72),        # (left, right)
+    "raw_y": (87, 866),        # (top, bottom)
+    "span_x": 720,
+    "span_y": 405,
+    "offset_x": 40,
+    "offset_y": 29,
+    "contact": (45, 967, 45, 908),
+}
+# The emulator's touch contract: hold an idle->point jump for at least this many frames, and never move the raw
+# point more than this many ADC units between consecutive frames (a teleport breaks the firmware's stable history).
+LCD_TOUCH_HOLD_FRAMES = 5
+LCD_TOUCH_STEP_MAX = 32
+
+
+def screen_to_touch_raw(x, y, calibration=LCD_TOUCH_CALIBRATION):
+    """800x480 LCD screen coordinates -> raw touch words (0..1023) under the loaded calibration (the inverse of the
+    firmware's mapping). Used by the panel model's screen-coordinate touch path; raw injection stays available too."""
+    left, right = calibration["raw_x"]
+    top, bottom = calibration["raw_y"]
+    raw_x = round(left - (x - calibration["offset_x"]) * (left - right) / calibration["span_x"])
+    raw_y = round(top + (y - calibration["offset_y"]) * (bottom - top) / calibration["span_y"])
+    return raw_x, raw_y
 
 
 def decode_lamps(frame):

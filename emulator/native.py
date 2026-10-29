@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 
 from prepare import private_path
@@ -28,10 +29,11 @@ QEMU_ARCHIVE_SHA256 = "a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689
 APP_NAME = "SP16 Emulator.app"
 BASE_GUEST_FILES = ("Dockerfile.native-base", "hardware_stub.c", "guest-init.sh", "guest-bridge.py", "pack-guest.sh",
                     "protocol.py", "panel.py", "panel_map.py", "input.py", "enter.py", "profiles.py", "recipes.py",
-                    "prepare.py", "guest-firmware.py", "profiles/sp16-1.60.json",
+                    "prepare.py", "guest-firmware.py", "midi/seq-bridge.c", "profiles/sp16-1.60.json",
                     "profiles/products/sp16.json")
 SWIFT_SOURCES = ("native-window.swift", "panel-view.swift", "data-image.swift", "audio-sink.swift",
-                "audio-output.swift", "firmware-library.swift", "firmware-window.swift", "app-diagnostics.swift")
+                "audio-output.swift", "firmware-library.swift", "firmware-window.swift", "app-diagnostics.swift",
+                "midi-routing.swift")
 ICON_TOOL = "make-icon.swift"
 # Vendor logo files and the old icon name. The public copy never ships them: the distribution scan (native.py
 # firmware audit) refuses their names and, if any is present, their content.
@@ -247,6 +249,11 @@ def arguments(qemu, guest, socket, trace=None, data=False, audio=None, firmware=
     # Audio transport: a dedicated virtio-serial port carrying playback frames to the host file sink.
     pcm = ["-chardev", f"socket,id=sp16pcm,path={socket}.pcm,server=on,wait=off",
            "-device", "virtserialport,chardev=sp16pcm,name=sp16.pcm"] if audio else []
+    # Full-duplex DIN MIDI UART, separate from the panel and factory-test loopback.
+    din = ["-chardev", f"socket,id=sp16din,path={socket}.midi,server=on,wait=off",
+           "-device", "virtserialport,chardev=sp16din,name=sp16.din"]
+    usb_midi = ["-chardev", f"socket,id=sp16usbmidi,path={socket}.usb-midi,server=on,wait=off",
+                "-device", "virtserialport,chardev=sp16usbmidi,name=sp16.usb-midi"]
     # Research gdb bridge (--trace gdb): a dedicated virtio-serial port so the guest can tunnel the qemu-user
     # gdbstub (127.0.0.1:1234 in the guest) out to the host, since the guest has no NIC beyond lo. The host end
     # is the unix socket {socket}.gdb; the guest-init forwarder bridges the vport to the in-guest stub, and a tiny
@@ -273,7 +280,7 @@ def arguments(qemu, guest, socket, trace=None, data=False, audio=None, firmware=
                        + (f" sp16.app={app_arg}" if app_arg else ""),
             "-device", "virtio-serial-device",
             "-chardev", f"socket,id=sp16,path={socket},server=on,wait=off",
-            "-device", "virtserialport,chardev=sp16,name=sp16.ui", *fw, *persistent, *pcm, *gdb]
+            "-device", "virtserialport,chardev=sp16,name=sp16.ui", *fw, *persistent, *pcm, *din, *usb_midi, *gdb]
 
 
 def shipped_profile(profile):
@@ -387,6 +394,10 @@ def bundle(output, qemu, guest, variant="stock", profile=None, research=False, t
     wrapper = output / NET_WRAPPER
     shutil.copy2(TOOLS / "net" / NET_WRAPPER, wrapper)
     wrapper.chmod(0o700)
+    # The mcast wrapper spawns this relay next to itself (see net/qemu-net.sh).
+    relay = output / NET_RELAY
+    shutil.copy2(TOOLS / "net" / NET_RELAY, relay)
+    relay.chmod(0o700)
     defaults = {"qemu": str(wrapper),
                 "arguments": arguments(qemu, guest, "@SOCKET@", trace, persistent, audio, True, padcal, app_arg),
                 "session": str(sessions), "socket": "@SOCKET@", "variant": variant,
@@ -534,11 +545,13 @@ def dev_overlay_path(folder):
 
 
 NET_WRAPPER = "qemu-net.sh"
+NET_RELAY = "segment_relay.py"
 NET_IFACE = re.compile(r"[a-z]{1,8}[0-9]{1,3}")
 NET_MCAST_GROUP = "230.0.0.1"
 NET_MCAST_PORT = 34567
 VMNET_DIRECTORIES = ("/opt/homebrew/var/run", "/usr/local/var/run", "/var/run")
 NET_MODES = "none, host, bridged:IF (for example bridged:en0) or mcast[:PORT]"
+NET_IP = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?")
 
 
 def vmnet_socket_path(name):
@@ -550,16 +563,37 @@ def vmnet_socket_path(name):
     return None
 
 
-def net_environment(mode):
-    """`launch --net MODE` -> the environment the QEMU wrapper reads (net/qemu-net.sh), {} for no network.
-    host and bridged:IF need the root socket_vmnet daemon to be running (the user starts it, see docs/changes/l4-network.md);
-    mcast needs nothing and links instances on this Mac only."""
+def validate_net_ip(net_ip):
+    """--net-ip: a.b.c.d or a.b.c.d/prefix, octets 0..255 and prefix 0..32; returned normalised with a /24 when bare."""
+    if net_ip is None:
+        return None
+    if not NET_IP.fullmatch(net_ip):
+        raise ValueError("--net-ip must be a.b.c.d[/prefix], e.g. 192.168.1.50/24")
+    addr, _, prefix = net_ip.partition("/")
+    if any(not octet.isdigit() or int(octet) > 255 for octet in addr.split(".")):
+        raise ValueError("--net-ip has an octet above 255")
+    if prefix and (not prefix.isdigit() or int(prefix) > 32):
+        raise ValueError("--net-ip prefix must be 0..32")
+    return addr + "/" + (prefix or "24")
+
+
+def net_environment(mode, net_ip=None):
+    """`launch --net MODE [--net-ip ADDR]` -> the environment the QEMU wrapper reads (net/qemu-net.sh), {} for no
+    network. host and bridged:IF need the root socket_vmnet daemon to be running (the user starts it, see
+    docs/changes/l4-network.md); mcast needs nothing and links instances on this Mac only. SP16_NET_MODE carries the
+    mode to the guest init (via /proc/cmdline) so a bridged run can add a real-subnet address; SP16_NET_IP is the
+    optional static address for that."""
     if mode in (None, "none"):
+        if net_ip is not None:
+            raise ValueError("--net-ip needs --net bridged:IF")
         return {}
+    net_ip = validate_net_ip(net_ip)
     if mode == "host" or mode.startswith("bridged:"):
         iface = mode.partition(":")[2]
         if mode != "host" and not NET_IFACE.fullmatch(iface):
             raise ValueError("--net bridged:IF needs an interface name such as bridged:en0")
+        if net_ip is not None and mode == "host":
+            raise ValueError("--net-ip needs --net bridged:IF (host mode has no real subnet)")
         name = "socket_vmnet" if mode == "host" else f"socket_vmnet.bridged.{iface}"
         path = vmnet_socket_path(name)
         if path is None:
@@ -568,21 +602,27 @@ def net_environment(mode):
                              "--net mcast, which needs no root and links emulators on this Mac only")
         if "," in path:
             raise ValueError("socket_vmnet path must not contain commas")
-        return {"SP16_NET_KIND": "unix", "SP16_NET_TARGET": path}
+        env = {"SP16_NET_KIND": "unix", "SP16_NET_TARGET": path, "SP16_NET_MODE": mode}
+        if net_ip is not None:
+            env["SP16_NET_IP"] = net_ip
+        return env
     if mode == "mcast" or mode.startswith("mcast:"):
         port = mode.partition(":")[2] or str(NET_MCAST_PORT)
         if not port.isdigit() or not 1024 <= int(port) <= 65535:
             raise ValueError("--net mcast:PORT needs a port from 1024 to 65535")
-        return {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": f"{NET_MCAST_GROUP}:{port}"}
+        if net_ip is not None:
+            raise ValueError("--net-ip needs --net bridged:IF")
+        return {"SP16_NET_KIND": "mcast", "SP16_NET_TARGET": f"{NET_MCAST_GROUP}:{port}", "SP16_NET_MODE": mode,
+                "SP16_PYTHON": sys.executable}
     raise ValueError(f"--net must be {NET_MODES}")
 
 
 def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overlay=None, no_ui_input=False,
-           no_audio_files=False, net=None):
+           no_audio_files=False, net=None, net_ip=None, midi=False):
     host_check()
     output = private_path(output)
     assets = validated_assets(output)
-    net_env = net_environment(net)
+    net_env = net_environment(net, net_ip)
     if net_env and not (output / NET_WRAPPER).is_file():
         raise ValueError("--net needs a build made by this version; rebuild it with ./sp16 build --rebuild")
     if dev_overlay is not None and not (assets.get("decoupled") is True and assets.get("research")):
@@ -608,8 +648,24 @@ def launch(output, ephemeral=False, usb_image=None, firmware_id=None, dev_overla
         + (["--dev-overlay", dev_overlay_path(dev_overlay)] if dev_overlay else []) \
         + (["--no-ui-input"] if no_ui_input else []) + (["--no-audio-files"] if no_audio_files else [])
     env_args = [arg for key, value in net_env.items() for arg in ("--env", f"{key}={value}")]
+    midi_since = time.time() if midi else None
     run(["open", "-n", *(["-g"] if no_ui_input else []), *env_args, assets["app_bundle"],
          *(["--args", *app_args] if app_args else [])])
+    # The app owns QEMU's lifetime; this bridge joins its DIN socket and exits when that socket closes.
+    # Keep it separate from the panel bridge's virtio port.
+    if midi and output.is_dir():
+        with (output / "din-midi.log").open("a") as midi_log:
+            subprocess.Popen([sys.executable, "-m", "midi.din", "--wait-for-session", str(output),
+                              "--since", str(midi_since), "--build-dir", str(output.parent),
+                              "--name", f"SP-16 DIN [{output.name}]"],
+                             cwd=TOOLS, stdin=subprocess.DEVNULL, stdout=midi_log, stderr=subprocess.STDOUT,
+                             start_new_session=True, close_fds=True)
+        with (output / "usb-midi.log").open("a") as midi_log:
+            subprocess.Popen([sys.executable, "-m", "midi.usb", "--wait-for-session", str(output),
+                              "--since", str(midi_since), "--build-dir", str(output.parent),
+                              "--name", f"SP-16 USB [{output.name}]"],
+                             cwd=TOOLS, stdin=subprocess.DEVNULL, stdout=midi_log, stderr=subprocess.STDOUT,
+                             start_new_session=True, close_fds=True)
     print(json.dumps({"status": "native_app_opened", "app": assets["app_bundle"], **({"net": net} if net_env else {}),
                       "diagnostics": str(output / "sessions"), "runtime_requires_docker": False}))
 
@@ -751,9 +807,17 @@ def main():
     launcher.add_argument("--net", metavar="MODE", default="none",
                           help="guest network (Pro DJ Link): " + NET_MODES + ". host and bridged need the socket_vmnet "
                                "daemon; mcast links emulators on this Mac without root. Default: none")
+    launcher.add_argument("--net-ip", metavar="ADDR[/PREFIX]",
+                          help="with --net bridged:IF: a static address on that interface's subnet for the guest "
+                               "(a.b.c.d[/prefix], /24 when the prefix is omitted), added beside the 169.254 link-local "
+                               "alias kept for Pro DJ Link")
     launcher.add_argument("--no-audio-files", action="store_true",
                           help="audio builds: the sink keeps reading and counting the guest's PCM (metrics) but "
                                "writes no WAV into the session folder")
+    launcher.add_argument("--midi", action="store_true",
+                          help="start the CoreMIDI bridges for this session: MIDI DIN in and out, and the separate USB "
+                               "MIDI byte stream the firmware's g_midi peer uses (two virtual endpoints, no physical USB "
+                               "device)")
     fw = commands.add_parser("firmware", help="decoupled builds: import, list, check and manage user-supplied firmware")
     fw.add_argument("action", choices=("import", "list", "show", "check", "rename", "remove", "select", "audit",
                                        "profile"))
@@ -788,7 +852,7 @@ def main():
             return diagnostics_command(args)
         else:
             launch(args.output, args.ephemeral, args.usb_image, args.firmware, args.dev_overlay, args.no_ui_input,
-                   args.no_audio_files, args.net)
+                   args.no_audio_files, args.net, args.net_ip, args.midi)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"native emulator failed: {exc}\n")
 

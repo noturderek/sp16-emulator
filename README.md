@@ -7,8 +7,9 @@ from that update; this repository contains none of it.
 
 > **Not affiliated.** This project is independent and is not affiliated with, endorsed by or supported by
 > AlphaTheta Corporation, Pioneer DJ or the makers of the TORAIZ SP-16. It ships no firmware, no firmware-derived
-> files, no key material and no vendor logos. You download the firmware update and the GPL source archive yourself,
-> from the official pages linked below, and use them under their own terms.
+> files, no key material and no vendor logos. The repository ships no vendor logos or artwork. For a personal build
+> you may draw your own from `private/skin/overlay.png`; never commit it. You download the firmware update and the
+> GPL source archive yourself, from the official pages linked below, and use them under their own terms.
 
 ## What you need
 
@@ -23,8 +24,9 @@ from that update; this repository contains none of it.
   Linux guest base image from Debian packages and this project's code (later builds reuse Docker's cache). `./sp16 mod
   sdk` uses it too. A built emulator runs without Docker.
 - About 3 GB of free disk space.
-- For the hardware conformance suite only: `pillow` and `numpy` in the Python that runs the build tools
-  (`./sp16 doctor` prints the exact install command for it) and `brew install tesseract`.
+- `pillow` is needed by `emulator/layout_overlay.py` (the panel overlay) as well as the hardware suite:
+  `python3 -m pip install pillow`. For the suite, `numpy` is also needed (`./sp16 doctor` prints the exact install
+  command for it) and `brew install tesseract`.
 
 ## Quick start
 
@@ -196,6 +198,53 @@ into `build/.cache`, a few seconds), then for example:
 
 `make build-audio` and `make build-record` build the two variants as `sp16-audio` and `sp16-record`.
 
+With `coreaudio` or `both`, the app's **Output** menu (and `./sp16 ctl monitor MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8`) selects
+which jack pair plays through your Mac. The master stream sends all 16 channels by default; MAIN OUT scales OUT1-2
+(channels 12 and 14). Research builds can inject an input WAV (`input.wav`, up to 64 MB) from a `--dev-overlay` folder,
+metered with peak-equivalent dBu readouts (`in_dbu_peak`, `out_dbu_peak`); see [docs/audio-jack-map.md](docs/audio-jack-map.md).
+
+## MIDI
+
+`./sp16 run --midi` starts two CoreMIDI bridges for the session: `SP-16 DIN [<build>]` on the DIN socket and
+`SP-16 USB [<build>]` for the firmware's USB-B MIDI. Both are **virtual CoreMIDI endpoints, not a physical USB or MIDI
+interface**; `./sp16 midi ports` lists them.
+
+- The shim serves the ALSA sequencer ABI the firmware's application opens and publishes its two peers (DIN, and the USB
+  gadget's `g_midi` while the app has USB-B in MIDI mode), so the app discovers and subscribes both.
+- The app's **MIDI > Routing…** window has one row per endpoint with In, Out, Send clock and Receive clock, a clock
+  source picker and a BPM/lock/jitter readout. Choices persist and are written to
+  `~/Library/Application Support/SP-16 Emulator/midi-routing.json`, which both bridges read live (`--config PATH`
+  points them elsewhere).
+- Generated output is gated by the firmware's own settings; OCR recipes set them on a running research session:
+  `python3 emulator/menu/sync_source.py --build NAME usb-note-out` (and `sync-source-pdl`, `usb-out`).
+
+DIN input and output are observed (a host note triggers a loaded sample; PLAY sends `FA`, 24 PPQN `F8`, `FC`), and the
+USB-B route carries the same transport and CC. USB-B **pad notes are not finished**: the route works, but a pad hit
+has no project content to turn into a note. [docs/midi.md](docs/midi.md) has the details.
+
+## Pro DJ Link
+
+`./sp16 run --net MODE` gives the guest a network: `host` and `bridged:IF` reach your LAN through the root
+`socket_vmnet` daemon, and `mcast` links emulators and host tools on this Mac without root. `mcast` runs through a
+host-side relay, because QEMU's own multicast backend cannot deliver to another local listener on macOS.
+
+On the segment the firmware binds UDP 50000, 50002 and 50001 and emits its keep-alive about every 2 s. Host tools
+decode and fake that traffic:
+
+```sh
+./sp16 run --name NAME --net mcast                     # one shell: the emulator, on the segment
+python3 emulator/net/segment_watch.py --seconds 20     # another: decode what the guest sends
+python3 emulator/net/segment_master.py --bpm 128 --pitch 2 --duration 120   # another: a fake tempo master
+# or all of it in one run (it starts the master and its own session):
+python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 --master-pitch 2
+```
+
+With SYNC SOURCE = PRO DJ LINK (the `sync-source-pdl` menu recipe) the sequencer follows the master's effective tempo
+exactly: 130.56 BPM against 128 BPM +2 %, with no tempo error. The downbeat lands within about 16 ms of the
+master's (read from the sequencer playhead; 5 ms is not yet reached). Linking with a second emulator was left parked. [docs/pro-dj-link.md](docs/pro-dj-link.md) covers
+the tools, the sync bridge that turns a master's tempo into MIDI clock (`emulator/sync/bridge.py`, optionally driving
+Carabiner for Ableton Link), and what is still open.
+
 ## Commands and Makefile
 
 `./sp16 help` lists every command; `./sp16 help <command>` (or `<command> --help`) shows its options and
@@ -207,7 +256,7 @@ the Python 3.12+ for the build tools.
 |---|---|
 | `doctor` | Check your Mac (Apple silicon, macOS, Command Line Tools, Python, Docker, disk space, git) and print the fixes |
 | `build` | Build the app into `build/<name>`: `--audio`, `--audio-device`, `--research`, `--trace` (strace, gdb, pcmtap, exec), `--app-arg` (research: start the app with an argument such as `testmode`), `--uncalibrated`, `--pad-calibration-value`, `--bundle-suffix`, `--library`, `--reuse-qemu-from`, `--no-reuse-qemu`, `--rebuild` |
-| `run` | Launch a build: `--firmware`, `--usb-image` (default `build/stick.img` when it exists), `--no-usb`, `--ephemeral`, `--dev-overlay`, `--no-ui-input` (bench mode: the window ignores input, for scripted runs), `--no-audio-files` (audio builds: count the audio, write no WAV) |
+| `run` | Launch a build: `--firmware`, `--usb-image` (default `build/stick.img` when it exists), `--no-usb`, `--ephemeral`, `--dev-overlay`, `--no-ui-input` (bench mode: the window ignores input, for scripted runs), `--no-audio-files` (audio builds: count the audio, write no WAV), `--net` (none, host, bridged:IF, mcast), `--net-ip`, `--midi` |
 | `bootstrap` | Everything in one go: `doctor`, build with audio, import and select firmware (`--update` or `--download-firmware`), fill the stick (`--samples`, `--projects`, folders or zips), launch; skips what is done, `--dry-run` lists the steps |
 | `usb create\|add\|ls\|mount\|unmount` | Prepare the virtual USB stick on the Mac without booting: load samples (`add --dest Projects` for project files), list, mount (see [Load your own samples](#5-load-your-own-samples-optional)) |
 | `builds` | List builds and the options each was built with |
@@ -215,8 +264,9 @@ the Python 3.12+ for the build tools.
 | `firmware import\|list\|show\|check\|select\|rename\|remove\|profile\|audit` | Manage the shared firmware library |
 | `firmware download --version 1.60` | Fetch the official firmware update from the official server (asks first; `--info`, `--yes`) |
 | `mod new\|check\|run\|test\|sdk\|package` | Develop and test firmware mods |
-| `ctl` | Drive a running research session (buttons, encoders, LCD) |
-| `hwsuite` | Run the hardware conformance suite |
+| `ctl` | Drive a running research session (buttons, encoders, LCD, power, standby, pressure, calibrate, fault, monitor, usb-oc) |
+| `midi` | Drive the emulator from a MIDI controller: list ports, learn a controller profile, mirror an SP-16, run the bridge (`ports`, `learn`, `preset`, `run`) |
+| `hwsuite` | Run the hardware conformance suite (supports `--tier extra`, `--testmode-build`, `--shots record\|compare`) |
 | `smoke` | Run the end-to-end smoke test and record a sped-up screencast |
 | `diagnostics` | Collect a redacted bug-report zip |
 | `test` | Run the firmware-free unit tests (`--coverage` measures coverage) |
@@ -261,18 +311,35 @@ To turn an unverified version into a verified one, see [docs/architecture.md](do
 
 **Works** (checked on firmware 1.60):
 
-- Boot to a settled home screen with live lamps; buttons, pads, encoders, the selector, the touch strip, the LCD and
-  touch; the power/standby key (`./sp16 ctl press power`); internal storage that persists across launches.
-- Audio: three playback streams, silent, recorded to WAV files or played through CoreAudio (`--audio`).
-- The virtual USB stick mounts and the firmware reads it (samples and projects: [step 5](#5-load-your-own-samples-optional)).
-- The analog board, as far as the firmware can see it: MAIN OUT and INPUT LEVEL act on the host side, the filter-select
-  and limiter lines are served, HP CUTOFF comes back out as the firmware's control-voltage code (read in the metrics),
-  and the filter loop passes a research test tone through the low-pass and high-pass.
-- The factory test mode (`--research --app-arg testmode`) with a DIN MIDI loopback cable. The DEVICE TEST page's
-  network query is answered with fixed values so the page no longer hangs; that fix is covered by contract tests and has
-  not been run end to end.
-- Research tools: the control socket (`./sp16 ctl`), `--trace` (strace, gdb, pcmtap, exec), the hardware suite, the
-  smoke test and the mod tooling.
+- Boot to a settled home screen with live lamps; buttons, pads, encoders, the selector, the touch strip; LCD with
+  calibrated, debounced touch (delivered as RX frame words); Utility LCD brightness dimming the panel; internal storage
+  that persists across launches.
+- App shell and menus: View > Lamp Glow (off by default), View > Rear I/O Panel (Cmd-R), View > Private Skin Overlay
+  (`private/skin/overlay.png`), Output monitor menu (MAIN, PHONES, OUT 3-4, OUT 5-6, OUT 7-8), Firmware > Power On
+  With Keys Held (Normal, Test Mode, Update Mode).
+- Power visual states: BOOT overlay, RUN, OFF on standby (dark panel, WAKE UP lit steady red), FAULT (`ctl fault on`:
+  panel dark, WAKE UP blinking red at ~1 Hz); power/standby key (`./sp16 ctl press power` or `ctl standby yes`).
+- Audio: three playback streams, silent, recorded to WAV files or played through CoreAudio (`--audio`); all 16 master
+  channels streamed; host Output monitor menu; CoreAudio power-on mute held until playback starts.
+- Virtual USB stick: mounts and hot-attaches at runtime (`virtio-blk-pci`, `ctl usb attach PATH` and USB > Attach USB
+  Image...); over-current testing with `./sp16 ctl usb-oc on|off`.
+- Analog board: MAIN OUT scales OUT1-2 (channels 12 and 14); INPUT LEVEL and soft input limiter on GPIO5_IO06;
+  peak-equivalent dBu readouts (`in_dbu_peak`, `out_dbu_peak`); input injection from `input.wav` in `--dev-overlay`
+  (up to 64 MB); HP CUTOFF DAC code; filter loop passes a research test tone through low-pass and high-pass.
+- MIDI controller bridge: `./sp16 midi` maps CoreMIDI controllers to emulator actions with lamp LED echo; built-in
+  SP-16 mirror preset.
+- MIDI routing and the DIN/USB-B routes: the shim serves the app's ALSA sequencer ABI, so it discovers both peers and
+  subscribes them; `./sp16 run --midi` publishes `SP-16 DIN` and `SP-16 USB`, the app's MIDI > Routing… window writes the
+  preferences both bridges honour, and DIN in/out and USB-B transport with CC are observed. Menu recipes set the
+  firmware's own sync source and MIDI output settings ([docs/midi.md](docs/midi.md)).
+- Pro DJ Link on the `mcast` segment: the guest's keep-alive is decoded by the host tools, and with SYNC SOURCE = PRO DJ
+  LINK the sequencer follows a master's effective tempo exactly ([docs/pro-dj-link.md](docs/pro-dj-link.md)).
+- Factory test mode (`--research --app-arg testmode`): PAGE 8 DEVICE TEST MIDI check (touch button at 115, 112)
+  verified live against DIN loopback; hardware suite extras tier checks HW-47..HW-54.
+- Research tools: the control socket (`./sp16 ctl` including `power`, `standby`, `pressure`, `calibrate`, `fault`,
+  `monitor`, `usb-oc`), `--trace` (strace, gdb, pcmtap, exec), the hardware suite with screenshot regression layer
+  (`--shots`), smoke test, mod tooling, the Pro DJ Link segment tools and the probes in `emulator/probes/`
+  (`over_led.py`, `ak4458_transport.py`, `filter_send.py`).
 
 **Not there yet:**
 
@@ -280,8 +347,15 @@ To turn an unverified version into a verified one, see [docs/architecture.md](do
   sessions tried nothing the firmware plays reaches the filter loop, which so far only carries the research
   `filter_tone`. The cutoff and resonance laws of the model are assumptions, not measurements. DRIVE has no emulator
   model: the firmware reads the pot as an ADC word and applies it itself.
-- Not emulated: MIDI beyond the factory test's loopback, USB-B, sync and PRO DJ LINK, network, audio input and live
-  sampling (the research input tone stands in), and output routing beyond the main stereo pair.
+- Audio input and live sampling: a research test tone or injected `input.wav` stands in for the input ADC; master
+  channels map to output jacks (see [docs/audio-jack-map.md](docs/audio-jack-map.md)); output routing beyond the
+  monitored pairs is not emulated. The filter send stays silent: the app never writes its send stream in the sessions
+  tried, and why needs a debugger.
+- USB-B pad notes: the route works (transport and CC arrive on `SP-16 USB`), but a pad hit produces no note; the
+  project needs playable content and the per-track MIDI channel and NOTE/CC send.
+- Pro DJ Link: the tempo follows; the downbeat is about 16 ms off the master's (the 5 ms target is not reached).
+  Linking with a second emulator was not attempted. The Ableton Link half of the sync bridge follows tempo (measured
+  with a Carabiner you build and run yourself); its phase is not measured.
 - A version is only `verified` by a full-tier hardware suite run ([docs/hardware-suite.md](docs/hardware-suite.md)).
 
 ## Load a modified firmware
@@ -321,7 +395,10 @@ make build-dev build-control      # build/sp16-dev and build/sp16-dev-uncal, sha
 ```
 
 The smoke tier takes about 8 minutes. Without the control build, check HW-24 (uncalibrated pads) is `BLOCKED` and the
-run exits 2, which is not a failure. See [docs/hardware-suite.md](docs/hardware-suite.md) for the full steps.
+run exits 2, which is not a failure. HW-35 (the OVER lamp) is declared known-failing in the 1.60 profile, so it reports
+`KNOWN-FAIL` with its measured figures instead of failing the run: the lamp watches the DSI drive input, whose threshold
+is +5.1 dBFS, and sampler playback does not drive it that far. See
+[docs/hardware-suite.md](docs/hardware-suite.md) for the full steps.
 
 ## Troubleshooting
 
@@ -389,7 +466,8 @@ such as an external drive's name, are kept.
 sp16, Makefile    the command line (`./sp16 help`) and the ready-made build configurations (`make help`)
 emulator/            sp16emu.py (the command), build tool, firmware importer, Linux guest base, hardware shim, panel model, macOS app,
                      compatibility profiles, developer tools, hardware suite, unit tests
-docs/                Python CLI/setup, architecture, modding guide, hardware suite, profile reference
+docs/                Python CLI/setup, architecture, MIDI, Pro DJ Link, modding guide, audio jack map, hardware suite,
+                     profile reference
 .agents/skills/      agent skills: sp16-bootstrap (fresh clone to a running emulator) and sp16-emulator-setup (setup details, mods, troubleshooting)
 ```
 

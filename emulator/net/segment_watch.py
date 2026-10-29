@@ -6,11 +6,18 @@ decodes the frames: ARP, and UDP on 50000-50002 with the Pro DJ Link magic (keep
   segment_watch.py [--port 34567] [--seconds 10] [--pcap FILE]   (--pcap writes a file Wireshark opens, with the nudge dissectors)
 """
 import argparse
+import os
 import socket
 import struct
+import sys
 import time
 
-MAGIC = b"Qspt1WmJOL"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import fake_master
+import segment
+
+MAGIC = fake_master.MAGIC
 
 
 def describe(frame):
@@ -30,8 +37,8 @@ def describe(frame):
     payload = frame[14 + ihl + 8:14 + ihl + length]
     text = f"UDP {ip_src}:{sport} -> {ip_dst}:{dport} len {len(payload)}"
     if payload.startswith(MAGIC):
-        name = payload[11:31].split(b"\0")[0].decode("ascii", "replace")
-        text += f" PRODJLINK type {payload[10]:#04x} name {name!r}"
+        # The name's offset depends on the packet family: 0x0c on port 50000, 0x0b on 50001/50002.
+        text += f" PRODJLINK type {payload[10]:#04x} name {fake_master.packet_name(payload, dport)!r}"
         if dport == 50000 and len(payload) == 54:
             text += f" mac {payload[0x26:0x2c].hex(':')} ip {socket.inet_ntoa(payload[0x2c:0x30])}"
         if dport == 50001 and payload[10] == 0x28 and len(payload) >= 0x5c:
@@ -47,11 +54,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=10.0)
     parser.add_argument("--pcap")
     args = parser.parse_args()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(("", args.port))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(args.group) + socket.inet_aton("0.0.0.0"))
+    sock = segment.multicast_socket(args.port, args.group)
     sock.settimeout(0.5)
     pcap = open(args.pcap, "wb") if args.pcap else None
     if pcap:
