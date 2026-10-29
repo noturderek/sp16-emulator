@@ -55,6 +55,7 @@ def noise(frames, seed=1):
     return [generator.uniform(-1.0, 1.0) for _ in range(frames)]
 
 
+@unittest.skipUnless(importlib.util.find_spec("numpy"), "numpy is only needed for the AK4458 transport probe")
 class CaptureReaderTest(unittest.TestCase):
     def test_a_clean_capture_round_trips(self):
         words = [sine(1000, 2000, 0.04) if w % 4 == 0 else [0.0] * 2000 for w in range(16)]
@@ -112,6 +113,7 @@ class CaptureReaderTest(unittest.TestCase):
             self.assertEqual(transport.console_tail(path, 6), "three\n")
 
 
+@unittest.skipUnless(importlib.util.find_spec("numpy"), "numpy is only needed for the AK4458 transport probe")
 class WordMeasureTest(unittest.TestCase):
     def test_a_tone_word_and_a_noise_word_separate_by_orders_of_magnitude(self):
         frames = 8192

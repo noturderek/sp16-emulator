@@ -83,6 +83,21 @@ class ClockEmitterTests(unittest.TestCase):
         self.assertGreater(len(sent), 20)   # 120 BPM = 48 pulses/s, so ~29 in 0.6 s
         self.assertLess(len(sent), 45)      # two threads would give ~58
 
+    def test_late_wakeups_are_caught_up_so_the_rate_holds(self):
+        # A busy host oversleeps: make every wait 3 periods late. The emitter must still average the set rate.
+        sent = []
+        emitter = bridge.ClockEmitter(sent.append)
+        emitter.set_bpm(120.0)                       # 48 pulses/s
+        real_wait = emitter._stop.wait
+        emitter._stop.wait = lambda t: real_wait(t + 3 * 60.0 / (120.0 * 24))
+        t0 = time.monotonic()
+        emitter.start()
+        time.sleep(1.0)
+        emitter.stop()
+        expected = 48 * (time.monotonic() - t0)
+        self.assertGreater(len(sent), 0.8 * expected)
+        self.assertLess(len(sent), 1.2 * expected + 2)
+
     def test_a_worker_that_died_lets_start_emit_again(self):
         sent = []
 

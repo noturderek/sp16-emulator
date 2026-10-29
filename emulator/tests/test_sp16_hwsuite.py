@@ -908,6 +908,7 @@ class TestmodePageTests(unittest.TestCase):
                 runner.run()
 
 
+@unittest.skipUnless(importlib.util.find_spec("PIL"), "pillow is only needed for the hardware suite")
 class ShotRegressionTests(unittest.TestCase):
     """Runner.shot: the suite's own references, masks given as fractions, a heat map for a change."""
 

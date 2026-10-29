@@ -29,6 +29,7 @@ import sync.pdl_sync as pdl  # noqa: E402
 
 MAGIC = pdl.MAGIC
 PPQN = 24.0
+CATCH_UP = 0.25   # seconds behind schedule the clock still catches up; later than this it restarts the schedule
 
 
 class ClockEmitter:
@@ -66,11 +67,22 @@ class ClockEmitter:
         self._thread.start()
 
     def _loop(self) -> None:
+        # Pulses are scheduled against absolute deadlines, not "one period after the last wake-up": a late wake-up
+        # (a busy host oversleeps by tens of milliseconds) is then caught up with the pulses it owes, so the average
+        # rate stays the set BPM instead of drifting slow. More than CATCH_UP late (a stall) restarts the schedule
+        # rather than bursting a backlog.
+        due = time.monotonic()
         while not self._stop.is_set():
-            if self._bpm > 0:
-                self._send(0xF8)
             period = 60.0 / (self._bpm * self._ppqn) if self._bpm > 0 else 0.05
-            self._stop.wait(period)
+            now = time.monotonic()
+            if now - due > CATCH_UP:
+                due = now
+            if now >= due:
+                if self._bpm > 0:
+                    self._send(0xF8)
+                due += period
+                continue
+            self._stop.wait(due - now)
 
     def stop(self) -> None:
         self._stop.set()
