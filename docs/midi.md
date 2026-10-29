@@ -122,7 +122,7 @@ sequencer proxy serves the ABI the app needs, not the guest kernel's own sequenc
 `./sp16 midi` is a separate tool: it maps a CoreMIDI controller's pads, knobs and keys onto emulator actions and
 echoes lamp state back as LED note/CC. `ports` lists endpoints, `learn` builds a profile under `private/midi/`, `run`
 runs the bridge, and `--preset sp16` mirrors the SP-16's own MIDI layout. See
-[architecture.md](architecture.md#midi-controller-bridge-din-midi-and-clock) for its files.
+[architecture.md](architecture.md#midi-controller-bridge-alsa-sequencer-and-din-midi) for its files.
 
 ## MIDI clock from a Pro DJ Link master
 
