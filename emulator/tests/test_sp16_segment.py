@@ -153,6 +153,14 @@ class SegmentMasterTests(unittest.TestCase):
         self.assertEqual(self.master.MAGIC, b"Qspt1WmJOL")
         self.assertEqual(self.master.MASTER_IP, "169.254.7.7")
 
+    def test_completed_beat_is_the_wrapped_previous_beat(self):
+        # The SP-16 beat handler reads Bb as the beat just completed, so the master reports the previous beat:
+        # entering beat 1 reports completed beat 4, entering beat 2 reports 1, and so on.
+        self.assertEqual(self.master.completed_beat(1), 4)
+        self.assertEqual(self.master.completed_beat(2), 1)
+        self.assertEqual(self.master.completed_beat(3), 2)
+        self.assertEqual(self.master.completed_beat(4), 3)
+
     def test_master_logs_the_guest_keepalive_name(self):
         # The SP-16's own keep-alive: 54 bytes, type 0x06 at 0x0a, a reserved 0x00 at 0x0b, the name at 0x0c.
         parsed = segment.parse_frame(framed(sp16_keepalive("TORAIZ"), 50000, 50000))
