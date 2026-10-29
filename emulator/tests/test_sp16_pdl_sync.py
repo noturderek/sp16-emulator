@@ -20,9 +20,10 @@ def beat_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1):
     return fake_master.beat_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, 100)
 
 
-def status_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1, beat_count=0, playing=True):
+def status_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1, beat_count=0, playing=True, master=True):
     """A master 0x0a status packet built by the shared packet builder, not by hand."""
-    return fake_master.status_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, beat_count, playing)
+    return fake_master.status_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, beat_count, playing=playing,
+                                       master=master)
 
 
 class TempoTests(unittest.TestCase):
@@ -51,6 +52,14 @@ class TempoTests(unittest.TestCase):
         self.assertAlmostEqual(status["pitch_frac"], 0.0, places=5)
         self.assertEqual((status["beat_in_bar"], status["beat_count"]), (2, 7))
         self.assertTrue(status["playing"] and status["master"])
+
+    def test_parse_status_rejects_packets_shorter_than_the_fields_it_reads(self):
+        # The last field is beat_in_bar at offset 0xa6, so anything under 0xa7 bytes is too short and must be a
+        # ValueError, not an IndexError or struct.error escaping the receive loop.
+        full = status_packet()
+        for length in (0x93, 0xa0, 0xa6):
+            with self.assertRaises(ValueError, msg=f"length {length}"):
+                pdl.parse_status_packet(full[:length])
 
 
 class TrackerTests(unittest.TestCase):
@@ -177,6 +186,14 @@ class CarabinerTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_bridge_ignores_a_non_master_players_status(self):
+        bridge = pdl.PdlClockBridge()
+        bridge.feed_status(status_packet(128.0, 0.02, 1), 0.0)     # the master at 128 BPM +2 %
+        self.assertAlmostEqual(bridge.tracker.effective_bpm, 130.56, delta=0.01)
+        result = bridge.feed_status(status_packet(90.0, 0.0, 2, master=False), 1.0)  # a non-master player
+        self.assertIsNone(result)                                   # not the master: no packet for the clock
+        self.assertAlmostEqual(bridge.tracker.effective_bpm, 130.56, delta=0.01)     # the master's tempo is intact
+
     def test_bridge_retunes_midi_clock_on_tempo_change(self):
         from midi import clock
         generator = clock.ClockGenerator(bpm=120.0)
@@ -194,6 +211,7 @@ class BridgeTests(unittest.TestCase):
                 self.forced = []
             def set_tempo(self, bpm):
                 self.tempos.append(bpm)
+                return True
             def force_beat_at_time(self, beat, when, quantum):
                 self.forced.append((beat, when, quantum))
         link = FakeLink()
@@ -203,12 +221,59 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(link.tempos), 1)  # one tempo, no repeat for the same BPM
         self.assertAlmostEqual(link.tempos[0], 130.56, delta=0.01)
 
+    def test_bridge_retries_a_failed_tempo_delivery(self):
+        class FailingLink:
+            def __init__(self):
+                self.tempos = []
+            def set_tempo(self, bpm):
+                self.tempos.append(bpm)
+                return False  # Carabiner not reachable: the delivery failed
+            def force_beat_at_time(self, beat, when, quantum):
+                pass
+        link = FailingLink()
+        bridge = pdl.PdlClockBridge(link=link)
+        bridge.feed_beat(beat_packet(128.0, 0.02, 1), 0.0)
+        bridge.feed_beat(beat_packet(128.0, 0.02, 2), 1.0)  # the same effective BPM
+        self.assertEqual(len(link.tempos), 2)  # the failed delivery was not remembered, so it retried
+        self.assertIsNone(bridge._sent_bpm)
+
+    def test_bridge_retunes_the_generator_independent_of_link_delivery(self):
+        # Sol's sequence: 120 delivered, 140 fails, back to 120. The MIDI generator must follow every tempo change
+        # even when Link delivery fails, and only the delivered tempo may be cached (so a repeated 140 retries).
+        from midi import clock
+
+        class FlakyLink:
+            def __init__(self):
+                self.tempos = []
+                self.fail_next = False
+            def set_tempo(self, bpm):
+                self.tempos.append(bpm)
+                return not self.fail_next
+            def force_beat_at_time(self, beat, when, quantum):
+                pass
+        generator = clock.ClockGenerator(bpm=120.0)
+        link = FlakyLink()
+        bridge = pdl.PdlClockBridge(generator=generator, link=link)
+        bridge.feed_beat(beat_packet(120.0, 0.0, 1), 0.0)       # 120 delivered and cached
+        self.assertAlmostEqual(generator.bpm, 120.0, delta=0.01)
+        self.assertEqual(link.tempos, [120.0])
+        link.fail_next = True
+        bridge.feed_beat(beat_packet(140.0, 0.0, 2), 1.0)       # 140: delivery fails
+        self.assertAlmostEqual(generator.bpm, 140.0, delta=0.01)  # the generator still follows the change
+        self.assertEqual(len(link.tempos), 2)                     # 140 was attempted (and failed)
+        bridge.feed_beat(beat_packet(120.0, 0.0, 3), 2.0)       # back to 120
+        self.assertAlmostEqual(generator.bpm, 120.0, delta=0.01)  # not stuck at 140
+        self.assertAlmostEqual(bridge._sent_bpm, 120.0, delta=0.01)  # only what Link accepted is cached
+        self.assertEqual(len(link.tempos), 2)                     # 120 already held by Link: no re-delivery
+        bridge.feed_beat(beat_packet(140.0, 0.0, 4), 3.0)       # 140 again: retried, not gated off by the cache
+        self.assertEqual(len(link.tempos), 3)
+
     def test_bridge_forces_phase_on_the_downbeat(self):
         class FakeLink:
             def __init__(self):
                 self.forced = []
             def set_tempo(self, bpm):
-                pass
+                return True
             def force_beat_at_time(self, beat, when, quantum):
                 self.forced.append((beat, when, quantum))
         link = FakeLink()
@@ -226,7 +291,7 @@ class BridgeTests(unittest.TestCase):
             def __init__(self):
                 self.forced = []
             def set_tempo(self, bpm):
-                pass
+                return True
             def force_beat_at_time(self, beat, when, quantum):
                 self.forced.append((beat, when, quantum))
         link = FakeLink()

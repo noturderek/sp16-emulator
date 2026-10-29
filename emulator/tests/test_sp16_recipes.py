@@ -84,8 +84,8 @@ class FollowPhaseTests(unittest.TestCase):
         onsets = [int(i * step_frames) for i in range(64)]
         window_t0_ns = 1_000_000_000 + 5_000_000  # the window opens 5 ms after the master's downbeat
         phase = timing_probe.follow_phase(onsets, master, window_t0_ns, 128.0)
-        self.assertAlmostEqual(phase["phase_median_ms"], 5.0, delta=1.0)
-        self.assertEqual(phase["downbeats"], 4)
+        self.assertAlmostEqual(phase["step_phase_median_ms"], 5.0, delta=1.0)
+        self.assertEqual(phase["onsets"], 64)
 
     def test_follow_phase_ignores_a_whole_bar_of_latency(self):
         bar_ns = int(4 * 60 / 128 * 1e9)
@@ -99,7 +99,7 @@ class FollowPhaseTests(unittest.TestCase):
         # the follower starts exactly one bar later than the master: phase still reads ~0
         window_t0_ns = 1_000_000_000 + bar_ns
         phase = timing_probe.follow_phase(onsets, master, window_t0_ns, 128.0)
-        self.assertAlmostEqual(phase["phase_median_ms"], 0.0, delta=1.0)
+        self.assertAlmostEqual(phase["step_phase_median_ms"], 0.0, delta=1.0)
 
     def test_follow_phase_refuses_little_data(self):
         self.assertEqual(timing_probe.follow_phase([0, 1, 2, 3], [(1, 1)], 0, 128.0)["error"], "too little data")

@@ -104,6 +104,31 @@ class ClockEmitterTests(unittest.TestCase):
         self.assertGreater(len(sent), 10)  # 120 BPM = 48 pulses/s, so ~24 more in 0.5 s
 
 
+class ClockSinkTests(unittest.TestCase):
+    def test_clock_sink_builds_a_four_field_clock_message(self):
+        import midi_bridge.midi as midi
+        sent = []
+
+        class FakePort:
+            def __init__(self, args):
+                pass
+
+            def send(self, msg):
+                sent.append(msg)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(midi, "Port", FakePort):
+            sink = bridge.clock_sink("Test Bus")
+            sink(0xF8)   # a clock byte: one message
+            sink(0x90)   # not a clock byte: ignored
+            sink.close()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].type, "clock")
+        self.assertEqual((sent[0].channel, sent[0].number, sent[0].value), (None, 0, 0))
+
+
 class RunTests(unittest.TestCase):
     def test_run_feeds_master_packets_and_emits_clock(self):
         class FakeSeg:
@@ -125,6 +150,27 @@ class RunTests(unittest.TestCase):
         fed = bridge.run(FakeSeg([frame]), sent.append, duration=0.6)
         self.assertEqual(fed, 1)
         self.assertGreater(len(sent), 20)  # the emitter ran at 130.56 BPM for the window
+
+    def test_run_survives_a_malformed_frame(self):
+        class FakeSeg:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            def settimeout(self, t):
+                pass
+
+            def recvfrom(self, n):
+                if self.frames:
+                    return self.frames.pop(0), None
+                time.sleep(0.01)
+                raise socket.timeout()
+
+        malformed = b"Qspt1WmJOL" + b"\x28" + b"\x00" * 20   # the magic and beat type, far short of a beat packet
+        beat = fake_master.beat_packet("CDJ-3000", 1, 128.0, 0.02, 1, 100)
+        sent = []
+        fed = bridge.run(FakeSeg([framed(malformed, 50001), framed(beat, 50001)]), sent.append, duration=0.6)
+        self.assertEqual(fed, 1)           # the bad frame was skipped, the good one still fed
+        self.assertGreater(len(sent), 20)
 
 
 if __name__ == "__main__":

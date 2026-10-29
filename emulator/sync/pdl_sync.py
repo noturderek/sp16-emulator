@@ -48,7 +48,7 @@ def parse_beat_packet(payload: bytes) -> dict:
 def parse_status_packet(payload: bytes) -> dict:
     """The master's 0x0a status packet: pitch factor, base BPM (x100), beat counter, beat in bar and the play/master
     flags (offset 0x89 bits, as net/fake_master.py sets them)."""
-    if len(payload) < 0x93 or payload[:10] != MAGIC or payload[10] != 0x0a:
+    if len(payload) < 0xa7 or payload[:10] != MAGIC or payload[10] != 0x0a:
         raise ValueError("not a 0x0a status packet")
     scaled_pitch = struct.unpack(">I", payload[0x8c:0x90])[0]
     bpm_x100 = struct.unpack(">H", payload[0x92:0x94])[0]
@@ -247,11 +247,12 @@ class PdlClockBridge:
         return int(time.monotonic() * 1e6)
 
     def _on_tempo(self, bpm: float) -> None:
+        if abs(self.generator.bpm - bpm) >= 1e-6:
+            self.generator.set_bpm(bpm)
         if self._sent_bpm is not None and abs(self._sent_bpm - bpm) < 1e-6:
-            return
-        self.generator.set_bpm(bpm)
-        if self.link is not None:
-            self.link.set_tempo(bpm)
+            return  # Link already has this tempo; nothing to deliver
+        if self.link is not None and self.link.set_tempo(bpm) is not True:
+            return  # not recorded, so the next packet with this BPM retries the delivery
         self._sent_bpm = bpm
 
     def _align_link(self, t: float) -> None:
@@ -274,6 +275,8 @@ class PdlClockBridge:
 
     def feed_status(self, payload: bytes, t: float) -> dict:
         status = parse_status_packet(payload)
+        if not status["master"]:
+            return None  # only the master player's status drives the clock
         self.tracker.update(status["bpm"], status["pitch_frac"], status["beat_in_bar"], t)
         self._on_tempo(self.tracker.effective_bpm)
         return status

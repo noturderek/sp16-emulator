@@ -83,7 +83,7 @@ All of them are stdlib-only Python under `emulator/net/`, and none needs root.
 | `segment_watch.py [--port 34567] [--group G] [--seconds 10] [--pcap FILE]` | Prints the Pro DJ Link traffic on the `--net mcast` segment: ARP, and UDP 50000–50002 with the Pro DJ Link magic (keep-alive type, name, MAC, IP). `--pcap` writes a file Wireshark opens, with hints for its dissectors |
 | `segment_master.py [--group G] [--port P] [--bpm 128] [--pitch 2] [--player 1] [--name CDJ-3000] [--duration S] [--change-after S --change-to BPM] [--log FILE]` | A fake tempo master that lives **on** the segment: keep-alive, beat and player-status frames as Ethernet frames, exactly where the relay picks them up. It reads frames back, so each guest keep-alive it sees is printed as proof the app accepted it. `--log` writes `beat <monotonic-ns> <beat-in-bar>` lines for phase measurement |
 | `fake_master.py --iface IF \| --bind-ip ADDR [--broadcast ADDR] [--bpm] [--pitch] [--player] [--name] [--duration] [--change-after/--change-to] [--log]` | The same packets through an interface's own sockets, for `host`/`bridged` runs and real hardware. SIGUSR1/SIGUSR2 change the tempo by ±4 BPM while it runs |
-| `timing_probe.py run --net mcast --build NAME [--master-bpm 128] [--master-pitch 2] …` | A follow run end to end: starts the segment master, launches its own `--net mcast` session, sets the firmware's sync source with the `sync-source-pdl` recipe, plays, and reports the jitter and panel-frame measurements plus a `follow` block (master effective BPM, measured tempo and error, downbeat phase) |
+| `timing_probe.py run --net mcast --build NAME [--master-bpm 128] [--master-pitch 2] …` | A follow run end to end: starts the segment master, launches its own `--net mcast` session, sets the firmware's sync source with the `sync-source-pdl` recipe, plays, and reports the jitter and panel-frame measurements plus a `follow` block (master effective BPM, measured tempo and error, and the follower's residual phase modulo one step as `step_phase_median_ms` / `step_phase_max_ms`) |
 
 The packet layouts follow the public Pro DJ Link write-up. Names are decoded at the offset of their packet family: the
 54-byte keep-alive and the other port-50000 frames carry the name at 0x0c, the port-50001/50002 beat and status frames
@@ -113,11 +113,14 @@ python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 -
   against a master at 128 BPM +2 %, `tempo_error_bpm` 0.0. The gate was the player-status packet's play state: the
   status frame's `P3` byte must say the player is loaded and playing forward, and the master-meaningful byte and the
   rekordbox `Mv` multiplier must be set (`emulator/net/fake_master.py`).
-- **Downbeat does not align (not finished).** The phase is a constant **~495 ms** off over 33 downbeats in a 60 s
-  window (median 495.256 ms, maximum 495.277 ms), so the 5 ms acceptance is unmet. The remaining question is the beat
-  packet's phase semantics (`nextBeat`, `Bb`). It is also unconfirmed whether the figure is a firmware phase gap or an
-  artifact of the probe taking every 16th click onset, which need not start at step 1.
-- **Linking with an emulated CDJ-3000 (not attempted).** It depends on the downbeat working, so it was left parked.
+- **Downbeat alignment (unverified).** The phase figure an earlier probe reported (a constant ~495 ms over 33
+  downbeats in a 60 s window) could not tell a firmware phase gap from a whole-step or whole-bar offset: identical
+  clicks on all 16 steps cannot say which click is step 1. `timing_probe.follow_phase` now reports the residual phase
+  modulo one step (`step_phase_median_ms` / `step_phase_max_ms`) instead of a downbeat delay, so a follower a whole
+  step or bar late reads 0 there. Naming the downbeat itself still needs the sequencer position
+  (`hwsuite.playhead_steps`), and the beat packet's phase semantics (`nextBeat`, `Bb`) remain the open question.
+- **Linking with an emulated CDJ-3000 (not attempted).** It depends on verifying downbeat alignment, so it was left
+  parked.
 
 ## The sync bridge
 
@@ -127,7 +130,7 @@ followers, independently of whether the emulator's own follower is engaged:
 ```sh
 python3 emulator/sync/bridge.py --clock-out "IAC Driver Bus 1"          # MIDI clock only
 python3 emulator/sync/bridge.py --clock-out "IAC Driver Bus 1" --link   # and Ableton Link
-python3 emulator/sync/bridge.py --duration 60                           # --link only, no clock destination
+python3 emulator/sync/bridge.py --link --duration 60                    # Link only, no clock destination
 ```
 
 - **MIDI clock (works, unit-tested).** The master's effective BPM (base BPM times the actual pitch) retunes a 24 PPQN
@@ -143,8 +146,10 @@ python3 emulator/sync/bridge.py --duration 60                           # --link
   (`sync: no Carabiner listening on 127.0.0.1:17000 …; Link tempo/phase sync is off`) and keeps the MIDI clock running;
   a later outage after a recovery warns once more.
 
-The bridge is stdlib only and reads the segment directly, so it also works against a real master on a bridged or host
-network as long as the packets reach it.
+The bridge is stdlib only and reads the multicast segment (encapsulated Ethernet frames on `230.0.0.1:34567`), so it
+follows the fake master or another emulator on `--net mcast`. It does not read native Pro DJ Link UDP (ports
+50001/50002), so a real master on a `host` or `bridged` network must first have its traffic re-encapsulated onto the
+segment; that step is not automated today.
 
 ## Diagnosing the network
 

@@ -127,7 +127,10 @@ def run(seg, send_clock, link=None, duration=0.0, now=time.monotonic):
                 parsed = segment.parse_frame(frame)
             except KeyError:
                 continue
-            packet = feed(bridge, parsed, now())
+            try:
+                packet = feed(bridge, parsed, now())
+            except ValueError:
+                continue  # a malformed beat/status packet must not end the bridge
             if packet:
                 fed += 1
                 emitter.set_bpm(bridge.tracker.effective_bpm)
@@ -144,7 +147,7 @@ def clock_sink(name):
     def send(byte):
         kind = "clock" if byte == 0xF8 else None
         if kind:
-            port.send(Message(kind))
+            port.send(Message(kind, None, 0, 0))
 
     send.close = port.close
     return send

@@ -104,6 +104,60 @@ class OnsetTests(unittest.TestCase):
             self.assertEqual(list(np.round(ch2 * 32768).astype(int)), [2 * f for f in range(10, 20)])
 
 
+class FollowPhaseTests(unittest.TestCase):
+    def master_beats(self, bpm=120.0, n_beats=64):
+        beat_ns = int(60 / bpm * 1e9)
+        return [(j * beat_ns, (j % 4) + 1) for j in range(n_beats)]
+
+    def test_aligned_playback_from_step_3_has_zero_step_phase(self):
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)      # 500 ms
+        step_ns = beat_ns // 4             # 125 ms
+        step = step_ns / 1e9 * probe.RATE  # samples per step (5512.5)
+        onsets = [i * step for i in range(40)]
+        window_t0_ns = 2 * step_ns         # the window opens at step 3, two steps after a downbeat
+        report = probe.follow_phase(onsets, self.master_beats(bpm), window_t0_ns, bpm)
+        self.assertAlmostEqual(report["step_phase_median_ms"], 0.0, delta=0.1)
+        self.assertAlmostEqual(report["step_phase_max_ms"], 0.0, delta=0.1)
+        self.assertEqual(report["onsets"], 40)
+        self.assertNotIn("downbeats", report)  # no downbeat delay is claimed
+
+    def test_a_real_phase_error_is_still_measured(self):
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step_ns = beat_ns // 4
+        step = step_ns / 1e9 * probe.RATE
+        onsets = [i * step for i in range(40)]
+        # The follower is a quarter step late: the window opens at step 1 but one quarter step after the downbeat.
+        report = probe.follow_phase(onsets, self.master_beats(bpm), step_ns // 4, bpm)
+        self.assertAlmostEqual(report["step_phase_median_ms"], (step_ns // 4) / 1e6, delta=0.1)
+
+    def test_a_follower_a_whole_step_late_reads_zero_step_phase(self):
+        # At 120 BPM a step is 125 ms. A follower delayed a full step lands its clicks exactly on the master's steps,
+        # so the residual modulo one step is 0; the report must not present that as a downbeat delay.
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step_ns = beat_ns // 4
+        step = step_ns / 1e9 * probe.RATE
+        onsets = [i * step for i in range(40)]
+        report = probe.follow_phase(onsets, self.master_beats(bpm), step_ns, bpm)  # one step after the downbeat
+        self.assertAlmostEqual(report["step_phase_median_ms"], 0.0, delta=0.1)
+        self.assertNotIn("downbeats", report)
+        self.assertNotIn("phase_median_ms", report)  # the downbeat-phase name is gone
+
+    def test_a_master_log_without_a_downbeat_is_insufficient_data(self):
+        # Sol's input: two master beats numbered 2 and 3 (no beat_in_bar 1) and 16 onsets, with the window covering
+        # where beat 1 would fall. The measurement cannot locate the step grid, so it is a structured result, not a
+        # min() over an empty downbeat list.
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step = beat_ns // 4 / 1e9 * probe.RATE
+        onsets = [i * step for i in range(16)]
+        beats = [(0, 2), (beat_ns, 3)]
+        report = probe.follow_phase(onsets, beats, -1000_000_000, bpm)
+        self.assertEqual(report, {"error": "no downbeat in master log"})
+
+
 class TxTests(unittest.TestCase):
     def test_steady_frames_have_no_stalls(self):
         report = probe.tx_stalls([i * 0.015 for i in range(1000)])
