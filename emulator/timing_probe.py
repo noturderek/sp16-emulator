@@ -15,7 +15,9 @@ measurements over the same window:
   above the limit (40 ms by default); the maximum is the number to watch. The bridge counts the same frames at its own
   end, so the report also says which hop a stall sat on: `guest-to-bridge` when the bridge itself waited between two
   arriving frames, `bridge-to-app` when it received them on time and the host app's reader or log writer was
-  late, and `mixed` when the same window holds both (a stall the bridge saw does not account for one it did not).
+  late, and `mixed` when the same window holds both. `mixed` is ambiguous evidence: one upstream stall the bridge saw
+  also opens a gap in the app's own log, so it does not prove stalls on both hops (a stall the bridge saw does not
+  account for one it did not).
 
 The audio clock and the panel link are independent paths: the jitter is the emulated sampler's own timing, the stalls
 are what the host sees of the panel. Both depend on host load, so the report carries the load average and the number
@@ -316,9 +318,10 @@ def stall_hop(report):
     """Where the window's panel-frame stalls sat, or None when the run cannot say.
 
     `guest-to-bridge` means the bridge itself waited that long between two arriving frames; `bridge-to-app` means the
-    bridge received them on time and the delay is in the host app's own reader and log writer. Both counters can be
-    non-zero over one window, and a stall the bridge saw does not account for one it did not, so that window is `mixed`
-    rather than attributed wholly to the earlier hop."""
+    bridge received them on time and the delay is in the host app's own reader and log writer. The two counters are
+    not independent: one upstream stall the bridge saw also opens a gap in the app's own log, so a single stall can
+    raise both. `mixed` therefore marks ambiguous evidence -- it does not prove stalls on both hops -- and a stall the
+    bridge saw does not account for one it did not."""
     stalls = (report.get("tx") or {}).get("stalls_over_limit")
     link = report.get("link") or {}
     bridge = link.get("gaps_over_limit")
