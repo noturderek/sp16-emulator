@@ -144,7 +144,7 @@ def clock_sink(name):
     def send(byte):
         kind = "clock" if byte == 0xF8 else None
         if kind:
-            port.send(Message(kind))
+            port.send(Message(kind, None, 0, 0))
 
     send.close = port.close
     return send

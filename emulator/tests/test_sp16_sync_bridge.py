@@ -104,6 +104,31 @@ class ClockEmitterTests(unittest.TestCase):
         self.assertGreater(len(sent), 10)  # 120 BPM = 48 pulses/s, so ~24 more in 0.5 s
 
 
+class ClockSinkTests(unittest.TestCase):
+    def test_clock_sink_builds_a_four_field_clock_message(self):
+        import midi_bridge.midi as midi
+        sent = []
+
+        class FakePort:
+            def __init__(self, args):
+                pass
+
+            def send(self, msg):
+                sent.append(msg)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(midi, "Port", FakePort):
+            sink = bridge.clock_sink("Test Bus")
+            sink(0xF8)   # a clock byte: one message
+            sink(0x90)   # not a clock byte: ignored
+            sink.close()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].type, "clock")
+        self.assertEqual((sent[0].channel, sent[0].number, sent[0].value), (None, 0, 0))
+
+
 class RunTests(unittest.TestCase):
     def test_run_feeds_master_packets_and_emits_clock(self):
         class FakeSeg:
