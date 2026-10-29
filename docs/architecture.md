@@ -175,8 +175,8 @@ virtio-net NIC:
   169.254.A.B link-local address.
 - The firmware binds UDP 50000, 50002 and 50001 and emits its 54-byte keep-alive about every 2 s; `segment_watch.py`
   decodes it and `segment_master.py` (a fake master on the segment) reads it back as proof of acceptance. With SYNC
-  SOURCE = PRO DJ LINK the sequencer follows the master's effective tempo exactly; downbeat alignment remains
-  unverified because the probe measures phase modulo one step.
+  SOURCE = PRO DJ LINK the sequencer follows the master's effective tempo exactly; the downbeat lands within
+  about 16 ms of the master's, measured from the sequencer playhead.
   `emulator/sync/bridge.py` additionally turns the master's tempo into a 24 PPQN MIDI clock and, with `--link`, drives
   a Carabiner. `timing_probe.py run --net mcast` measures a whole follow run.
 
