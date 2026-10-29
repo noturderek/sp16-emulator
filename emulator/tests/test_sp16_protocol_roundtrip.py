@@ -5,7 +5,7 @@ Three layers:
 1. Golden tables, hand-written from the panel protocol reference (internal docs/reference/toraiz-sp16-panel-protocol.md:
    "Panel RX frame", "Panel TX frame", "Touch strip", evidence E2, E7, E8, E11-E15). They are not derived from
    panel_map.py, so a wrong canonical entry fails here. Entries the reference does not give are left out; they are
-   listed as unverified (grade U) in docs/changes/l3a-harness-easy.md.
+   unverified (grade U).
 2. Raw-frame fixtures: literal bytes decoded to the expected control, so the decoder is checked against wire bytes and
    not only against the tables it reads.
 3. Self-consistency round trip: every control in panel-layout.json is sent as an event through PanelModel and decoded

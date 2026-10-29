@@ -270,7 +270,7 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // App Nap otherwise delays every thread of a background or occluded app by tens to hundreds of milliseconds,
-        // stalling the panel frame transport (docs/changes/l2-audio-timing.md section 6). Audio builds hold their own
+        // stalling the panel frame transport. Audio builds hold their own
         // assertions in AudioSink/AudioOutput; this one covers builds without a sink, for the life of the app.
         panelActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
                                                               reason: "SP-16 panel transport")
