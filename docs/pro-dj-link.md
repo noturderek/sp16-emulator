@@ -19,7 +19,18 @@ unit, and no device identity, MAC or IP of a real unit appears in this repositor
 | `mcast[:PORT]` | a local multicast segment, `230.0.0.1:34567` by default | nothing, no root |
 
 `host` and `bridged:IF` are the modes that can reach real hardware on your LAN. `mcast` links emulators and host tools
-on this Mac only, which is what the tests and the fake master below use. Each start takes a random locally
+on this Mac only, which is what the tests and the fake master below use.
+
+The two daemon modes need `socket_vmnet` (`brew install socket_vmnet`) with its daemon running as root: the host one
+listens on `/opt/homebrew/var/run/socket_vmnet` (or `/usr/local/var/run` on Intel), and a bridged one per interface on
+`/opt/homebrew/var/run/socket_vmnet.bridged.<if>`. Start the bridged daemon yourself, for example:
+
+```sh
+sudo /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-mode=bridged --vmnet-interface=en0 \
+  /opt/homebrew/var/run/socket_vmnet.bridged.en0
+```
+
+`--net host` and `--net bridged:IF` say which socket is missing when the daemon is not up. Each start takes a random locally
 administered MAC (`52:54:00:…`), so two instances never share one and none is a real unit's.
 
 The guest assigns itself a link-local `169.254.A.B` address on its own. The shim answers the firmware's GLINK carrier
