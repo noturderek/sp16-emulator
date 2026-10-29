@@ -158,6 +158,52 @@ class FollowPhaseTests(unittest.TestCase):
         self.assertEqual(report, {"error": "no downbeat in master log"})
 
 
+class DownbeatErrorTests(unittest.TestCase):
+    def master(self, bpm=120.0, n_bars=16):
+        """Master beats in seconds: (t, beat_in_bar) over `n_bars` bars at `bpm`."""
+        beat = 60.0 / bpm
+        return [(bar * 4 * beat + i * beat, i + 1) for bar in range(n_bars) for i in range(4)]
+
+    def step0(self, beats, shift=0.0):
+        """Synthetic playhead changes: step 0 at each bar start, shifted by `shift` seconds."""
+        return [(t + shift, 0) for t, b in beats if b == 1]
+
+    def test_aligned_bars_have_zero_downbeat_error(self):
+        beats = self.master()
+        report = probe.downbeat_error(self.step0(beats), beats)
+        self.assertAlmostEqual(report["median"], 0.0, delta=0.001)
+        self.assertAlmostEqual(report["max"], 0.0, delta=0.001)
+        self.assertEqual(report["n"], 16)
+
+    def test_a_constant_late_offset_is_reported_in_ms(self):
+        beats = self.master()
+        report = probe.downbeat_error(self.step0(beats, shift=0.495), beats)
+        self.assertAlmostEqual(report["median"], 495.0, delta=0.5)
+        self.assertAlmostEqual(report["max"], 495.0, delta=0.5)
+        self.assertEqual(report["n"], 16)
+
+    def test_an_early_offset_is_signed_negative(self):
+        beats = self.master()
+        report = probe.downbeat_error(self.step0(beats, shift=-0.010), beats)
+        self.assertAlmostEqual(report["median"], -10.0, delta=0.5)
+
+    def test_a_follower_a_whole_bar_late_reads_zero(self):
+        beats = self.master(n_bars=17)  # one extra bar so the last step-0 still has a downbeat ahead of it
+        bar = 4 * 60.0 / 120.0
+        report = probe.downbeat_error(self.step0([b for b in beats if b[1] == 1][:16], shift=bar), beats)
+        self.assertAlmostEqual(report["median"], 0.0, delta=0.001)
+        self.assertAlmostEqual(report["max"], 0.0, delta=0.001)
+
+    def test_only_step0_changes_are_measured(self):
+        beats = self.master()
+        report = probe.downbeat_error([(t + 0.1, 3) for t, _ in beats], beats)
+        self.assertEqual(report, {"error": "no playhead step-0 entries in the window"})
+
+    def test_too_few_downbeats_is_insufficient_data(self):
+        self.assertEqual(probe.downbeat_error([(0.0, 0)], [(0.0, 1)]),
+                         {"error": "too few downbeats in master log"})
+
+
 class TxTests(unittest.TestCase):
     def test_steady_frames_have_no_stalls(self):
         report = probe.tx_stalls([i * 0.015 for i in range(1000)])

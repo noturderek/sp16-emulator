@@ -266,6 +266,43 @@ def follow_phase(onsets, master_beats, window_t0_ns, bpm, rate=RATE):
             "onsets": len(phases)}
 
 
+def downbeat_error(playhead_changes, master_beats):
+    """Signed downbeat error in ms: each time the follower's playhead enters step 0 (a bar start) is matched to the
+    nearest master downbeat (beat-in-bar 1) on the same clock, and the signed difference is the downbeat error.
+
+    `playhead_changes` are `(t_seconds, step_index)` pairs from hwsuite.playhead_steps (step 0 = bar start);
+    `master_beats` are `(t_seconds, beat_in_bar)` pairs. A follower whose bars line up with the master reads ~0 ms; a
+    follower a whole bar late also reads 0 (its step-0 entry is matched to the nearest master bar start), so this
+    names the residual offset within a bar, not the absolute bar number. The report is the signed median (ms), the
+    maximum absolute error (ms) and the count of step-0 entries; a structured error when there are no downbeats or no
+    step-0 entries in the window.
+    """
+    downbeats = sorted(t for t, b in master_beats if b == 1)
+    if len(downbeats) < 2:
+        return {"error": "too few downbeats in master log"}
+    errors = [(t - min(downbeats, key=lambda d: abs(d - t))) * 1000.0
+              for t, step in playhead_changes if step == 0]
+    if not errors:
+        return {"error": "no playhead step-0 entries in the window"}
+    return {"median": round(statistics.median(errors), 3),
+            "max": round(max(abs(e) for e in errors), 3),
+            "n": len(errors)}
+
+
+def playhead_window(session, tx_start, started, window_t0_ns, seconds, colour):
+    """The follower's playhead step changes inside the measurement window, on the master's monotonic clock.
+
+    Reads the decoded panel frames logged since `tx_start`, adds `started` (the app's launch time on the same
+    monotonic clock as the master's beat log) to each frame's own time base, keeps the frames that fall inside
+    [window_t0_ns, window_t0_ns + seconds], and returns hwsuite.playhead_steps over them.
+    """
+    import hwsuite
+    t1_ns = window_t0_ns + seconds * 1e9
+    records = [(t + started, d) for t, d in session.lamps_since(tx_start)
+               if window_t0_ns <= (t + started) * 1e9 <= t1_ns]
+    return hwsuite.playhead_steps(records, tuple(colour))
+
+
 def audio_counters(session):
     """Frames recorded and frames the guest dropped on the master stream so far (metrics of the host sink)."""
     stream = ((session.metrics().get("audio") or {}).get("streams") or {}).get("ak4458audio-0") or {}
@@ -411,12 +448,18 @@ def run(args):
             "bridge_timing": {"before": link_before, "after": link_after}}
         if args.net and master_log is not None and master_log.exists():
             effective = args.master_bpm * (1 + args.master_pitch / 100.0)
+            master_beats = read_master_beats(master_log)
+            started = window_t0_ns / 1e9 - float((session.metrics() or {}).get("uptime_seconds", 0.0))
             report["follow"] = {
                 "master_bpm": args.master_bpm, "master_pitch_pct": args.master_pitch,
                 "master_effective_bpm": effective,
                 "measured_tempo_bpm": report["audio"].get("tempo_bpm"),
                 "tempo_error_bpm": round((report["audio"].get("tempo_bpm") or 0.0) - effective, 3),
-                "phase": follow_phase(onsets, read_master_beats(master_log), window_t0_ns, effective)}
+                "phase": follow_phase(onsets, master_beats, window_t0_ns, effective),
+                "downbeat_ms": downbeat_error(
+                    playhead_window(session, tx_start, started, window_t0_ns, args.seconds,
+                                    profile["rgb_known"]["playhead"]),
+                    [(t / 1e9, b) for t, b in master_beats])}
         if not args.no_setup:
             runner.select_track(2)
             for n in range(1, 17):
