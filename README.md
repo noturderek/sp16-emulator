@@ -241,7 +241,8 @@ python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 -
 
 With SYNC SOURCE = PRO DJ LINK (the `sync-source-pdl` menu recipe) the sequencer follows the master's effective tempo
 exactly: 130.56 BPM against 128 BPM +2 %, with no tempo error. The downbeat lands within about 16 ms of the
-master's (read from the sequencer playhead; 5 ms is not yet reached). Linking with a second emulator was left parked. [docs/pro-dj-link.md](docs/pro-dj-link.md) covers
+master's (read from the sequencer playhead; 5 ms is not yet reached). Linking with a second emulator was left parked. [docs/live-hardware.md](docs/live-hardware.md) has the recipes with real gear (a physical SP-16 over USB MIDI, a CDJ-3000
+over Ethernet, Ableton Link). [docs/pro-dj-link.md](docs/pro-dj-link.md) covers
 the tools, the sync bridge that turns a master's tempo into MIDI clock (`emulator/sync/bridge.py`, optionally driving
 Carabiner for Ableton Link), and what is still open.
 

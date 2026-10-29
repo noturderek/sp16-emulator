@@ -17,7 +17,7 @@ author:
 
 The emulated sampler can join a Pro DJ Link network, publish its keep-alive and follow a tempo master. This document
 covers the network modes, the host-side segment the emulator uses, the tools that fake and watch a segment, and how far
-each part of the feature goes.
+each part of the feature goes. For a real CDJ on Ethernet, step by step, see [live-hardware.md](live-hardware.md).
 
 Grades: **O** observed in this emulator, **S** static, **I** inferred, **U** unknown. Nothing here was measured on a
 unit, and no device identity, MAC or IP of a real unit appears in this repository.
