@@ -1,3 +1,18 @@
+---
+title: Pro DJ Link
+description: How the emulated sampler joins a Pro DJ Link network: the segment relay, the segment tools, the keep-alive and following a tempo master.
+type: reference
+status: active
+created: 2026-10-28
+tags: [prodjlink, network, sync]
+author:
+  harness: pi
+  agent: lk8-docs
+  model: deepseek-v4.1-flash
+  thinking: high
+  tokens: unknown
+---
+
 # Pro DJ Link
 
 The emulated sampler can join a Pro DJ Link network, publish its keep-alive and follow a tempo master. This document

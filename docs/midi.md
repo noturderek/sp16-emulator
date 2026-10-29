@@ -1,3 +1,18 @@
+---
+title: MIDI
+description: How MIDI gets in and out of the emulated sampler: the sequencer proxy, DIN and USB-B host endpoints, routing preferences and the settings that gate MIDI.
+type: reference
+status: active
+created: 2026-10-28
+tags: [midi, usb, din]
+author:
+  harness: pi
+  agent: lk8-docs
+  model: deepseek-v4.1-flash
+  thinking: high
+  tokens: unknown
+---
+
 # MIDI
 
 How MIDI gets in and out of the emulated sampler: the ALSA sequencer the firmware's application talks to, the two
