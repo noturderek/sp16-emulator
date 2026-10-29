@@ -91,7 +91,7 @@ All of them are stdlib-only Python under `emulator/net/`, and none needs root.
 | `segment_watch.py [--port 34567] [--group G] [--seconds 10] [--pcap FILE]` | Prints the Pro DJ Link traffic on the `--net mcast` segment: ARP, and UDP 50000–50002 with the Pro DJ Link magic (keep-alive type, name, MAC, IP). `--pcap` writes a file Wireshark opens, with hints for its dissectors |
 | `segment_master.py [--group G] [--port P] [--bpm 128] [--pitch 2] [--player 1] [--name CDJ-3000] [--duration S] [--change-after S --change-to BPM] [--log FILE]` | A fake tempo master that lives **on** the segment: keep-alive, beat and player-status frames as Ethernet frames, exactly where the relay picks them up. It reads frames back, so each guest keep-alive it sees is printed as proof the app accepted it. `--log` writes `beat <monotonic-ns> <beat-in-bar>` lines for phase measurement |
 | `fake_master.py --iface IF \| --bind-ip ADDR [--broadcast ADDR] [--bpm] [--pitch] [--player] [--name] [--duration] [--change-after/--change-to] [--log]` | The same packets through an interface's own sockets, for `host`/`bridged` runs and real hardware. SIGUSR1/SIGUSR2 change the tempo by ±4 BPM while it runs |
-| `timing_probe.py run --net mcast --build NAME [--master-bpm 128] [--master-pitch 2] …` | A follow run end to end: starts the segment master, launches its own `--net mcast` session, sets the firmware's sync source with the `sync-source-pdl` recipe, plays, and reports the jitter and panel-frame measurements plus a `follow` block (master effective BPM, measured tempo and error, and the follower's residual phase modulo one step as `step_phase_median_ms` / `step_phase_max_ms`) |
+| `timing_probe.py run --net mcast --build NAME [--master-bpm 128] [--master-pitch 2] …` | A follow run end to end: starts the segment master, launches its own `--net mcast` session, sets the firmware's sync source with the `sync-source-pdl` recipe, plays, and reports the jitter and panel-frame measurements plus a `follow` block (master effective BPM, measured tempo and error, the follower's residual phase modulo one step as `step_phase_median_ms` / `step_phase_max_ms`, and the downbeat error from the sequencer playhead as `downbeat_ms` median / max / n) |
 
 The packet layouts follow the public Pro DJ Link write-up. Names are decoded at the offset of their packet family: the
 54-byte keep-alive and the other port-50000 frames carry the name at 0x0c, the port-50001/50002 beat and status frames
@@ -121,14 +121,16 @@ python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 -
   against a master at 128 BPM +2 %, `tempo_error_bpm` 0.0. The gate was the player-status packet's play state: the
   status frame's `P3` byte must say the player is loaded and playing forward, and the master-meaningful byte and the
   rekordbox `Mv` multiplier must be set (`emulator/net/fake_master.py`).
-- **Downbeat alignment (unverified).** The phase figure an earlier probe reported (a constant ~495 ms over 33
-  downbeats in a 60 s window) could not tell a firmware phase gap from a whole-step or whole-bar offset: identical
-  clicks on all 16 steps cannot say which click is step 1. `timing_probe.follow_phase` now reports the residual phase
-  modulo one step (`step_phase_median_ms` / `step_phase_max_ms`) instead of a downbeat delay, so a follower a whole
-  step or bar late reads 0 there. Naming the downbeat itself still needs the sequencer position
-  (`hwsuite.playhead_steps`), and the beat packet's phase semantics (`nextBeat`, `Bb`) remain the open question.
-- **Linking with an emulated CDJ-3000 (not attempted).** It depends on verifying downbeat alignment, so it was left
-  parked.
+- **Downbeat alignment (measured).** The probe now reads the sequencer position, not just the click onsets: during
+  the follow window it decodes the panel frames, takes `hwsuite.playhead_steps` (step 0 = bar start) and reports
+  `downbeat_ms` (median, max, n) = the time the playhead enters step 0 minus the nearest master downbeat
+  (beat-in-bar 1). At 128 BPM +2 % (130.56) the follower's downbeat was **~473 ms late** when the master reported
+  the current beat, because the beat handler `FUN_0051e6b0` reads the beat packet's `Bb` (`0x5c`) as the beat that
+  just **completed** and follows the next-bar distance (`0x2c`) from that same convention. `segment_master.py` now
+  reports the completed beat, which aligns the bar to **~16 ms** (median, `n` 33; the residual is the emulator's
+  network latency, not a whole beat).
+- **Linking with an emulated CDJ-3000 (not attempted).** The downbeat is now measured and largely aligned
+  (~16 ms residual; see above), so this is no longer blocked on phase evidence, but it was still not attempted.
 
 ## The sync bridge
 
