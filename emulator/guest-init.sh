@@ -216,8 +216,8 @@ printf 'pcm.null { type null }\nseq.default { type hw }\n' > /tmp/sp16-root/etc/
 # trusted init, not the OEM: it formats the card once (only when it has no filesystem), repairs an unclean shutdown
 # with fsck.vfat -a, and mounts it at the chroot's /mnt/emmc before the app starts. The OEM's own mkfs/mount stay
 # refused by the preload. /root/data lives in a dot-directory on the same card (one image, one fsck, one clean
-# unmount); files the rootfs ships there (the synthetic padcalibration.xml) are only copied when missing, so a
-# newer persisted file is never overwritten. /root/pdj/project, browse, scenes and packages are tmpfs (the OEM symlinks into them).
+# unmount); files the rootfs ships there (the synthetic padcalibration.xml and the default Toraiz_SP16.dat
+# settings) are only copied when missing, so a newer persisted file is never overwritten. /root/pdj/project, browse, scenes and packages are tmpfs (the OEM symlinks into them).
 sp16_emmc=0
 # virtio-blk disks are told apart by their QEMU serial (sp16emmc, sp16usb): with a virtual USB stick attached the
 # probe order no longer guarantees that the eMMC is vda. Prints the device node, or fails after about 5 s.

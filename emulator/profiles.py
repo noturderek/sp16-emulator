@@ -42,7 +42,7 @@ SUITE_FIELDS = {"identity": dict, "home": dict, "touch_probe": dict, "touch_dead
                 "strip": dict, "usb": dict, "device_nodes": list, "device_nodes_unserved": list, "ioctl_set": list,
                 "hardware": dict}
 # What code needs at run time; shipped copies (app bundle, guest base image) keep only these, without the update hash.
-RUNTIME_FIELDS = ("schema", "id", "product", "status", "firmware", "runtime", "panel", "calibration")
+RUNTIME_FIELDS = ("schema", "id", "product", "status", "firmware", "runtime", "panel", "calibration", "settings")
 
 _cache = {}
 
@@ -124,6 +124,19 @@ def validate(profile):
              and "{value}" in calibration["attribute"] and isinstance(calibration.get("pads"), int)
              and 1 <= calibration["pads"] <= 64, "calibration template")
     _require(isinstance(calibration.get("markers", []), list), "calibration.markers")
+    settings = profile.get("settings")
+    if settings is not None:
+        # The firmware's saved Utility settings, seeded when the data image has none (docs/profiles.md).
+        _require(isinstance(settings, dict) and guest_path(settings.get("path")), "settings.path")
+        _require(isinstance(settings.get("header"), str) and re.fullmatch(r"(?:[0-9a-f]{2}){1,16}", settings["header"]),
+                 "settings.header")
+        size, offset = settings.get("record_size"), settings.get("value_offset")
+        _require(isinstance(size, int) and isinstance(offset, int) and 8 <= size <= 4096 and 4 <= offset <= size - 4,
+                 "settings.record_size/value_offset")
+        defaults, seed = settings.get("defaults"), settings.get("seed", {})
+        _require(isinstance(defaults, dict) and defaults and isinstance(seed, dict)
+                 and all(re.fullmatch(r"[0-9]{1,5}", k) and isinstance(v, int) for k, v in {**defaults, **seed}.items())
+                 and set(seed) <= set(defaults), "settings.defaults/seed")
     # Hardware conformance suite fields (docs/hardware-suite.md): optional
     # here; null means not yet authored. Only their container types are checked; the suite runner reads them.
     for key, kinds in SUITE_FIELDS.items():

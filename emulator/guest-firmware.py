@@ -416,6 +416,7 @@ def attach(params):
     if not re.fullmatch(r"[0-9]\.[0-9]{2}", version):
         raise ValueError("invalid firmware version")
     stage_calibration(params.get("sp16.padcal", "off"), profile)
+    stage_settings(profile)
     # One line of shell-safe fields (every value was validated as a plain token or guest path) for guest-init.sh.
     print(variant, version, how, *profiles.runtime_fields(profile, app_path))
 
@@ -438,6 +439,39 @@ def stage_calibration(setting, profile, root=ROOT):
     parent.mkdir(parents=True, exist_ok=True)
     target = parent / os.path.basename(calibration["path"])
     target.write_text(calibration["template"].format(attributes=attributes))
+    os.chmod(target, 0o644)
+    return target
+
+
+
+def settings_file(settings):
+    """The firmware's saved-settings file built from a profile's `settings`: the header, then one record per id in id
+    order with the id at +0 and the value (the default, or the seed's) at `value_offset`; the rest of each record is
+    zeros, which the loader never reads."""
+    import struct
+    values = {int(k): v for k, v in settings["defaults"].items()}
+    values.update({int(k): v for k, v in settings.get("seed", {}).items()})
+    out = bytearray(bytes.fromhex(settings["header"]))
+    for key in sorted(values):
+        record = bytearray(settings["record_size"])
+        struct.pack_into("<i", record, 0, key)
+        struct.pack_into("<i", record, settings["value_offset"], values[key])
+        out += record
+    return bytes(out)
+
+
+def stage_settings(profile, root=ROOT):
+    """Default Utility settings (the profile's seed over the firmware's defaults: 1.60 starts with LCD BRIGHTNESS 5)
+    written into the overlay's upper layer; guest-init.sh copies it onto the data image only when the image has none,
+    so a value the firmware saved is never replaced. A profile without `settings` stages nothing."""
+    import prepare
+    settings = profile.get("settings")
+    if not settings:
+        return None
+    parent = prepare.guest_file(Path(root), os.path.dirname(settings["path"]))
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / os.path.basename(settings["path"])
+    target.write_bytes(settings_file(settings))
     os.chmod(target, 0o644)
     return target
 

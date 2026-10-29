@@ -597,6 +597,50 @@
     ],
     "default": 242
   },
+  "settings": {
+    "path": "/root/data/Toraiz_SP16.dat",
+    "format": "8-byte header (magic 0x2a7b9e8f, version 0x00010004), then 0x8c-byte records sorted by id: int32 id at +0, int32 value at +0x88; no checksum (loader FUN_0056824c, writer FUN_005680d4, defaults FUN_0056a7f0)",
+    "header": "8f9e7b2a04000100",
+    "record_size": 140,
+    "value_offset": 136,
+    "defaults": {
+      "2": 0,
+      "3": 2,
+      "5": 3,
+      "6": 32,
+      "7": 48,
+      "9": 65,
+      "10": 112,
+      "12": 0,
+      "13": 0,
+      "14": 5,
+      "15": 5,
+      "16": 80,
+      "17": 96,
+      "18": 128,
+      "19": 144,
+      "22": 193,
+      "23": 0,
+      "24": 100,
+      "25": 208,
+      "26": 50,
+      "27": 224,
+      "28": 0,
+      "36": 388,
+      "37": 401,
+      "42": 272,
+      "43": 288,
+      "45": 240,
+      "46": 256,
+      "47": 4
+    },
+    "seed": {
+      "5": 5
+    },
+    "names": {
+      "5": "LCD BRIGHTNESS (step 1..5; the firmware maps it to /dev/backlight 0x13, 0x2c, 0x5b, 0x9e, 0xf8)"
+    }
+  },
   "identity": {
     "version": "1.60",
     "image_sha256": "a2073e9d3b7dcdbeeb1c96c28cbc6ae2560b68789d5fb65e5bc0e205da690e6a",
