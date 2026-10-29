@@ -30,16 +30,7 @@ MASTER_IP, BROADCAST_IP, MASTER_MAC = "169.254.7.7", "169.254.255.255", "02:00:0
 
 
 def join_segment(group, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except OSError:
-        pass
-    sock.bind(("", port))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                    socket.inet_aton(group) + socket.inet_aton("0.0.0.0"))
-    return sock
+    return segment.multicast_socket(port, group)
 
 
 def send_packet(seg, group, port, src_mac, src_ip, dst_ip, dst_port, payload):
@@ -105,6 +96,13 @@ def drain_frames(seg, mac, seen, max_frames=64):
     return seen
 
 
+def completed_beat(beat_in_bar):
+    """The beat-in-bar (Bb) the SP-16's beat handler expects: the beat that just COMPLETED, not the beat starting
+    now. The SP-16 firmware reads Bb at byte 0x5c as the completed beat, so a master that reports the current beat
+    leaves the follower's downbeat one beat late; reporting the completed beat aligns it."""
+    return (beat_in_bar - 2) % 4 + 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--group", default=GROUP)
@@ -163,8 +161,14 @@ def main(argv=None):
             status_count += 1
             next_status += 0.2
         if now >= next_beat:
+            # The SP-16's beat handler (FUN_0051e6b0) reads the beat packet's beat-in-bar (Bb, 0x5c) as the beat that
+            # just COMPLETED, not the beat starting now, and its bar phase also follows the next-bar distance (0x2c)
+            # computed from that same convention. A master that reports the current beat (like a stock CDJ) leaves the
+            # follower's downbeat one beat late (~473 ms at 130.56 BPM); reporting the completed beat -- Bb =
+            # (beat_in_bar - 1) mod 4 -- aligns the bar to within the emulator's network latency (~16 ms). The --log
+            # still records the true beat-in-bar so the probe's downbeat measurement is unchanged.
             send(fake_master.PORT_BEAT, fake_master.beat_packet(args.name, args.player, state["bpm"], pitch,
-                                                                beat_in_bar, beat_s * 1000))
+                                                                completed_beat(beat_in_bar), beat_s * 1000))
             if log:
                 log.write(f"beat {time.monotonic_ns()} {beat_in_bar}\n")
             beat_count += 1

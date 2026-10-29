@@ -11,6 +11,7 @@ from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
+import net.segment as segment  # noqa: E402
 import net.segment_relay as segment_relay  # noqa: E402
 
 
@@ -85,16 +86,8 @@ class RelayTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertTrue(os.path.exists(sock_path), "relay socket did not appear")
 
-                # The host watcher joins the group exactly like segment_watch.py.
-                watcher = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                watcher.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    watcher.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-                except OSError:
-                    pass
-                watcher.bind(("", port))
-                watcher.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                                   socket.inet_aton(group) + socket.inet_aton("0.0.0.0"))
+                # The host watcher joins the group exactly like segment_watch.py (pinned to the loopback).
+                watcher = segment.multicast_socket(port, group)
                 watcher.settimeout(0.5)
 
                 qemu = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -149,15 +142,7 @@ class RelayTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertTrue(os.path.exists(sock_path), "relay socket did not appear")
 
-                watcher = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                watcher.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    watcher.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-                except OSError:
-                    pass
-                watcher.bind(("", port))
-                watcher.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                                   socket.inet_aton(group) + socket.inet_aton("0.0.0.0"))
+                watcher = segment.multicast_socket(port, group)
 
                 qemu = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 qemu.settimeout(5)

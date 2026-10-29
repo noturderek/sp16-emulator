@@ -62,3 +62,33 @@ def parse_frame(frame: bytes) -> dict:
     payload = frame[14 + ihl + 8:14 + ihl + udp_length]
     return {"src_mac": src_mac, "dst_mac": dst_mac, "src_ip": src_ip, "dst_ip": dst_ip,
             "src_port": src_port, "dst_port": dst_port, "payload": payload}
+
+
+LOOPBACK = "127.0.0.1"  # the interface the mcast segment is pinned to (see multicast_socket)
+
+
+def multicast_socket(port: int, group: str, iface: str = LOOPBACK) -> socket.socket:
+    """A UDP socket bound to the wildcard address and joined to `group` on `port`, pinned to `iface` for both the
+    send and receive paths. Every host peer of an `--net mcast` segment must use this (or the same options) so that
+    their datagrams find each other.
+
+    Multicast delivery between two host processes on one Mac depends on the interface the OS picks for the group.
+    With a second default route present (a `bridge100` from socket_vmnet, say), the default route is no longer the
+    interface every peer joins, and multicast loopback delivery breaks. Pinning the group to the loopback interface
+    -- `IP_MULTICAST_IF` for the send path, `IP_MULTICAST_LOOP` so our own datagrams loop back, and
+    `IP_ADD_MEMBERSHIP` on the loopback address for the receive path -- makes the segment a local loop that does not
+    depend on the host's route table. `SO_REUSEADDR`/`SO_REUSEPORT` let several peers share the port on one host.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    sock.bind(("", port))
+    iface_bytes = socket.inet_aton(iface)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, iface_bytes)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton(group) + iface_bytes)
+    return sock

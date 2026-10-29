@@ -15,6 +15,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fake_master
+import segment
 
 MAGIC = fake_master.MAGIC
 
@@ -53,11 +54,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=10.0)
     parser.add_argument("--pcap")
     args = parser.parse_args()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(("", args.port))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(args.group) + socket.inet_aton("0.0.0.0"))
+    sock = segment.multicast_socket(args.port, args.group)
     sock.settimeout(0.5)
     pcap = open(args.pcap, "wb") if args.pcap else None
     if pcap:

@@ -80,17 +80,9 @@ class ClockEmitter:
 
 
 def join_segment(group, port):
-    """A UDP socket joined to the mcast segment's group on `port`, wildcard-bound (the setup that receives on macOS)."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except (AttributeError, OSError):
-        pass
-    sock.bind(("", port))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                    socket.inet_aton(group) + socket.inet_aton("0.0.0.0"))
-    return sock
+    """A UDP socket joined to the mcast segment's group on `port`, wildcard-bound and pinned to the loopback
+    interface (net/segment.multicast_socket), the setup that receives on macOS."""
+    return segment.multicast_socket(port, group)
 
 
 def feed(bridge, parsed, t):
