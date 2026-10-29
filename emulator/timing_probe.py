@@ -236,23 +236,35 @@ def read_master_beats(path):
 def follow_phase(onsets, master_beats, window_t0_ns, bpm, rate=RATE):
     """Phase error in ms between the SP-16's downbeats and the master's.
 
-    The click fixture sits on every one of the 16 steps, so every 16th onset (step 1 of each bar) is a bar's downbeat
-    in 4/4. `onsets` are frame offsets from the measurement window's first frame; `window_t0_ns` is the host monotonic
-    time of that frame; `master_beats` are (monotonic_ns, beat_in_bar) pairs. The error is reduced modulo the bar
-    period, so a follower that is a whole bar late is not counted as a phase error.
+    The click fixture sits on every one of the 16 steps, so a downbeat is every 16th onset -- but only when the
+    measurement window happens to open on step 1. Instead of assuming the first onset is a downbeat, each onset is
+    matched to the master beat nearest it and its step number (1..16) is read from that beat's beat-in-bar plus the
+    sub-beat offset; only the onsets on step 1 are the downbeats. `onsets` are frame offsets from the window's first
+    frame; `window_t0_ns` is the host monotonic time of that frame; `master_beats` are (monotonic_ns, beat_in_bar)
+    pairs. The error is reduced modulo the bar period, so a follower that is a whole bar late is not counted as a
+    phase error.
     """
-    downbeats = [t for t, b in master_beats if b == 1]
-    if len(downbeats) < 2 or len(onsets) < 32:
+    beats = list(master_beats)
+    if len(beats) < 2 or len(onsets) < 16:
         return {"error": "too little data"}
     bar_ms = 4 * 60.0 / bpm * 1000.0
-    sp_downbeats = [window_t0_ns + int(on / rate * 1e9) for on in onsets[::16]]
+    beat_ns = 60.0 / bpm * 1e9
+    downbeats = [t for t, b in beats if b == 1]
     errors = []
-    for sp in sp_downbeats:
-        nearest = min(downbeats, key=lambda m: abs(m - sp))
-        phase = (sp - nearest) / 1e6 % bar_ms
+    for on in onsets:
+        sp_ns = window_t0_ns + int(on / rate * 1e9)
+        nearest_t, nearest_b = min(beats, key=lambda m: abs(m[0] - sp_ns))
+        frac = (sp_ns - nearest_t) / beat_ns
+        step_num = round((nearest_b - 1 + frac) * 4) + 1
+        if step_num != 1:
+            continue  # not a downbeat onset
+        nearest_downbeat = min(downbeats, key=lambda d: abs(d - sp_ns))
+        phase = (sp_ns - nearest_downbeat) / 1e6 % bar_ms
         if phase > bar_ms / 2:
             phase -= bar_ms
         errors.append(phase)
+    if not errors:
+        return {"error": "no downbeats found"}
     return {"phase_median_ms": round(statistics.median(abs(e) for e in errors), 3),
             "phase_max_ms": round(max(abs(e) for e in errors), 3),
             "downbeats": len(errors)}

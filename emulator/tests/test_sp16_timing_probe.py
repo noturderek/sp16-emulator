@@ -104,6 +104,34 @@ class OnsetTests(unittest.TestCase):
             self.assertEqual(list(np.round(ch2 * 32768).astype(int)), [2 * f for f in range(10, 20)])
 
 
+class FollowPhaseTests(unittest.TestCase):
+    def master_beats(self, bpm=120.0, n_beats=64):
+        beat_ns = int(60 / bpm * 1e9)
+        return [(j * beat_ns, (j % 4) + 1) for j in range(n_beats)]
+
+    def test_aligned_playback_from_step_3_has_zero_phase(self):
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)      # 500 ms
+        step_ns = beat_ns // 4             # 125 ms
+        step = step_ns / 1e9 * probe.RATE  # samples per step (5512.5)
+        onsets = [i * step for i in range(40)]
+        window_t0_ns = 2 * step_ns         # the window opens at step 3, two steps after a downbeat
+        report = probe.follow_phase(onsets, self.master_beats(bpm), window_t0_ns, bpm)
+        self.assertAlmostEqual(report["phase_median_ms"], 0.0, delta=0.1)
+        self.assertAlmostEqual(report["phase_max_ms"], 0.0, delta=0.1)
+        self.assertEqual(report["downbeats"], 2)
+
+    def test_a_real_phase_error_is_still_measured(self):
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step_ns = beat_ns // 4
+        step = step_ns / 1e9 * probe.RATE
+        onsets = [i * step for i in range(40)]
+        # The follower is a quarter step late: the window opens at step 1 but one quarter step after the downbeat.
+        report = probe.follow_phase(onsets, self.master_beats(bpm), step_ns // 4, bpm)
+        self.assertAlmostEqual(report["phase_median_ms"], (step_ns // 4) / 1e6, delta=0.1)
+
+
 class TxTests(unittest.TestCase):
     def test_steady_frames_have_no_stalls(self):
         report = probe.tx_stalls([i * 0.015 for i in range(1000)])
