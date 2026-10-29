@@ -66,18 +66,6 @@ def join_group(port, group, iface=None):
     return sock
 
 
-def flush_stream(sock, buffer):
-    """Send `buffer` to the nonblocking stream `sock`; return the part not yet sent.
-
-    Backpressure (BlockingIOError / InterruptedError) is not an error: the caller keeps the remainder and retries when
-    the socket is writable again. A partial send keeps only the unsent tail."""
-    try:
-        sent = sock.send(buffer)
-    except (BlockingIOError, InterruptedError):
-        return buffer
-    return buffer[sent:] if sent > 0 else buffer
-
-
 class Outbox:
     """A bounded FIFO of framed records waiting to be written to the QEMU stream.
 

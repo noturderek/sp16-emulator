@@ -203,21 +203,61 @@ class RelayTests(unittest.TestCase):
                     proc.terminate()
                     proc.wait(timeout=5)
 
-    def test_flush_stream_buffers_a_full_socket_without_losing_bytes(self):
-        class Blocked:
-            def send(self, data):
-                raise BlockingIOError()
-        data = b"x" * 100
-        self.assertEqual(segment_relay.flush_stream(Blocked(), data), data)
-
-    def test_flush_stream_keeps_the_unsent_tail_of_a_partial_send(self):
-        class Partial:
-            def send(self, data):
-                return 10
-        self.assertEqual(segment_relay.flush_stream(Partial(), b"x" * 100), b"x" * 90)
-
 
 class OutboxTests(unittest.TestCase):
+    def test_flush_buffers_a_full_socket_without_losing_bytes(self):
+        for error in (BlockingIOError, InterruptedError, None):
+            for offset in (0, 10):
+                with self.subTest(error=error, offset=offset):
+                    class Blocked:
+                        def send(self, data):
+                            if error is not None:
+                                raise error()
+                            return 0
+
+                    class Partial:
+                        def send(self, data):
+                            return offset
+
+                    outbox = segment_relay.Outbox()
+                    outbox.push(b"x" * 100)
+                    outbox.push(b"y" * 20)
+                    if offset:
+                        outbox.flush(Partial())
+                    outbox.flush(Blocked())
+                    self.assertEqual(list(outbox.queue), [b"x" * 100, b"y" * 20])
+                    self.assertEqual(outbox.bytes, 120 - offset)
+                    self.assertEqual(outbox.sent_offset, offset)
+
+    def test_flush_keeps_the_unsent_tail_of_repeated_partial_sends(self):
+        class Partial:
+            def __init__(self):
+                self.sends = []
+
+            def send(self, data):
+                self.sends.append(data)
+                if len(self.sends) == 1:
+                    return 10
+                if len(self.sends) == 2:
+                    return 15
+                return len(data)
+
+        outbox = segment_relay.Outbox()
+        outbox.push(b"x" * 100)
+        outbox.push(b"y" * 20)
+        sock = Partial()
+        outbox.flush(sock)
+        self.assertEqual(outbox.bytes, 110)
+        self.assertEqual(outbox.sent_offset, 10)
+        outbox.flush(sock)
+        self.assertEqual(outbox.bytes, 95)
+        self.assertEqual(outbox.sent_offset, 25)
+        outbox.flush(sock)
+        self.assertEqual(sock.sends, [b"x" * 100, b"x" * 90, b"x" * 75, b"y" * 20])
+        self.assertFalse(outbox)
+        self.assertEqual(outbox.bytes, 0)
+        self.assertEqual(outbox.sent_offset, 0)
+
     def test_overflow_preserves_a_frame_already_started_on_the_qemu_stream(self):
         frames = [letter * 12 for letter in (b"A", b"B", b"C", b"D", b"E")]
         records = [struct.pack(">I", len(frame)) + frame for frame in frames]
