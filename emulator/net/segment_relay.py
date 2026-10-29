@@ -22,6 +22,7 @@ The relay exits (and unlinks its socket) when QEMU disconnects, or after `--idle
 Stdlib only.
 """
 import argparse
+import collections
 import errno
 import os
 import select
@@ -29,6 +30,8 @@ import socket
 import struct
 import sys
 import time
+
+OUTBOX_LIMIT = 1 << 20  # bytes of frames the relay holds for a QEMU that has stopped reading
 
 
 def parse_target(target):
@@ -75,6 +78,53 @@ def flush_stream(sock, buffer):
     return buffer[sent:] if sent > 0 else buffer
 
 
+class Outbox:
+    """A bounded FIFO of framed records waiting to be written to the QEMU stream.
+
+    QEMU's stream backend can stop reading (a paused guest, a slow reader); the relay must not buffer without bound.
+    Records are held in a deque under a byte budget `limit`; when a push would exceed it, the oldest whole records are
+    dropped first (never a partial record) and counted so the relay can report the overflow once. Byte accounting
+    stays exact across partial sends because the unsent tail of a record is kept in place at the head.
+    """
+
+    def __init__(self, limit=OUTBOX_LIMIT):
+        if limit <= 0:
+            raise ValueError("outbox limit must be positive")
+        self.limit = limit
+        self.queue = collections.deque()
+        self.bytes = 0
+        self.dropped_frames = 0
+        self.dropped_bytes = 0
+
+    def push(self, record: bytes) -> None:
+        self.queue.append(record)
+        self.bytes += len(record)
+        while self.bytes > self.limit and self.queue:
+            head = self.queue.popleft()
+            self.bytes -= len(head)
+            self.dropped_frames += 1
+            self.dropped_bytes += len(head)
+
+    def flush(self, sock) -> None:
+        """Write records oldest-first to the nonblocking `sock`, keeping the unsent tail of the record in progress."""
+        while self.queue:
+            head = self.queue[0]
+            try:
+                sent = sock.send(head)
+            except (BlockingIOError, InterruptedError):
+                return
+            if sent <= 0:
+                return
+            self.bytes -= sent
+            if sent < len(head):
+                self.queue[0] = head[sent:]
+                return
+            self.queue.popleft()
+
+    def __bool__(self):
+        return bool(self.queue)
+
+
 def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.stderr):
     """Run until QEMU disconnects (returns 0) or no QEMU connects in `idle_timeout` (returns 1)."""
     group, port = parse_target(target)
@@ -118,9 +168,10 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
         qemu.setblocking(False)
         seg.setblocking(False)
         pending = b""
-        to_qemu = b""
+        outbox = Outbox()
+        dropped_reported = False
         while True:
-            writable = [qemu] if to_qemu else []
+            writable = [qemu] if outbox else []
             readable, ready_write, _ = select.select([seg, qemu], writable, [], 1.0)
             for ready in readable:
                 if ready is seg:
@@ -138,7 +189,12 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
                     if own and frame[6:12].hex() == own:
                         continue  # our own send echoed back: never hand it to our guest
                     stats["to_guest"] += 1
-                    to_qemu += struct.pack(">I", len(frame)) + frame
+                    outbox.push(struct.pack(">I", len(frame)) + frame)
+                    if outbox.dropped_frames and not dropped_reported:
+                        dropped_reported = True
+                        print(f"segment-relay: QEMU stopped reading; dropping the oldest queued frames "
+                              f"({outbox.dropped_frames} frames, {outbox.dropped_bytes} bytes so far)",
+                              file=log, flush=True)
                 else:
                     try:
                         chunk = qemu.recv(65536)
@@ -161,11 +217,11 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
                                 continue
                             raise
                         stats["to_segment"] += 1
-            if ready_write and to_qemu:
+            if ready_write and outbox:
                 # The guest has not kept up: only write when the socket is writable, keep the rest for the next
                 # writable turn instead of letting BlockingIOError end the relay.
                 try:
-                    to_qemu = flush_stream(qemu, to_qemu)
+                    outbox.flush(qemu)
                 except OSError as err:
                     if err.errno in transient:
                         note("send", err)

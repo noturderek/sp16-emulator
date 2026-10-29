@@ -129,15 +129,18 @@ class RelayTests(unittest.TestCase):
                     proc.terminate()
                     proc.wait(timeout=5)
 
-    def test_relay_survives_backpressure_when_qemu_stops_reading(self):
+    def test_relay_bounds_the_outbox_under_sustained_backpressure(self):
         port = free_udp_port()
         group, mac = "230.0.0.1", "52:54:00:00:00:01"
+        size = 1200
+        sent = 2000                       # ~2.4 MB, several times the 1 MiB outbox
+        record = size + 14 + 4             # 4-byte length prefix + Ethernet frame
         with tempfile.TemporaryDirectory() as folder:
             sock_path = os.path.join(folder, "relay.sock")
             proc = subprocess.Popen([sys.executable, str(TOOLS / "net" / "segment_relay.py"),
                                      "--socket", sock_path, "--target", f"{group}:{port}",
                                      "--mac", mac, "--idle-timeout", "10"],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             watcher = None
             qemu = None
             try:
@@ -160,29 +163,37 @@ class RelayTests(unittest.TestCase):
                 qemu.settimeout(5)
                 qemu.connect(sock_path)
 
-                # The guest never reads: flood the segment (a foreign MAC) so the relay must buffer for a stalled peer.
-                other = ethernet("52:54:00:00:00:02", bytes([0xBB] * 1200))
-                sent = 2000
-                for _ in range(sent):
-                    watcher.sendto(other, (group, port))
-                time.sleep(0.5)
+                # The guest never reads: flood the segment (a foreign MAC) far past the outbox limit, paced so the
+                # relay itself (not the OS receive buffer) is what overflows.
+                for seq in range(sent):
+                    frame = ethernet("52:54:00:00:00:02", struct.pack(">I", seq) + bytes([0xBB] * (size - 4)))
+                    watcher.sendto(frame, (group, port))
+                    time.sleep(0.0005)
+                time.sleep(1.0)            # let the relay queue (and drop) them
                 self.assertIsNone(proc.poll(), "the relay crashed under backpressure")
 
-                # The guest now drains: every forwarded frame must arrive (buffering lost none).
-                qemu.settimeout(10)
-                got = 0
-                deadline = time.time() + 10
-                while got < sent and time.time() < deadline:
+                # The guest now drains: only the newest frames survive (the oldest were dropped), so the count is
+                # bounded by the outbox limit rather than by the flood size.
+                qemu.settimeout(15)
+                got = []
+                deadline = time.time() + 15
+                while time.time() < deadline:
                     try:
-                        recv_frame(qemu, timeout=1.0)
-                        got += 1
+                        got.append(recv_frame(qemu, timeout=0.5))
                     except socket.timeout:
                         break
-                self.assertGreaterEqual(got, 0.9 * sent, f"only {got}/{sent} frames arrived")
+                seqs = [struct.unpack(">I", f[14:18])[0] for f in got]
+                self.assertGreater(len(got), 0)              # the newest frames were delivered
+                self.assertLess(len(got), sent)              # drops happened, not an unbounded buffer
+                self.assertEqual(seqs, sorted(seqs))         # drop-oldest preserves order
+                # The delivered count is bounded by the outbox cap (plus the kernel send buffer), never by the flood.
+                self.assertLessEqual(len(got) * record, 2 * segment_relay.OUTBOX_LIMIT)
 
                 qemu.close()
                 qemu = None
                 self.assertEqual(proc.wait(timeout=5), 0)
+                self.assertIn("dropping the oldest queued frames", proc.stderr.read())
+                self.assertFalse(os.path.exists(sock_path))
             finally:
                 if qemu is not None:
                     qemu.close()
@@ -204,6 +215,37 @@ class RelayTests(unittest.TestCase):
             def send(self, data):
                 return 10
         self.assertEqual(segment_relay.flush_stream(Partial(), b"x" * 100), b"x" * 90)
+
+
+class OutboxTests(unittest.TestCase):
+    def test_outbox_drops_the_oldest_records_to_stay_under_the_limit(self):
+        outbox = segment_relay.Outbox(limit=100)
+        for _ in range(5):
+            outbox.push(b"x" * 30)           # 150 bytes over a 100-byte budget
+        self.assertLessEqual(outbox.bytes, 100)
+        self.assertEqual(outbox.dropped_frames, 2)  # the two oldest records were dropped
+        self.assertEqual(outbox.dropped_bytes, 60)
+        self.assertEqual(outbox.bytes, 90)          # the three newest (90 bytes) remain
+
+    def test_outbox_flushes_oldest_first_and_keeps_a_partial_tail(self):
+        class Partial:
+            def __init__(self):
+                self.sends = []
+            def send(self, data):
+                self.sends.append(data)
+                if len(self.sends) == 1:
+                    return 3                      # first record partially sent
+                raise BlockingIOError()           # then the socket is full
+        outbox = segment_relay.Outbox(limit=1000)
+        outbox.push(b"aaaaa")
+        outbox.push(b"bbbbb")
+        outbox.flush(Partial())
+        self.assertEqual(list(outbox.queue), [b"aa", b"bbbbb"])  # the unsent tail stays at the head
+        self.assertEqual(outbox.bytes, 7)
+
+    def test_outbox_refuses_a_non_positive_limit(self):
+        with self.assertRaises(ValueError):
+            segment_relay.Outbox(limit=0)
 
 
 if __name__ == "__main__":
