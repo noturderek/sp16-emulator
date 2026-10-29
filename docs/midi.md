@@ -55,8 +55,9 @@ faults or a failed USB flush close and disable only the USB route and clear its 
 The app has a **MIDI > Routing…** window. Nothing else in the emulator depends on it.
 
 - One row per CoreMIDI endpoint, sources first, with the columns **Port**, **In**, **Out**, **Send clock**,
-  **Receive clock**. A toggle that does not apply to an endpoint's kind is disabled. Ports appear and disappear live
-  as devices are plugged in.
+  **Receive clock**. A column that does not apply to an endpoint's kind (In and Receive clock for a destination,
+  Out and Send clock for a source) is left blank and cannot be toggled. Ports appear and disappear live as devices are
+  plugged in.
 - Under the table: a **Clock source** picker (Internal or any source) and **BPM**, **Lock** (`locked`/`unlocked`) and
   **Jitter** readouts. Jitter is the sample standard deviation of the last 96 clock intervals, so a steady clock reads
   close to 0 µs instead of the interval itself. The lock loop is the second-order delay-locked loop of
