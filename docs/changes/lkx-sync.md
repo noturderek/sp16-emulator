@@ -1,6 +1,6 @@
 ---
-title: "Review fix A (lkx-sync): sync bridge, segment relay, timing probe, Pro DJ Link docs"
-description: "Fixes for Codex Sol's review findings in the sync bridge, the segment relay, the timing probe and docs/pro-dj-link.md."
+title: "Review fix A, round 2 (lkx-sync): status_packet order, generator retune, step phase, relay outbox"
+description: "Round-2 fixes for Codex Sol's re-review: status_packet argument order, MIDI generator retune vs Link caching, step-phase reporting, the relay outbox bound and the no-downbeat master-log guard."
 type: report
 status: active
 created: 2026-10-28
@@ -98,3 +98,63 @@ decodes the playhead step from the panel TX log, but timing_probe does not consu
    whole-beat offset; the re-run should confirm which regime applies.
 2. Finding 12 was fixed by correcting the doc (per the note, "correcting the doc is enough"). If a native-UDP
    50001/50002 reader is wanted later, it is a separate feature, not a doc change.
+
+## Round 2 (Codex Sol re-review, run `agent-dispatch-zwvfelih/final.txt`)
+
+Sol re-reviewed the round-1 commits and rejected them with five blocking findings. Each is fixed with a unit test that
+reproduces it first.
+
+- **FINDING 1 [blocking]** `fake_master.py:83` — inserting `master` before `counter` broke the positional callers
+  (`fake_master.py:197`, `segment_master.py:160`): their status counter became the master flag, so the first status
+  was non-master and every serialized counter stayed 0. `master` is now keyword-only after `counter`, and both callers
+  plus the `test_sp16_pdl_sync` helper pass it by keyword. Commit `ac3eaac`.
+- **FINDING 2 [blocking]** `pdl_sync.py:253` — `_on_tempo` gated the ClockGenerator retune on `_sent_bpm`, so a tempo
+  whose delivery failed left the generator at the failed tempo (120 ok, 140 failed, 120 left it at 140). The generator
+  now follows the packet BPM gated only on its own current bpm; `_sent_bpm` caches only what Link accepted.
+  Commit `c52eb3c`.
+- **FINDING 3 [blocking]** `timing_probe.py:260` — picking clicks by proximity to the master cannot establish the
+  follower's downbeat; `follow_phase` now reports the residual phase modulo one step as
+  `step_phase_median_ms` / `step_phase_max_ms` and no longer claims a `downbeats` count. Commit `d7a296e`.
+- **FINDING 4 [blocking]** `segment_relay.py:141` — the pending QEMU stream grew without bound and each immutable
+  concatenation copied the backlog. Frames now queue in a bounded `Outbox` (a deque under a 1 MiB budget); overflow
+  drops the oldest records, counts them and prints one line. Commit `ad7a74d`.
+- **FINDING 5 [blocking]** `timing_probe.py:250` — a master log with no downbeat reached `min()` on an empty list.
+  `follow_phase` now returns a structured insufficient-data result when the log has no `beat_in_bar 1`.
+  Commit `ff0bcf4`.
+
+## Round-2 hand-back
+
+| Finding | Commit | Files | Check | Result |
+|---|---|---|---|---|
+| 1 | `ac3eaac` | net/fake_master.py, net/segment_master.py, tests/test_sp16_net.py, tests/test_sp16_pdl_sync.py | `python3 -m unittest emulator.tests.test_sp16_net emulator.tests.test_sp16_pdl_sync emulator.tests.test_sp16_sync_bridge` | 56/56 OK |
+| 2 | `c52eb3c` | sync/pdl_sync.py, tests/test_sp16_pdl_sync.py | `python3 -m unittest emulator.tests.test_sp16_pdl_sync` | 23/23 OK |
+| 3 | `d7a296e` | timing_probe.py, tests/test_sp16_timing_probe.py, tests/test_sp16_recipes.py | `python3 -m unittest emulator.tests.test_sp16_timing_probe emulator.tests.test_sp16_recipes` | 36/36 OK |
+| 4 | `ad7a74d` | net/segment_relay.py, tests/test_sp16_segment_relay.py | `python3 -m unittest emulator.tests.test_sp16_segment_relay emulator.tests.test_sp16_segment` | 26/26 OK |
+| 5 | `ff0bcf4` | timing_probe.py, tests/test_sp16_timing_probe.py | `python3 -m unittest emulator.tests.test_sp16_timing_probe emulator.tests.test_sp16_recipes` | 37/37 OK |
+
+Full check (the quick set plus every changed module and the timing-probe tests):
+`python3 -m unittest emulator.tests.test_sp16_panel emulator.tests.test_sp16_profiles emulator.tests.test_sp16_fwdev
+emulator.tests.test_sp16_cli_usb emulator.tests.test_sp16_exectrace emulator.tests.test_sp16_fwpack
+emulator.tests.test_sp16_emulator emulator.tests.test_sp16_hwsuite emulator.tests.test_sp16_pcm_tap_analyze
+emulator.tests.test_sp16_e2e_screen emulator.tests.test_sp16_smoke emulator.tests.test_sp16_bootstrap
+emulator.tests.test_sp16_firmware_import emulator.tests.test_sp16_enter emulator.tests.test_sp16_sync_bridge
+emulator.tests.test_sp16_pdl_sync emulator.tests.test_sp16_net emulator.tests.test_sp16_segment
+emulator.tests.test_sp16_segment_relay emulator.tests.test_sp16_timing_probe emulator.tests.test_sp16_recipes`
+→ 576 tests, OK. `git diff --check` clean before every commit.
+
+**What did not run and why.** No live run, build or hardware: all five fixes are source and unit-test changes, and the
+relay's sustained backpressure is covered by a paced subprocess flood plus deterministic `Outbox` unit tests. Swift and
+arm-contracts checks do not apply (no Swift or stub/contract files touched).
+
+**Side effects.** None — no builds, no emulator sessions, no processes left running.
+
+**Parked tasks.** None.
+
+**Cross-lane requests.** None. (Same observation as round 1: `follow_phase` now measures modulo one step, so the
+follower's bar position is still not observable from the clicks alone; `hwsuite.playhead_steps` would supply it if a
+downbeat measurement is wanted later.)
+
+**Open questions for the owner.**
+1. The live `follow` block now reports `step_phase_median_ms` / `step_phase_max_ms` (residual modulo one step). A
+   whole-step or whole-bar offset reads 0, so a future `timing_probe.py run --net mcast …` cannot confirm downbeat
+   alignment by itself; that would need the sequencer position.
