@@ -236,40 +236,31 @@ def read_master_beats(path):
 
 
 def follow_phase(onsets, master_beats, window_t0_ns, bpm, rate=RATE):
-    """Phase error in ms between the SP-16's downbeats and the master's.
+    """Residual phase, modulo one step, in ms between the SP-16's steps and the master's step grid.
 
-    The click fixture sits on every one of the 16 steps, so a downbeat is every 16th onset -- but only when the
-    measurement window happens to open on step 1. Instead of assuming the first onset is a downbeat, each onset is
-    matched to the master beat nearest it and its step number (1..16) is read from that beat's beat-in-bar plus the
-    sub-beat offset; only the onsets on step 1 are the downbeats. `onsets` are frame offsets from the window's first
-    frame; `window_t0_ns` is the host monotonic time of that frame; `master_beats` are (monotonic_ns, beat_in_bar)
-    pairs. The error is reduced modulo the bar period, so a follower that is a whole bar late is not counted as a
-    phase error.
+    The click fixture puts a click on every one of the 16 steps, so every onset lands on the master's step grid; the
+    onsets alone cannot name *which* step (the follower's bar position is not observable from the clicks), so a
+    downbeat delay is not claimed. Each onset is matched to the master beat nearest it and its position on the 16-step
+    grid is read from that beat's beat-in-bar plus the sub-beat fraction; the signed offset from the nearest step,
+    folded to half a step, is the step phase. A follower a whole step (or bar) late reads 0 here: this measures step
+    alignment, not downbeat delay. `onsets` are frame offsets from the window's first frame; `window_t0_ns` is the host
+    monotonic time of that frame; `master_beats` are (monotonic_ns, beat_in_bar) pairs.
     """
     beats = list(master_beats)
     if len(beats) < 2 or len(onsets) < 16:
         return {"error": "too little data"}
-    bar_ms = 4 * 60.0 / bpm * 1000.0
     beat_ns = 60.0 / bpm * 1e9
-    downbeats = [t for t, b in beats if b == 1]
-    errors = []
+    step_ms = beat_ns / 4 / 1e6  # one step is a quarter beat
+    phases = []
     for on in onsets:
         sp_ns = window_t0_ns + int(on / rate * 1e9)
         nearest_t, nearest_b = min(beats, key=lambda m: abs(m[0] - sp_ns))
         frac = (sp_ns - nearest_t) / beat_ns
-        step_num = round((nearest_b - 1 + frac) * 4) + 1
-        if step_num != 1:
-            continue  # not a downbeat onset
-        nearest_downbeat = min(downbeats, key=lambda d: abs(d - sp_ns))
-        phase = (sp_ns - nearest_downbeat) / 1e6 % bar_ms
-        if phase > bar_ms / 2:
-            phase -= bar_ms
-        errors.append(phase)
-    if not errors:
-        return {"error": "no downbeats found"}
-    return {"phase_median_ms": round(statistics.median(abs(e) for e in errors), 3),
-            "phase_max_ms": round(max(abs(e) for e in errors), 3),
-            "downbeats": len(errors)}
+        step_pos = (nearest_b - 1 + frac) * 4.0                # 0..16 steps from the bar's downbeat
+        phases.append((step_pos - round(step_pos)) * step_ms)  # signed, folded to half a step
+    return {"step_phase_median_ms": round(statistics.median(abs(p) for p in phases), 3),
+            "step_phase_max_ms": round(max(abs(p) for p in phases), 3),
+            "onsets": len(phases)}
 
 
 def audio_counters(session):
