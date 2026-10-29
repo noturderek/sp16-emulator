@@ -113,13 +113,14 @@ python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 -
   against a master at 128 BPM +2 %, `tempo_error_bpm` 0.0. The gate was the player-status packet's play state: the
   status frame's `P3` byte must say the player is loaded and playing forward, and the master-meaningful byte and the
   rekordbox `Mv` multiplier must be set (`emulator/net/fake_master.py`).
-- **Downbeat does not align (not finished).** The phase figure an earlier probe reported (a constant ~495 ms over 33
+- **Downbeat alignment (unverified).** The phase figure an earlier probe reported (a constant ~495 ms over 33
   downbeats in a 60 s window) could not tell a firmware phase gap from a whole-step or whole-bar offset: identical
   clicks on all 16 steps cannot say which click is step 1. `timing_probe.follow_phase` now reports the residual phase
   modulo one step (`step_phase_median_ms` / `step_phase_max_ms`) instead of a downbeat delay, so a follower a whole
   step or bar late reads 0 there. Naming the downbeat itself still needs the sequencer position
   (`hwsuite.playhead_steps`), and the beat packet's phase semantics (`nextBeat`, `Bb`) remain the open question.
-- **Linking with an emulated CDJ-3000 (not attempted).** It depends on the downbeat working, so it was left parked.
+- **Linking with an emulated CDJ-3000 (not attempted).** It depends on verifying downbeat alignment, so it was left
+  parked.
 
 ## The sync bridge
 

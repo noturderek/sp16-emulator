@@ -16,7 +16,7 @@ The firmware talks to its hardware through a small set of interfaces. The emulat
 | Analog board: filter send/return loop, high-pass DAC, MAIN OUT, INPUT LEVEL, CUTOFF, RESONANCE | `hardware_stub.c` board model (see [Analog board model](#analog-board-model)); host-only pot positions from `panel.py` through a shared state file; reference curves in `analog_laws.py` |
 | GPIO lines (filter select, input limiter, MIDI thru, USB-A power and over-current) | `hardware_stub.c` serves `/dev/gpiodrv` (one byte per line); input limiter on GPIO5_IO06; active-low USB over-current on GPIO4_IO14 (`ctl usb-oc on\|off`). Logged and reported in `metrics.guest.board.gpio` |
 | ALSA sequencer and MIDI | `hardware_stub.c` answers the 32-bit ALSA sequencer ABI for the firmware app (version and running-mode ioctls, client/port enumeration, port creation, subscriptions, events), advertising client 128 `snd-din-midi` always and client 129 `g_midi` while the USB-B MIDI mode marker exists. DIN UART (`/dev/din_midi`) and the `sp16.usb-midi` byte stream are carried by `emulator/midi/seq-bridge.c` to the host bridges (`emulator/midi/din.py`, `usb.py`, gated by `--midi`); shared clock engine `emulator/midi/clock.py`. See [midi.md](midi.md). Factory test loopback (`/dev/ttymxc1`) serves PAGE 8: DEVICE TEST |
-| Network and Pro DJ Link | Virtio-net NIC (`--net host\|bridged:IF\|mcast[:PORT]`, `--net-ip`). `mcast` runs through a host-side relay (`emulator/net/segment_relay.py`) instead of QEMU's own multicast backend. `hardware_stub.c` provides fixed GLINK carrier=1 response and passes real ARP packet sockets. Link-local 169.254.A.B assigned by guest. The keep-alive is emitted and decoded on the segment and the firmware follows a master's tempo; the downbeat is not aligned. See [pro-dj-link.md](pro-dj-link.md) |
+| Network and Pro DJ Link | Virtio-net NIC (`--net host\|bridged:IF\|mcast[:PORT]`, `--net-ip`). `mcast` runs through a host-side relay (`emulator/net/segment_relay.py`) instead of QEMU's own multicast backend. `hardware_stub.c` provides fixed GLINK carrier=1 response and passes real ARP packet sockets. Link-local 169.254.A.B assigned by guest. The keep-alive is emitted and decoded on the segment and the firmware follows a master's tempo; downbeat alignment remains unverified (the probe measures phase modulo one step). See [pro-dj-link.md](pro-dj-link.md) |
 | Internal storage | a per-firmware 1 GB data image (`data/emmc.img`), formatted once; `./sp16 run --ephemeral` uses a disposable one with no saved project and no lock, so a second app can run the same firmware |
 | USB stick | `virtio-blk-pci` on a PCIe root port supporting QMP hot attach at runtime (`ctl usb attach PATH`, USB > Attach USB Image...) |
 | Backlight, media notifications, helper processes | `hardware_stub.c` serves `/dev/backlight` ioctl `0x40047000` (raw 0..255), scaling panel LCD brightness from Utility settings. Unknown device nodes and ioctls fail loudly and are counted |
@@ -175,7 +175,8 @@ virtio-net NIC:
   169.254.A.B link-local address.
 - The firmware binds UDP 50000, 50002 and 50001 and emits its 54-byte keep-alive about every 2 s; `segment_watch.py`
   decodes it and `segment_master.py` (a fake master on the segment) reads it back as proof of acceptance. With SYNC
-  SOURCE = PRO DJ LINK the sequencer follows the master's effective tempo exactly; the downbeat stays ~495 ms off.
+  SOURCE = PRO DJ LINK the sequencer follows the master's effective tempo exactly; downbeat alignment remains
+  unverified because the probe measures phase modulo one step.
   `emulator/sync/bridge.py` additionally turns the master's tempo into a 24 PPQN MIDI clock and, with `--link`, drives
   a Carabiner. `timing_probe.py run --net mcast` measures a whole follow run.
 

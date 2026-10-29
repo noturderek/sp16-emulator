@@ -240,10 +240,10 @@ python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 -
 ```
 
 With SYNC SOURCE = PRO DJ LINK (the `sync-source-pdl` menu recipe) the sequencer follows the master's effective tempo
-exactly: 130.56 BPM against 128 BPM +2 %, with no tempo error. The downbeat does not align yet (about 495 ms off), so
-linking with a second emulator was left parked. [docs/pro-dj-link.md](docs/pro-dj-link.md) covers the tools, the sync
-bridge that turns a master's tempo into MIDI clock (`emulator/sync/bridge.py`, optionally driving Carabiner for Ableton
-Link), and what is still open.
+exactly: 130.56 BPM against 128 BPM +2 %, with no tempo error. Downbeat alignment remains unverified: the probe reports
+phase modulo one step. Linking with a second emulator was left parked. [docs/pro-dj-link.md](docs/pro-dj-link.md) covers
+the tools, the sync bridge that turns a master's tempo into MIDI clock (`emulator/sync/bridge.py`, optionally driving
+Carabiner for Ableton Link), and what is still open.
 
 ## Commands and Makefile
 
@@ -353,8 +353,9 @@ To turn an unverified version into a verified one, see [docs/architecture.md](do
   tried, and why needs a debugger.
 - USB-B pad notes: the route works (transport and CC arrive on `SP-16 USB`), but a pad hit produces no note; the
   project needs playable content and the per-track MIDI channel and NOTE/CC send.
-- Pro DJ Link: the tempo follows, the downbeat is about 495 ms off, and linking with a second emulator was not
-  attempted. The Ableton Link half of the sync bridge is untested (it needs a Carabiner you run yourself).
+- Pro DJ Link: the tempo follows; downbeat alignment remains unverified because the probe measures phase modulo one
+  step. Linking with a second emulator was not attempted. The Ableton Link half of the sync bridge is untested (it
+  needs a Carabiner you run yourself).
 - A version is only `verified` by a full-tier hardware suite run ([docs/hardware-suite.md](docs/hardware-suite.md)).
 
 ## Load a modified firmware
