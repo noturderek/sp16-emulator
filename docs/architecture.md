@@ -291,6 +291,19 @@ into one `i<n> c<cpu> 0x%08x` per line. A console from an older build still read
 Tracing every block slows the app a lot: expect a long boot. A clean stop (`SIGTERM` to the app's process id, or Cmd-Q)
 loses at most the last half second of addresses.
 
+### Timing probe
+
+`python3 emulator/timing_probe.py run --build NAME [--seconds 60]` measures two independent paths of a running research
+session: the audio clock (a click on every one of the 16 steps gives the step interval and its jitter from the recorded
+WAV, sample-accurate) and the panel link (the intervals between the firmware's TX frames as the host received them; a
+gap above `--stall-ms`, 40 ms by default, is a stall). The bridge counts the same frames at its own end, so the report
+names the hop a stall sat on: `guest-to-bridge`, `bridge-to-app` or `mixed`. Targets are an onset sigma below 1 ms and
+a stall maximum below 40 ms over 60 s; the report carries the load average and the VM count, so compare runs taken
+under similar load. A host that stops draining the audio port long enough leaves holes in the WAV, which the report
+shows as `gap_frames_in_window`/`guest_drops_in_window` and `targets_met.audio_window_clean` false. `--net mcast` turns
+the same run into a Pro DJ Link follow measurement ([pro-dj-link.md](pro-dj-link.md)). The `wav` and `tx` subcommands
+re-analyse a recording or a session's `tx-frames.jsonl` without starting anything.
+
 ### Bench mode (`--no-ui-input`)
 
 A script that drives a session through the socket and compares the LCD against reference data can be disturbed by
