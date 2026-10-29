@@ -3,7 +3,7 @@
 Joins the segment (net/segment.py framing), feeds the master's 0x28 beat and 0x0a status packets to
 sync/pdl_sync.py's PdlClockBridge, and emits the resulting MIDI clock (0xF8, 24 PPQN) through a `send_clock(byte)`
 sink at the master's effective BPM. When a Carabiner listens on 127.0.0.1:17000, the same bridge also sends it
-set-tempo and force-beat-at-time (the Link half; Carabiner is a design-reference app the user runs themselves).
+bpm and force-beat-at-time (the Link half; Carabiner is a design-reference app the user runs themselves).
 
 The bridge reads the master's packets straight off the segment, so it runs independently of whether the emulator's
 own follower path is engaged. Stdlib only; the CoreMIDI sink is a thin adapter the caller supplies (e.g.

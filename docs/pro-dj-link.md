@@ -133,10 +133,13 @@ python3 emulator/sync/bridge.py --duration 60                           # --link
 - **MIDI clock (works, unit-tested).** The master's effective BPM (base BPM times the actual pitch) retunes a 24 PPQN
   0xF8 stream on a background thread; a tempo change lands on the next pulse without restarting the thread. The CoreMIDI
   sink is a thin adapter, so the packet → tempo → clock pipeline is tested without CoreMIDI.
-- **Ableton Link (not tested live).** `--link` drives a minimal Carabiner client on TCP `127.0.0.1:17000`: `set-tempo`
-  on a tempo change and `force-beat-at-time` on every downbeat (beat 0 of the next bar). Carabiner is a design
-  reference the user runs themselves; it is not bundled, and no live acceptance was run (the Mac used had no
-  Carabiner listening). With no Carabiner the bridge prints one diagnostic per outage
+- **Ableton Link (tempo works; phase not measured).** `--link` drives a minimal Carabiner client on TCP
+  `127.0.0.1:17000`: `bpm` on a tempo change and `force-beat-at-time` on every downbeat (beat 0 of the next bar, at the
+  Link clock's now, `:start + beat * 60e6 / bpm` from Carabiner's `status`). Carabiner is not bundled; build it from
+  [Deep-Symmetry/carabiner](https://github.com/Deep-Symmetry/carabiner) and run it yourself. Live, with the segment
+  master at 128 BPM +2 % changing to 140 BPM after 25 s, a second Carabiner on another port (an independent Link peer)
+  read 130.56 BPM, then 142.80 BPM within about 4 s of the change. Whether the forced downbeat lands on the master's
+  downbeat was not measured. With no Carabiner the bridge prints one diagnostic per outage
   (`sync: no Carabiner listening on 127.0.0.1:17000 …; Link tempo/phase sync is off`) and keeps the MIDI clock running;
   a later outage after a recovery warns once more.
 
