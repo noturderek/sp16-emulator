@@ -34,14 +34,15 @@ def target_name(build, din=False):
 def forward(line):
     """The helper's `in HEX` line -> the `out HEX` line to send, or None for anything else."""
     line = line.strip()
-    if not line.startswith("in "):
+    if not line.startswith("in ") or not line[3:].strip():
         return None
     return "out " + line[3:]
 
 
 def shown(line):
     """True when a forwarded message is worth printing (not clock or active sensing)."""
-    return line.strip()[3:5] not in QUIET
+    payload = line.strip()[3:]
+    return bool(payload) and payload[:2] not in QUIET
 
 
 def endpoints_present(listing, source, target):

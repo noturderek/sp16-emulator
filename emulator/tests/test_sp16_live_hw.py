@@ -50,7 +50,20 @@ class PdlScanTests(unittest.TestCase):
             {"port": 50001, "kind": 0x28, "name": "CDJ-3000", "player": 2, "bpm": 120.0, "pitch": 1.0,
              "effective": 120.0, "beat_in_bar": 2},
         ])
-        self.assertEqual(pdl_scan.hints(devices), ["CDJ-3000 is not the tempo master: press MASTER on it"])
+        self.assertEqual(pdl_scan.hints(devices), ["CDJ-3000 #2 is not the tempo master: press MASTER on it"])
+
+    def test_a_stopped_master_and_two_players_of_one_model(self):
+        devices = pdl_scan.summarise([
+            {"port": 50000, "kind": 6, "name": "TORAIZ", "player": 0x41},
+            {"port": 50002, "kind": 0x0a, "name": "CDJ-3000", "player": 1, "master": True, "play_state": 0x00},
+            {"port": 50001, "kind": 0x28, "name": "CDJ-3000", "player": 1, "bpm": 120.0, "pitch": 1.0,
+             "effective": 120.0, "beat_in_bar": 1},
+            {"port": 50001, "kind": 0x28, "name": "CDJ-3000", "player": 2, "bpm": 126.0, "pitch": 1.0,
+             "effective": 126.0, "beat_in_bar": 3},
+        ])
+        self.assertEqual(sorted(devices), ["CDJ-3000 #1", "CDJ-3000 #2", "TORAIZ #65"])
+        self.assertIn("CDJ-3000 #1 has no track loaded and playing: the SP-16 follows a playing master only",
+                      pdl_scan.hints(devices))
 
 
 class ThruTests(unittest.TestCase):
@@ -58,6 +71,8 @@ class ThruTests(unittest.TestCase):
         self.assertEqual(thru.forward("in fa\n"), "out fa")
         self.assertEqual(thru.forward("in 90 3c 64"), "out 90 3c 64")
         self.assertIsNone(thru.forward("ready"))
+        self.assertIsNone(thru.forward("in "))
+        self.assertFalse(thru.shown("in "))
 
     def test_clock_and_active_sensing_are_forwarded_but_not_shown(self):
         self.assertFalse(thru.shown("in f8"))

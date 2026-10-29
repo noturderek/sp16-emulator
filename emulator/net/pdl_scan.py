@@ -49,10 +49,12 @@ def decode(port, data):
 
 
 def summarise(packets):
-    """Per device name: the player number, the packet kinds seen and the latest beat/status fields."""
+    """Per device (name and player number, so two players of one model stay apart): the packet kinds seen and the
+    latest beat/status fields. A packet without a player number is filed under the name alone."""
     devices = {}
     for p in packets:
-        d = devices.setdefault(p["name"], {"kinds": set()})
+        key = p["name"] if "player" not in p else f'{p["name"]} #{p["player"]}'
+        d = devices.setdefault(key, {"kinds": set(), "name": p["name"]})
         d["kinds"].add({50000: "keep-alive", 50001: "beat", 50002: "status"}[p["port"]])
         for key in ("player", "bpm", "pitch", "effective", "beat_in_bar", "master", "play_state"):
             if key in p:
@@ -63,8 +65,8 @@ def summarise(packets):
 def hints(devices):
     """Plain-language checks for following a master (from the 1.60 follower's gates)."""
     out = []
-    players = {n: d for n, d in devices.items() if n != EMULATOR_NAME}
-    if EMULATOR_NAME not in devices:
+    players = {n: d for n, d in devices.items() if d.get("name", n) != EMULATOR_NAME}
+    if not any(d.get("name", n) == EMULATOR_NAME for n, d in devices.items()):
         out.append("no TORAIZ keep-alive: start the emulator with --net bridged:IF on this network")
     if not players:
         out.append("no other Pro DJ Link device seen: check the cable, the adapter and that the player is on")
@@ -75,6 +77,8 @@ def hints(devices):
             out.append(f"{name} sends no beat packets: load and play a track on it")
         if d.get("master") is False:
             out.append(f"{name} is not the tempo master: press MASTER on it")
+        if "play_state" in d and not d["play_state"] & 0x09:
+            out.append(f"{name} has no track loaded and playing: the SP-16 follows a playing master only")
     if players and not any("status" in d["kinds"] for d in players.values()):
         out.append("status packets are sent to each player directly, so this scan cannot see the master flag: if the "
                    "emulator shows LINK but keeps its own BPM, press MASTER on the player and make sure a track is playing")
@@ -110,8 +114,8 @@ def main(argv=None):
     parser.add_argument("--seconds", type=float, default=6.0, help="how long to listen (default 6)")
     args = parser.parse_args(argv)
     devices = summarise(listen(args.seconds))
-    for name, d in sorted(devices.items()):
-        line = f"{name or '?':<12} player {d.get('player', '?'):<3} {', '.join(sorted(d['kinds']))}"
+    for _, d in sorted(devices.items()):
+        line = f"{d['name'] or '?':<12} player {d.get('player', '?'):<3} {', '.join(sorted(d['kinds']))}"
         if "bpm" in d:
             line += (f"  {d['bpm']:.2f} BPM x pitch {(d['pitch'] - 1) * 100:+.2f} percent = {d['effective']:.2f} BPM,"
                      f" beat {d['beat_in_bar']}")

@@ -57,7 +57,8 @@ between them.
    python3 emulator/midi/thru.py --build NAME
    ```
 
-   It waits for both ends, then prints `thru: TSP-16 -> SP-16 USB [NAME]` and each message but clock.
+   It waits for both ends, then prints `thru: TSP-16 -> SP-16 USB [NAME] (Ctrl-C to stop)` and each message it
+   forwards except clock and active sensing.
 4. Press **PLAY** on the physical unit: the thru prints `fa`, the emulated sequencer starts and takes the tempo from
    the clock (it reads, for example, 120.1 against 120.0: tempo from clock timing always wobbles a little). STOP
    prints `fc`.
