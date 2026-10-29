@@ -5,6 +5,7 @@ into build/midi-bridge/. It speaks one text line per message over stdin/stdout, 
 every test can substitute a pipe for it.
 """
 from collections import namedtuple
+import fcntl
 import os
 from pathlib import Path
 import queue
@@ -74,20 +75,33 @@ def hex_line(data):
 
 
 def helper_binary(build_dir=None):
-    """The compiled helper, built when missing or older than its source. Raises RuntimeError without swiftc."""
+    """The compiled helper, built when missing or older than its source. Raises RuntimeError without swiftc.
+
+    The DIN and USB bridges both call this on first use, so the build is serialised under a lock file: the second
+    bridge re-checks after acquiring the lock and finds the binary already up to date, instead of racing swiftc's
+    linker on the same output path (which fails with "ld: File exists")."""
     folder = Path(build_dir or REPO / "build") / "midi-bridge"
     binary = folder / "coremidi-io"
     if binary.exists() and binary.stat().st_mtime >= HELPER_SOURCE.stat().st_mtime:
         return binary
     folder.mkdir(parents=True, exist_ok=True)
-    try:
-        result = subprocess.run(["swiftc", "-O", str(HELPER_SOURCE), "-framework", "CoreMIDI", "-o", str(binary)],
-                                capture_output=True, text=True, timeout=300)
-    except FileNotFoundError:
-        raise RuntimeError("swiftc is missing; install the Xcode Command Line Tools with: xcode-select --install") from None
-    if result.returncode:
-        raise RuntimeError(f"building the CoreMIDI helper failed:\n{result.stderr.strip()}")
-    return binary
+    with (folder / "coremidi-io.lock").open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # Re-check under the lock: another bridge may have built the helper while this one waited.
+            if binary.exists() and binary.stat().st_mtime >= HELPER_SOURCE.stat().st_mtime:
+                return binary
+            try:
+                result = subprocess.run(["swiftc", "-O", str(HELPER_SOURCE), "-framework", "CoreMIDI",
+                                         "-o", str(binary)], capture_output=True, text=True, timeout=300)
+            except FileNotFoundError:
+                raise RuntimeError("swiftc is missing; install the Xcode Command Line Tools with: "
+                                   "xcode-select --install") from None
+            if result.returncode:
+                raise RuntimeError(f"building the CoreMIDI helper failed:\n{result.stderr.strip()}")
+            return binary
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def list_ports(build_dir=None):

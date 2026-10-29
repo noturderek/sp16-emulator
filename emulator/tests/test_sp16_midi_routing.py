@@ -130,6 +130,19 @@ class MalformedPreferencesTests(unittest.TestCase):
             self.assertTrue(routing.route(NAME, True).carries_from_guest(NOTE))
             self.assertIsNone(routing.problem)
 
+    def test_a_stat_permission_error_keeps_the_routes_it_already_had(self):
+        # A stat(2) permission error must not clear the routes the user already closed: reopening a disabled
+        # direction is worse than keeping it closed. Only an absent file (FileNotFoundError) means "no preferences".
+        with tempfile.TemporaryDirectory() as folder:
+            path = preferences(folder, [port_entry(inEnabled=False)])
+            routing = Routing(path, refresh_seconds=0)
+            self.assertFalse(routing.route(NAME, True).carries_from_guest(NOTE))
+            with mock.patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
+                self.assertFalse(routing.route(NAME, True).carries_from_guest(NOTE))
+                self.assertIsNotNone(routing.problem)
+            # Once the file is readable again its routes hold (still closed here), never silently reopened.
+            self.assertFalse(routing.route(NAME, True).carries_from_guest(NOTE))
+
     def test_a_toggle_that_is_not_a_json_true_fails_closed(self):
         # A hand-edited "true"/1 must not read as on: only a real JSON true opens a direction.
         route = route_for([port_entry(inEnabled="true", outEnabled=1)])

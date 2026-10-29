@@ -33,7 +33,7 @@ What every update of the product shares; used by the importer before a version h
 | `firmware` | `version`, `app_path`, `app_sha256` (the identity that matches a profile to an import), `upd_sha256` (repository copy only), `app_revision`, `panel_revisions`, `loader_path` |
 | `runtime` | application working directory, emulated CPU, library path, data, storage and USB mount points, writable directories, allowed application arguments |
 | `panel` | `selector_window_frames`, `pad_curve`, `button_roles`, `buttons_inert`, `counters`, `analog_words`, `lamp_roles` (SHIFT has no physical lamp), `lamp_groups`, `mono_dim_flag` |
-| `audio` | `audio.jacks` mapping jack names to stream channel pairs (MAIN, PHONES, OUT 3-4, OUT 5-6, OUT 7-8), retained in shipped profiles for the Output monitor menu |
+| `audio` | `audio.jacks` mapping jack names to stream channel pairs (MAIN, PHONES, OUT 3-4, OUT 5-6, OUT 7-8), validated against `audio-jack-map.json`. Dropped from shipped profiles (not a runtime field); the Output monitor menu uses the same mapping compiled into the app |
 | `calibration` | pad calibration file path, format, template, range and default; the guest writes a synthetic file in this format at boot |
 
 ### Hardware suite data (repository copy only)
