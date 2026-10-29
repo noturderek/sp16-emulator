@@ -82,9 +82,9 @@ class Outbox:
     """A bounded FIFO of framed records waiting to be written to the QEMU stream.
 
     QEMU's stream backend can stop reading (a paused guest, a slow reader); the relay must not buffer without bound.
-    Records are held in a deque under a byte budget `limit`; when a push would exceed it, the oldest whole records are
-    dropped first (never a partial record) and counted so the relay can report the overflow once. Byte accounting
-    stays exact across partial sends because the unsent tail of a record is kept in place at the head.
+    Records are held in a deque under an unsent-byte budget `limit`; when a push would exceed it, the oldest untouched
+    records are dropped first and counted so the relay can report the overflow once. The head record's sent offset
+    protects an in-progress frame from being dropped: its remaining bytes must precede the next length prefix.
     """
 
     def __init__(self, limit=OUTBOX_LIMIT):
@@ -92,6 +92,7 @@ class Outbox:
             raise ValueError("outbox limit must be positive")
         self.limit = limit
         self.queue = collections.deque()
+        self.sent_offset = 0
         self.bytes = 0
         self.dropped_frames = 0
         self.dropped_bytes = 0
@@ -99,27 +100,30 @@ class Outbox:
     def push(self, record: bytes) -> None:
         self.queue.append(record)
         self.bytes += len(record)
-        while self.bytes > self.limit and self.queue:
-            head = self.queue.popleft()
-            self.bytes -= len(head)
+        drop_index = 1 if self.sent_offset else 0
+        while self.bytes > self.limit and len(self.queue) > drop_index:
+            record = self.queue[drop_index]
+            del self.queue[drop_index]
+            self.bytes -= len(record)
             self.dropped_frames += 1
-            self.dropped_bytes += len(head)
+            self.dropped_bytes += len(record)
 
     def flush(self, sock) -> None:
         """Write records oldest-first to the nonblocking `sock`, keeping the unsent tail of the record in progress."""
         while self.queue:
             head = self.queue[0]
             try:
-                sent = sock.send(head)
+                sent = sock.send(head[self.sent_offset:])
             except (BlockingIOError, InterruptedError):
                 return
             if sent <= 0:
                 return
             self.bytes -= sent
-            if sent < len(head):
-                self.queue[0] = head[sent:]
+            self.sent_offset += sent
+            if self.sent_offset < len(head):
                 return
             self.queue.popleft()
+            self.sent_offset = 0
 
     def __bool__(self):
         return bool(self.queue)

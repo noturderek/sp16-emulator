@@ -218,6 +218,47 @@ class RelayTests(unittest.TestCase):
 
 
 class OutboxTests(unittest.TestCase):
+    def test_overflow_preserves_a_frame_already_started_on_the_qemu_stream(self):
+        frames = [letter * 12 for letter in (b"A", b"B", b"C", b"D", b"E")]
+        records = [struct.pack(">I", len(frame)) + frame for frame in frames]
+        # Split both the length prefix and the payload, including halfway through the record.
+        for offset in (1, 3, 4, 8, 15):
+            for oversized in (False, True):
+                with self.subTest(offset=offset, oversized=oversized):
+                    writer, qemu = socket.socketpair()
+                    with writer, qemu:
+                        class Partial:
+                            def send(self, data):
+                                return writer.send(data[:offset])
+
+                        outbox = segment_relay.Outbox(limit=48)
+                        for record in records[:3]:
+                            outbox.push(record)
+                        outbox.flush(Partial())
+                        for record in records[3:]:
+                            outbox.push(record)
+                        if oversized:
+                            outbox.push(struct.pack(">I", 60) + b"X" * 60)
+
+                        outbox.flush(writer)
+                        expected = [frames[0]] if oversized else [frames[0], *frames[3:]]
+                        for frame in expected:
+                            self.assertEqual(recv_frame(qemu), frame)
+                        self.assertFalse(outbox)
+                        self.assertEqual(outbox.bytes, 0)
+                        self.assertEqual(outbox.dropped_frames, 5 if oversized else 2)
+                        self.assertEqual(outbox.dropped_bytes, 128 if oversized else 32)
+
+                        # Completing a partial frame must also clear its protection for later overflows.
+                        for record in records[1:]:
+                            outbox.push(record)
+                        self.assertEqual(outbox.bytes, 48)
+                        outbox.flush(writer)
+                        for frame in frames[2:]:
+                            self.assertEqual(recv_frame(qemu), frame)
+                        writer.shutdown(socket.SHUT_WR)
+                        self.assertEqual(qemu.recv(1), b"")
+
     def test_outbox_drops_the_oldest_records_to_stay_under_the_limit(self):
         outbox = segment_relay.Outbox(limit=100)
         for _ in range(5):
@@ -240,7 +281,8 @@ class OutboxTests(unittest.TestCase):
         outbox.push(b"aaaaa")
         outbox.push(b"bbbbb")
         outbox.flush(Partial())
-        self.assertEqual(list(outbox.queue), [b"aa", b"bbbbb"])  # the unsent tail stays at the head
+        self.assertEqual(list(outbox.queue), [b"aaaaa", b"bbbbb"])
+        self.assertEqual(outbox.sent_offset, 3)     # resume the head before sending the next record
         self.assertEqual(outbox.bytes, 7)
 
     def test_outbox_refuses_a_non_positive_limit(self):
