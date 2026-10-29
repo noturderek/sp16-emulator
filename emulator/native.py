@@ -579,8 +579,8 @@ def validate_net_ip(net_ip):
 
 def net_environment(mode, net_ip=None):
     """`launch --net MODE [--net-ip ADDR]` -> the environment the QEMU wrapper reads (net/qemu-net.sh), {} for no
-    network. host and bridged:IF need the root socket_vmnet daemon to be running (the user starts it, see
-    docs/changes/l4-network.md); mcast needs nothing and links instances on this Mac only. SP16_NET_MODE carries the
+    network. host and bridged:IF need the root socket_vmnet daemon to be running (the user starts it with
+    emulator/net/vmnet-bridged.sh IF, see docs/pro-dj-link.md); mcast needs nothing and links instances on this Mac only. SP16_NET_MODE carries the
     mode to the guest init (via /proc/cmdline) so a bridged run can add a real-subnet address; SP16_NET_IP is the
     optional static address for that."""
     if mode in (None, "none"):
@@ -598,7 +598,7 @@ def net_environment(mode, net_ip=None):
         path = vmnet_socket_path(name)
         if path is None:
             raise ValueError(f"--net {mode}: the socket_vmnet daemon is not running (no {name} socket in "
-                             f"{', '.join(VMNET_DIRECTORIES)}). Start it first (see docs/changes/l4-network.md), or use "
+                             f"{', '.join(VMNET_DIRECTORIES)}). Start it first (emulator/net/vmnet-bridged.sh IF; docs/pro-dj-link.md), or use "
                              "--net mcast, which needs no root and links emulators on this Mac only")
         if "," in path:
             raise ValueError("socket_vmnet path must not contain commas")

@@ -196,7 +196,7 @@ class VersionDataTests(unittest.TestCase):
 
     def test_the_jacks_survive_a_shipped_profile_that_drops_the_audio_section(self):
         """native.shipped_profile keeps runtime fields only, so a shipped copy without audio still validates (the
-        monitor menu needs audio.jacks there; that switch is a cross-lane request, see docs/changes)."""
+        monitor menu needs audio.jacks there; that switch is a separate change)."""
         shipped = native.shipped_profile(profiles.legacy())
         self.assertNotIn("audio", shipped)
         self.assertEqual(profiles.audio_jacks(shipped), {})
