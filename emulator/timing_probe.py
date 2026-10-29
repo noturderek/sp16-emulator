@@ -244,11 +244,14 @@ def follow_phase(onsets, master_beats, window_t0_ns, bpm, rate=RATE):
     grid is read from that beat's beat-in-bar plus the sub-beat fraction; the signed offset from the nearest step,
     folded to half a step, is the step phase. A follower a whole step (or bar) late reads 0 here: this measures step
     alignment, not downbeat delay. `onsets` are frame offsets from the window's first frame; `window_t0_ns` is the host
-    monotonic time of that frame; `master_beats` are (monotonic_ns, beat_in_bar) pairs.
+    monotonic time of that frame; `master_beats` are (monotonic_ns, beat_in_bar) pairs. A master log without a downbeat
+    (no beat_in_bar 1) cannot locate the step grid, so the measurement reports insufficient data.
     """
     beats = list(master_beats)
     if len(beats) < 2 or len(onsets) < 16:
         return {"error": "too little data"}
+    if not any(b == 1 for _, b in beats):
+        return {"error": "no downbeat in master log"}
     beat_ns = 60.0 / bpm * 1e9
     step_ms = beat_ns / 4 / 1e6  # one step is a quarter beat
     phases = []

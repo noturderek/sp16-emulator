@@ -145,6 +145,18 @@ class FollowPhaseTests(unittest.TestCase):
         self.assertNotIn("downbeats", report)
         self.assertNotIn("phase_median_ms", report)  # the downbeat-phase name is gone
 
+    def test_a_master_log_without_a_downbeat_is_insufficient_data(self):
+        # Sol's input: two master beats numbered 2 and 3 (no beat_in_bar 1) and 16 onsets, with the window covering
+        # where beat 1 would fall. The measurement cannot locate the step grid, so it is a structured result, not a
+        # min() over an empty downbeat list.
+        bpm = 120.0
+        beat_ns = int(60 / bpm * 1e9)
+        step = beat_ns // 4 / 1e9 * probe.RATE
+        onsets = [i * step for i in range(16)]
+        beats = [(0, 2), (beat_ns, 3)]
+        report = probe.follow_phase(onsets, beats, -1000_000_000, bpm)
+        self.assertEqual(report, {"error": "no downbeat in master log"})
+
 
 class TxTests(unittest.TestCase):
     def test_steady_frames_have_no_stalls(self):
