@@ -5,7 +5,7 @@ The SP-16 is a Pro DJ Link tempo follower; the bridge takes the master's tempo/p
 
 * MIDI clock: `midi/clock.py`'s ClockGenerator, fed the effective BPM (base BPM times the actual pitch), exactly as
   python-prodj-link's midiclock.py does (`clock = bpm * actual_pitch`).
-* Ableton Link: a minimal Carabiner client (TCP 127.0.0.1:17000) that sends `set-tempo` on a change and
+* Ableton Link: a minimal Carabiner client (TCP 127.0.0.1:17000) that sends `bpm` on a change and
   `force-beat-at-time` to align the downbeat. Carabiner (external/Deep-Symmetry_carabiner, design reference) then
   shares the tempo with every Link peer. Ableton Link itself is a design reference only (external/Ableton_link is GPL).
 
@@ -15,6 +15,7 @@ and net/fake_master.py builds. Stdlib only.
 from __future__ import annotations
 
 import re
+import select
 import socket
 import struct
 import sys
@@ -98,18 +99,20 @@ class TempoTracker:
 
 
 class CarabinerLink:
-    """A minimal Carabiner client: `set-tempo` on tempo change and `force-beat-at-time` for phase. Carabiner listens on
-    TCP 127.0.0.1:17000 and answers `status` with `{ :peers N :bpm X :start T :beat B }` (T in microseconds)."""
+    """A minimal Carabiner client: `bpm` on tempo change and `force-beat-at-time` for phase. Carabiner listens on
+    TCP 127.0.0.1:17000 and answers `status` with `status { :peers N :bpm X :start T :beat B }` (T in microseconds).
+    It also answers `bpm` (when the tempo changes) and `force-beat-at-time` with a status line, so replies are read
+    line by line and `status()` skips any it did not ask for."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 17000):
         self.host, self.port = host, port
         self.sock: socket.socket | None = None
-        self._file = None
+        self._buf = b""
         self._warned = False
 
     @staticmethod
     def set_tempo_message(bpm: float) -> bytes:
-        return f"set-tempo {bpm:.6f}\n".encode()
+        return f"bpm {bpm:.6f}\n".encode()
 
     @staticmethod
     def force_beat_at_time_message(beat: float, when_micros: int, quantum: int = 4) -> bytes:
@@ -130,34 +133,62 @@ class CarabinerLink:
             fields[key] = float(value) if "." in value else int(value)
         return fields
 
+    @staticmethod
+    def link_now(status: dict) -> int:
+        """The Link clock now, in microseconds, from a status reply: `:start` is when beat 0 fell at the current tempo,
+        so now = start + beat * 60e6 / bpm."""
+        return int(status["start"] + status["beat"] * 60e6 / status["bpm"])
+
     def connect(self) -> None:
         self.sock = socket.create_connection((self.host, self.port), timeout=2.0)
-        self._file = self.sock.makefile("rb")
+        self._buf = b""
 
     def send(self, message: bytes) -> None:
         if self.sock is None:
             self.connect()
         self.sock.sendall(message)
 
-    def status(self) -> dict | None:
-        """The current Carabiner status (its Link-timeline `start`, in microseconds), or None when not connected."""
-        try:
-            self.send(b"status\n")
-            if self._file is None:
+    def _read_line(self, timeout: float) -> bytes | None:
+        """One reply line, or None when none arrives within `timeout` (0 polls without waiting)."""
+        while b"\n" not in self._buf:
+            ready, _, _ = select.select([self.sock], [], [], timeout)
+            if not ready:
                 return None
-            return self.parse_status(self._file.readline())
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionResetError("Carabiner closed the connection")
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        return line
+
+    def status(self) -> dict | None:
+        """The current Carabiner status (its Link-timeline `start`, in microseconds), or None when not connected.
+        Replies already waiting (to earlier `bpm` and `force-beat-at-time` calls) are discarded first."""
+        try:
+            if self.sock is not None:
+                while self._read_line(0) is not None:
+                    pass
+            self.send(b"status\n")
+            deadline = time.monotonic() + 1.0
+            while (left := deadline - time.monotonic()) > 0:
+                line = self._read_line(left)
+                if line is None:
+                    return None
+                if line.startswith(b"status"):
+                    return self.parse_status(line)
+            return None
         except OSError:
+            self._drop()
             return None
 
     def _drop(self) -> None:
         """Close the socket without raising, so the next send attempts a fresh connect."""
-        for closable in (self._file, self.sock):
-            try:
-                if closable is not None:
-                    closable.close()
-            except OSError:
-                pass
-        self._file = None
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except OSError:
+            pass
+        self._buf = b""
         self.sock = None
 
     def _deliver(self, message: bytes) -> bool:
@@ -193,7 +224,7 @@ class PdlClockBridge:
     """Consumes master packets, keeps a MIDI ClockGenerator at the effective BPM, and pushes tempo/phase to Link.
 
     `feed_beat(payload, t)` and `feed_status(payload, t)` accept packets (with host monotonic timestamps); on a tempo
-    change the MIDI generator is retuned and `set-tempo` is sent to Carabiner (when `link` is set).
+    change the MIDI generator is retuned and `bpm` is sent to Carabiner (when `link` is set).
     """
 
     def __init__(self, generator: clock.ClockGenerator | None = None, link: CarabinerLink | None = None,
@@ -206,12 +237,13 @@ class PdlClockBridge:
         self._host_now = host_now or time.monotonic
 
     def _link_now(self) -> int:
-        """The Link-domain clock in microseconds: Carabiner's `status` `:start`, or host monotonic microseconds when no
-        Carabiner is connected (which still exercises the phase path before a real Link peer joins)."""
+        """The Link-domain clock now, in microseconds, from Carabiner's `status` (`CarabinerLink.link_now`), or host
+        monotonic microseconds when no Carabiner is connected (which still exercises the phase path before a real Link
+        peer joins)."""
         if isinstance(self.link, CarabinerLink):
             status = self.link.status()
-            if status and isinstance(status.get("start"), (int, float)):
-                return int(status["start"])
+            if status and status.get("bpm"):
+                return CarabinerLink.link_now(status)
         return int(time.monotonic() * 1e6)
 
     def _on_tempo(self, bpm: float) -> None:

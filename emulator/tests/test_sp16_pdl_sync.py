@@ -2,6 +2,8 @@
 import contextlib
 import io
 import socket
+import threading
+import time
 import unittest
 from pathlib import Path
 import sys
@@ -70,7 +72,8 @@ class TrackerTests(unittest.TestCase):
 
 class CarabinerTests(unittest.TestCase):
     def test_message_formatting(self):
-        self.assertEqual(pdl.CarabinerLink.set_tempo_message(130.56), b"set-tempo 130.560000\n")
+        # Carabiner's tempo command is `bpm` (its README); it ignores anything else
+        self.assertEqual(pdl.CarabinerLink.set_tempo_message(130.56), b"bpm 130.560000\n")
         self.assertEqual(pdl.CarabinerLink.force_beat_at_time_message(1.0, 12345678, 4),
                          b"force-beat-at-time 1.000000 12345678 4\n")
 
@@ -80,6 +83,37 @@ class CarabinerTests(unittest.TestCase):
 
     def test_parse_status_refuses_an_incomplete_reply(self):
         self.assertIsNone(pdl.CarabinerLink.parse_status(b"{:peers 1 :bpm 120.0}"))
+
+    def test_link_now_is_start_plus_elapsed_beats(self):
+        # 4 beats at 120 BPM after beat 0 is 2 s after :start
+        status = {"peers": 1, "bpm": 120.0, "start": 5_000_000, "beat": 4.0}
+        self.assertEqual(pdl.CarabinerLink.link_now(status), 7_000_000)
+
+    def test_status_skips_replies_to_earlier_commands(self):
+        server = socket.create_server(("127.0.0.1", 0))
+        try:
+            link = pdl.CarabinerLink(port=server.getsockname()[1])
+            self.assertTrue(link.set_tempo(130.56))
+            conn, _ = server.accept()
+            try:
+                conn.recv(64)
+                # the reply to `bpm`, then a stray non-status line, are waiting before `status` is asked
+                conn.sendall(b"status { :peers 1 :bpm 130.560000 :start 1 :beat 0.0 }\nbad-beat \n")
+                time.sleep(0.1)
+
+                def answer():
+                    conn.recv(64)
+                    conn.sendall(b"status { :peers 1 :bpm 130.560000 :start 900 :beat 2.0 }\n")
+                worker = threading.Thread(target=answer)
+                worker.start()
+                status = link.status()
+                worker.join(2)
+                self.assertEqual(status["start"], 900)  # the fresh reply, not the stale one
+            finally:
+                conn.close()
+                link.close()
+        finally:
+            server.close()
 
     def test_tempo_and_phase_report_one_diagnostic_without_a_carabiner(self):
         # a loopback port that nothing listens on: connect() gets ECONNREFUSED immediately
@@ -133,7 +167,7 @@ class CarabinerTests(unittest.TestCase):
                 self.assertTrue(link.set_tempo(130.56))
             conn, _ = server.accept()
             try:
-                self.assertEqual(conn.recv(64), b"set-tempo 130.560000\n")
+                self.assertEqual(conn.recv(64), b"bpm 130.560000\n")
             finally:
                 conn.close()
             link.close()
@@ -149,7 +183,7 @@ class BridgeTests(unittest.TestCase):
         bridge = pdl.PdlClockBridge(generator=generator)
         bridge.feed_beat(beat_packet(128.0, 0.02, 1), 0.0)
         self.assertAlmostEqual(generator.bpm, 130.56, delta=0.01)
-        # a change to 124 BPM retunes the generator and would set-tempo again
+        # a change to 124 BPM retunes the generator and would send `bpm` again
         bridge.feed_beat(beat_packet(124.0, 0.0, 1), 1.0)
         self.assertAlmostEqual(generator.bpm, 124.0)
 
