@@ -147,7 +147,10 @@ python3 emulator/probes/over_led.py run --build NAME [--track 3] [--volumes 127,
 
 It runs a discarded warm-up strike first (the first strike of a run is silently dropped), and its last pass plays the
 -30 dBFS fixture as a control that has to stay dark, labelled with the track volume and level it actually played at.
-Each pass says whether mono 34 lit and which mono channels did.
+Each pass says whether mono 34 lit and which mono channels did. The fixtures' names are the level of the file
+(`hw-tone-full.wav` 0 dBFS, `hw-tone440.wav` -6, `hw-tone-m30.wav` -30, each within 0.1 dB, pinned by a unit test); a
+pass's measured level is lower by whatever track volume it played at, which is why the control's label names its
+volume.
 
 Measured (firmware 1.60, grade O): the master reaches 32767 (0.0 dBFS, 13280 near-full-scale samples) at track volume
 127 with a neutral MAIN OUT gain, and the shim's own MAIN-pair peak equals the WAV peak within printing tolerance in
