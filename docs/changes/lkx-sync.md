@@ -1,14 +1,14 @@
 ---
-title: "Review fix A, round 2 (lkx-sync): status_packet order, generator retune, step phase, relay outbox"
-description: "Round-2 fixes for Codex Sol's re-review: status_packet argument order, MIDI generator retune vs Link caching, step-phase reporting, the relay outbox bound and the no-downbeat master-log guard."
+title: "Review fix A, round 3 (lkx-sync): preserve partial frames and qualify downbeat alignment"
+description: "Round-3 fixes for the relay's overflow framing corruption, consistent unverified downbeat alignment wording, and backpressure tests on the production Outbox. Earlier round reports are retained below."
 type: report
-status: active
+status: complete
 created: 2026-10-28
 tags: [sp16, emulator, lkx-sync, review-fix]
 author:
-  harness: pi
+  harness: codex
   agent: lkx-sync
-  model: deepseek-v4-pro
+  model: gpt-6
   thinking: high
   tokens: unknown
 ---
@@ -158,3 +158,91 @@ downbeat measurement is wanted later.)
 1. The live `follow` block now reports `step_phase_median_ms` / `step_phase_max_ms` (residual modulo one step). A
    whole-step or whole-bar offset reads 0, so a future `timing_probe.py run --net mcast …` cannot confirm downbeat
    alignment by itself; that would need the sequencer position.
+
+## Round 3 (Codex Astra re-review)
+
+This round addresses the three findings in `agent-dispatch-1ohbzke7/final.txt`. The earlier reports above describe
+DeepSeek's work; this round used Codex, thinking high. The session identifies its model family as `gpt-6`; an exact
+runtime model identifier was not exposed, so the author metadata and trailers use that available identity.
+
+1. **Preserve an in-progress frame during overflow.** `Outbox` retains complete records and the head's sent offset.
+   Overflow evicts the oldest untouched record, skipping an in-progress head even when an oversized arrival must
+   itself be discarded. A socket-pair regression fills the queue, partially sends a frame, overflows, drains, and
+   parses exactly the expected length-prefixed frames with the QEMU-side reader. Ten subcases cover prefix and
+   payload splits (offsets 1, 3, 4, 8 and 15), normal and oversized arrivals, and a later overflow after the protected
+   record completes. Before the fix this test failed all ten subcases (five failures, five timeouts); afterward all
+   pass. Commit `a0cd308`.
+2. **Describe downbeat alignment as unverified consistently.** Correct the guide heading, both README claims and
+   both architecture claims, including the overview table. The guide keeps the earlier ~495 ms figure only to
+   explain why it cannot establish downbeat alignment. Commit `8011049`.
+3. **Exercise production backpressure handling.** Remove unused `flush_stream()` and move its two tests to
+   `Outbox.flush()`. Cover `BlockingIOError`, `InterruptedError`, zero-byte sends, preservation of a partially sent
+   head, repeated partial sends, byte accounting and FIFO completion. No Python references to the removed helper
+   remain. Commit `3abc839`.
+
+**Complete Outbox review.** Read the entire class and its relay call sites. Only `flush()` advances the sent offset;
+it resumes the head before attempting any following record and resets the offset only after completing that head.
+Blocked, interrupted and zero-byte writes preserve both the offset and byte count. `push()` appends at the tail and
+can evict only untouched records, including the new arrival if necessary. No other partial-frame splitting or
+reordering path was found. The byte budget counts unsent bytes; retaining the head also retains its already-sent
+prefix until completion (bounded by one frame, at most 65,539 bytes including framing at the relay receive limit).
+
+## Round-3 hand-back
+
+The check names below expand to the exact commands following the table. Every commit passed `git diff --check`,
+and its complete staged diff was read before committing.
+
+| Finding | Commit | Files changed | Check result lines |
+|---|---|---|---|
+| 1 | `a0cd308` | `emulator/net/segment_relay.py`, `emulator/tests/test_sp16_segment_relay.py` | Q: `Ran 456 tests`, `OK` (456/456); N: `Ran 52 tests`, `FAILED (failures=1, errors=1)` (50/52); I: `Ran 48 tests`, `OK` (48/48); F: `Ran 4 tests`, `OK` (4/4) |
+| 2 | `8011049` | `README.md`, `docs/pro-dj-link.md`, `docs/architecture.md` | Q: `Ran 456 tests`, `OK` (456/456); all downbeat/alignment mentions in the three documents reviewed |
+| 3 | `3abc839` | `emulator/net/segment_relay.py`, `emulator/tests/test_sp16_segment_relay.py` | Q: `Ran 456 tests`, `OK` (456/456); N: `Ran 52 tests`, `FAILED (failures=1, errors=1)` (50/52); I: `Ran 50 tests`, `OK` (50/50); F: `Ran 6 tests`, `OK` (6/6) |
+
+Q (quick set, separately run after each finding):
+
+```sh
+python3 -m unittest emulator.tests.test_sp16_panel emulator.tests.test_sp16_profiles emulator.tests.test_sp16_fwdev emulator.tests.test_sp16_cli_usb emulator.tests.test_sp16_exectrace emulator.tests.test_sp16_fwpack emulator.tests.test_sp16_emulator emulator.tests.test_sp16_hwsuite emulator.tests.test_sp16_pcm_tap_analyze emulator.tests.test_sp16_e2e_screen emulator.tests.test_sp16_smoke emulator.tests.test_sp16_bootstrap emulator.tests.test_sp16_firmware_import emulator.tests.test_sp16_enter
+```
+
+N (requested network selection, run after findings 1 and 3):
+
+```sh
+python3 -m unittest emulator.tests.test_sp16_segment_relay emulator.tests.test_sp16_net emulator.tests.test_sp16_segment
+```
+
+I (selection without the two failing multicast tests; also excludes the obsolete helper tests before finding 3):
+
+```sh
+python3 -m unittest emulator.tests.test_sp16_segment_relay.ParseTests emulator.tests.test_sp16_segment_relay.OutboxTests emulator.tests.test_sp16_segment_relay.RelayTests.test_relay_exits_without_qemu emulator.tests.test_sp16_net emulator.tests.test_sp16_segment
+```
+
+F (deterministic production Outbox tests):
+
+```sh
+python3 -m unittest emulator.tests.test_sp16_segment_relay.OutboxTests
+```
+
+**Multicast failures reproduced before the fix.** N has two failures on this host:
+`test_relays_both_ways_and_filters_own_echo` times out waiting for the guest frame;
+`test_relay_bounds_the_outbox_under_sustained_backpressure` receives zero frames after the flood. To compare against
+the unchanged relay, a temporary directory was populated with
+`git show b3c196c:emulator/net/segment_relay.py`, the test module's `TOOLS` was pointed at that directory, and those
+two `RelayTests` were run via `unittest.TextTestRunner`. Result: `Ran 2 tests`,
+`FAILED (failures=1, errors=1)` (0/2), at the same assertions. This establishes that they predate these changes;
+the host/network cause was not diagnosed. The deterministic socket-pair regression does not depend on multicast.
+
+**What did not run and why.** Per the common brief, no full unit suite. No builds, native emulator smoke, live timing,
+CoreMIDI, Carabiner or hardware runs: these findings concern host Python queue behavior and documentation, covered
+by the checks above. Swift typechecking and ARM contracts do not apply; no Swift, stub or contract files changed.
+
+**Side effects.** Tests started and cleaned up their own relay subprocesses and temporary sockets/directories. The
+baseline comparison's temporary source tree was removed. No builds or firmware sessions started, no unrelated
+processes stopped, no processes left running, and no push or PR.
+
+**Parked tasks.** None of the three requested findings.
+
+**Cross-lane requests.** None; this round's brief explicitly authorized the README and existing documentation edits.
+
+**Open questions for the owner.** The two unchanged-relay multicast delivery failures need a separate diagnosis or
+a rerun on a working multicast setup. Downbeat alignment still requires sequencer-position evidence; the current
+probe alone cannot verify it.
