@@ -118,13 +118,14 @@ silently weakening the check. The declaration lives in the profile's `hardware.k
 - The check still runs and still records its measured figures (sub-results keep the live numbers, for example the peak
   in dBFS).
 - A FAIL on a declared check is re-labelled **KNOWN-FAIL**. The reason quotes the declaration, its owner and date, and
-the measured gap, and the report gives the check its own section.
+  the measured gap, and the report gives the check its own section.
 - KNOWN-FAIL does not count as a failure: it does not change the exit code and does not block verification
   eligibility. `--mark-verified` refuses a KNOWN-FAIL that is not declared in the profile.
 - A malformed entry (not an object, or no `check`) is skipped rather than raising, so a hand-edited profile cannot
   crash a run.
 
-Deleting the entry is the only way to make a KNOWN-FAIL block verification again; fix the cause first.
+The entry stays until the cause is fixed: removing it puts the check back in the way of verification, and a KNOWN-FAIL
+whose cause is gone simply passes.
 
 ### HW-35 and the OVER lamp
 
