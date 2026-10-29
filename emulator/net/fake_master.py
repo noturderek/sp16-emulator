@@ -80,7 +80,7 @@ def beat_packet(name, player, bpm, pitch, beat_in_bar, next_beat_ms):
     return bytes(packet)
 
 
-def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=True, counter=0):
+def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=True, master=True, counter=0):
     """Player status (type 0x0a, 212 bytes) with the fields a follower needs: the P3 play state (0x9d, 0x0d while
     playing so the follower's (P3 & 1) || (P3 & 8) gate passes), the master-meaningful and Mv multiplier bytes,
     playing/master/sync flags, pitch, BPM, beat counter and beat in bar (offsets from the public protocol write-up;
@@ -95,7 +95,7 @@ def status_packet(name, player, bpm, pitch, beat_in_bar, beat_count, playing=Tru
     packet[0x27] = 1 if playing else 0
     packet[0x28] = player                                  # loaded player: own number
     packet[0x7b] = 3 if playing else 5                     # play state: playing / stopped
-    packet[0x89] = 0x84 | (0x40 if playing else 0) | 0x20 | 0x10 | 0x08   # play, master, sync, on-air
+    packet[0x89] = 0x84 | (0x40 if playing else 0) | (0x20 if master else 0) | 0x10 | 0x08   # play, master, sync, on-air
     struct.pack_into(">I", packet, 0x8c, int(round((1 + pitch) * 0x100000)))
     struct.pack_into(">H", packet, 0x90, 0x8000)          # Mv: rekordbox-track BPM multiplier (not the 0xffff sentinel)
     struct.pack_into(">H", packet, 0x92, int(round(bpm * 100)))

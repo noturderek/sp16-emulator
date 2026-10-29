@@ -20,9 +20,9 @@ def beat_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1):
     return fake_master.beat_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, 100)
 
 
-def status_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1, beat_count=0, playing=True):
+def status_packet(bpm=128.0, pitch_frac=0.02, beat_in_bar=1, beat_count=0, playing=True, master=True):
     """A master 0x0a status packet built by the shared packet builder, not by hand."""
-    return fake_master.status_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, beat_count, playing)
+    return fake_master.status_packet("CDJ-3000", 1, bpm, pitch_frac, beat_in_bar, beat_count, playing, master)
 
 
 class TempoTests(unittest.TestCase):
@@ -177,6 +177,14 @@ class CarabinerTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_bridge_ignores_a_non_master_players_status(self):
+        bridge = pdl.PdlClockBridge()
+        bridge.feed_status(status_packet(128.0, 0.02, 1), 0.0)     # the master at 128 BPM +2 %
+        self.assertAlmostEqual(bridge.tracker.effective_bpm, 130.56, delta=0.01)
+        result = bridge.feed_status(status_packet(90.0, 0.0, 2, master=False), 1.0)  # a non-master player
+        self.assertIsNone(result)                                   # not the master: no packet for the clock
+        self.assertAlmostEqual(bridge.tracker.effective_bpm, 130.56, delta=0.01)     # the master's tempo is intact
+
     def test_bridge_retunes_midi_clock_on_tempo_change(self):
         from midi import clock
         generator = clock.ClockGenerator(bpm=120.0)

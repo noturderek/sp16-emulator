@@ -274,6 +274,8 @@ class PdlClockBridge:
 
     def feed_status(self, payload: bytes, t: float) -> dict:
         status = parse_status_packet(payload)
+        if not status["master"]:
+            return None  # only the master player's status drives the clock
         self.tracker.update(status["bpm"], status["pitch_frac"], status["beat_in_bar"], t)
         self._on_tempo(self.tracker.effective_bpm)
         return status
