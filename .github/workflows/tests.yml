@@ -42,8 +42,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install coverage.py
-        run: python -m pip install coverage
+      - name: Install coverage.py and the optional test packages
+        run: python -m pip install coverage numpy pillow
       - name: Run the firmware-free unit tests with coverage
         run: ./sp16 --python "$(command -v python)" test --coverage
       - name: Coverage summary
