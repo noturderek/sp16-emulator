@@ -41,7 +41,7 @@ MAPPER = "sp16upd"
 # reports which of them the imported application references, and which similar-looking names it uses that the shim
 # does not know. Kept equal to the C source by a unit test.
 SHIM_DEVICES = ("/dev/subucom_spi0.1", "/dev/cdc_spi2.0", "/dev/dac_spi4.0", "/dev/backlight", "/proc/udev_usb1",
-                "/proc/udev_usbctn1", "/dev/gpiodrv", "/dev/ttymxc1", "/dev/din_midi")
+                "/proc/udev_usbctn1", "/dev/gpiodrv", "/dev/ttymxc1", "/dev/din_midi", "/dev/snd/seq")
 SHIM_PCMS = ("hw:ak4452audio,0", "hw:ak4452audio,1", "hw:ak4458audio,0")
 SHIM_IOCTLS = (0x40047000, 0x40107000, 0x80017001, 0x40017001, 0x80047002, 0x40047002, 0x80027003, 0x40027003,
                0x80047004, 0x40047004, 0x40017005, 0x40047007, 0x80017006, 0x40017008, 0x40017009, 0x40017006)
@@ -416,6 +416,7 @@ def attach(params):
     if not re.fullmatch(r"[0-9]\.[0-9]{2}", version):
         raise ValueError("invalid firmware version")
     stage_calibration(params.get("sp16.padcal", "off"), profile)
+    stage_settings(profile)
     # One line of shell-safe fields (every value was validated as a plain token or guest path) for guest-init.sh.
     print(variant, version, how, *profiles.runtime_fields(profile, app_path))
 
@@ -438,6 +439,39 @@ def stage_calibration(setting, profile, root=ROOT):
     parent.mkdir(parents=True, exist_ok=True)
     target = parent / os.path.basename(calibration["path"])
     target.write_text(calibration["template"].format(attributes=attributes))
+    os.chmod(target, 0o644)
+    return target
+
+
+
+def settings_file(settings):
+    """The firmware's saved-settings file built from a profile's `settings`: the header, then one record per id in id
+    order with the id at +0 and the value (the default, or the seed's) at `value_offset`; the rest of each record is
+    zeros, which the loader never reads."""
+    import struct
+    values = {int(k): v for k, v in settings["defaults"].items()}
+    values.update({int(k): v for k, v in settings.get("seed", {}).items()})
+    out = bytearray(bytes.fromhex(settings["header"]))
+    for key in sorted(values):
+        record = bytearray(settings["record_size"])
+        struct.pack_into("<i", record, 0, key)
+        struct.pack_into("<i", record, settings["value_offset"], values[key])
+        out += record
+    return bytes(out)
+
+
+def stage_settings(profile, root=ROOT):
+    """Default Utility settings (the profile's seed over the firmware's defaults: 1.60 starts with LCD BRIGHTNESS 5)
+    written into the overlay's upper layer; guest-init.sh copies it onto the data image only when the image has none,
+    so a value the firmware saved is never replaced. A profile without `settings` stages nothing."""
+    import prepare
+    settings = profile.get("settings")
+    if not settings:
+        return None
+    parent = prepare.guest_file(Path(root), os.path.dirname(settings["path"]))
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / os.path.basename(settings["path"])
+    target.write_bytes(settings_file(settings))
     os.chmod(target, 0o644)
     return target
 
@@ -512,6 +546,14 @@ def read_request(fd):
     return json.loads(buffer.split(b"\n", 1)[0])
 
 
+def check_repacked_layer(path, layer):
+    """A repacked tar layer against the length the unit's initramfs reads at boot (prepare.check_boot_read), naming
+    the layer. Returns its size; refuses it when the layer is enforced and longer than the limit."""
+    import prepare
+    limit = layer.get("max_boot_read_bytes") if layer.get("enforce_boot_read") else None
+    return prepare.check_boot_read(path, limit, layer.get("file") or Path(path).name)
+
+
 def package_update(params):
     """Repacked update (D3, emulator only): base update + recipes -> deterministic ISO -> encrypted onto the output disk.
     The host appends the SP16MODLAB- trailer and CRC; this never produces a stock LIVESAMPLER marker."""
@@ -558,6 +600,7 @@ def package_update(params):
             before = sha256_file(source)
             target = Path(PKG_ROOT) / name
             rewrite_tar_gz(source, target, replacements, layer_prefix(descriptors[name]))
+            check_repacked_layer(target, descriptors[name])
             os.replace(target, source)
             layers[name] = {"base_sha256": before, "sha256": sha256_file(source)}
         manifest = {"schema": 1, "kind": "sp16-mod-update", "id": mod_id,
@@ -609,9 +652,26 @@ def package_update(params):
 
 
 DEV_SHARE = "/opt/sp16/dev-share"
+# Where the record of the overlay's written paths lives. A record in /run is lost when the VM restarts, and then files an
+# earlier session wrote through files/ into the persistent data directory are never put back. The eMMC image's own
+# .sp16 directory survives a restart and is outside the app's data directory, so the record goes there; without a mounted
+# eMMC nothing under it can persist, so /run is the honest fallback.
 DEV_STATE = "/run/sp16-dev-applied.json"
+DEV_STATE_IN_EMMC = (".sp16", "sp16-dev-applied.json")
 DEV_PRELOAD_DIR = "/opt/sp16/dev"
 MAX_DEV_FILE = 256 << 20
+
+
+def dev_state_path(root, profile_id):
+    """The file that records which guest paths the overlay wrote, next to the firmware's own .sp16 data directory on the
+    eMMC image, or /run when this boot has no eMMC mounted."""
+    import prepare
+    try:
+        mount = profiles_module().load(profile_id)["runtime"]["emmc_mount"]
+        folder = prepare.guest_file(Path(root), mount) / DEV_STATE_IN_EMMC[0]
+    except (OSError, ValueError, KeyError):
+        return Path(DEV_STATE)
+    return folder / DEV_STATE_IN_EMMC[1] if folder.is_dir() else Path(DEV_STATE)
 
 
 def dev_plan(share, lower, profile_id):
@@ -672,18 +732,23 @@ def dev_restore(root, lower, paths):
             target.unlink()
 
 
-def dev_apply(params, share=DEV_SHARE, root=ROOT, lower=FW_LOWER, state=DEV_STATE, profile_id=None):
+def dev_apply(params, share=DEV_SHARE, root=ROOT, lower=FW_LOWER, state=None, profile_id=None):
     """Apply the developer overlay into the overlay's upper layer, never the read-only image. Transactional: on any
     error every touched path is restored and nothing of the overlay stays. Prints the preload list for the shell."""
     import prepare
     profile_id = profile_id or os.environ.get("SP16_PROFILE", "")
+    state = Path(state) if state is not None else dev_state_path(root, profile_id)
     try:
-        previous = json.loads(Path(state).read_text()).get("paths", [])
-    except (OSError, ValueError):
+        previous = json.loads(state.read_text()).get("paths", [])
+    except (OSError, ValueError, AttributeError):
         previous = []
     dev_restore(root, lower, previous)
-    Path(state).write_text(json.dumps({"paths": []}))
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"paths": []}))
     plan, applied, preload = dev_plan(share, lower, profile_id)
+    owned = {path for path in plan if prepare.guest_file(Path(root), path) == state}
+    if owned:
+        raise ValueError(f"overlay file {sorted(owned)[0]} is the overlay's own record of written paths")
     written = []
     try:
         for path, (data, mode) in sorted(plan.items()):
@@ -698,13 +763,39 @@ def dev_apply(params, share=DEV_SHARE, root=ROOT, lower=FW_LOWER, state=DEV_STAT
     except BaseException:
         dev_restore(root, lower, written)
         raise
-    Path(state).write_text(json.dumps({"paths": written}))
+    state.write_text(json.dumps({"paths": written}))
     app_path = params.get("sp16.app_path", "")
     app_sha = hashlib.sha256(prepare.guest_file(Path(root), app_path).read_bytes()).hexdigest() \
         if app_path else "unknown"
     log(f"SP16_DEV applied recipes={','.join(applied) or 'none'} files={len(plan) - len(preload)} "
         f"preload={len(preload)} app_sha256={app_sha}")
     print(":".join(preload))
+
+
+APL_HOOK_MARKER = b"# SP16_APL_HOOK"
+APL_HOOK_MAX = 240
+
+
+def apl_hook_line(apl_start):
+    """The one shell line the firmware's apl_start carries right after a `# SP16_APL_HOOK` line, or None.
+
+    The emulator never runs the firmware's apl_start, but a firmware that loads a mod from the data volume does it with
+    one line placed just before the app starts (for example `[ -f /root/data/mod.sh ] && (. /root/data/mod.sh)`). The
+    init runs only that line, so such a mod is exercised the way the unit would. The line must be a single printable
+    ASCII line (a tab character is tolerated) of at most APL_HOOK_MAX bytes; anything else is refused."""
+    try:
+        lines = Path(apl_start).read_bytes().split(b"\n")
+    except OSError:
+        return None
+    for index, line in enumerate(lines[:-1]):
+        if line.strip() != APL_HOOK_MARKER:
+            continue
+        hook = lines[index + 1].rstrip(b"\r")
+        if not hook.strip() or len(hook) > APL_HOOK_MAX or any(byte < 32 or byte > 126 for byte in hook if byte != 9):
+            raise ValueError("the apl_start hook line is empty, longer than 240 bytes or not printable ASCII"
+                             " (a tab character is tolerated)")
+        return hook.decode("ascii")
+    return None
 
 
 def main():
@@ -729,8 +820,16 @@ def main():
         except ValueError as error:
             print(f"SP16_FIRMWARE_ERROR {error}", file=sys.stderr, flush=True)
             sys.exit(3)
+    elif command == "apl-hook":
+        try:
+            hook = apl_hook_line(sys.argv[2]) if len(sys.argv) > 2 else None
+        except ValueError as error:
+            print(f"SP16_APL_HOOK_ERROR {error}", file=sys.stderr, flush=True)
+            sys.exit(3)
+        if hook:
+            print(hook)
     else:
-        raise SystemExit("usage: guest-firmware.py import|package|attach|dev-apply")
+        raise SystemExit("usage: guest-firmware.py import|package|attach|dev-apply|apl-hook")
 
 
 if __name__ == "__main__":

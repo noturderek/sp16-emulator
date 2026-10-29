@@ -253,7 +253,14 @@ final class AudioOutput {
     private var observer: NSObjectProtocol?
     private var offlineThread: Thread?
     private var retryTimer: DispatchSourceTimer?
-    var muted = false
+    /// Power-on mute (the firmware's xMUTE, ~19.5 s after power-on). Read on the render thread, written once at
+    /// launch and once at the unmute deadline, so it is guarded by its own unfair lock.
+    private var mutedStorage = false
+    private let mutedLock = UnfairLock()
+    var muted: Bool {
+        get { mutedLock.lock(); defer { mutedLock.unlock() }; return mutedStorage }
+        set { mutedLock.lock(); mutedStorage = newValue; mutedLock.unlock() }
+    }
     /// Verification only: build and prepare the real device graph (device selection, formats) but never start IO.
     var dryRun = false
     private var droppedUnavailable: UInt64 = 0, restarts: UInt64 = 0, lastError = ""

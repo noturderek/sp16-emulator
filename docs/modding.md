@@ -20,7 +20,9 @@ mkdir -p -m 700 private           # git-ignored and owner-only (build/ is create
 ```
 
 `--bundle-suffix dev` gives this build its own bundle id, so it can run next to your normal build. All builds share
-the firmware library `build/library`, so firmware you already imported is available here too.
+the firmware library `build/library`, so firmware you already imported is available here too. When working in a git
+worktree, builds can reuse the main checkout's library and compiled QEMU with
+`--library <path>/build/sp16/library` and `--reuse-qemu-from <path>/build/qemu-source`.
 
 ## A mod folder
 
@@ -129,6 +131,39 @@ share not visible to the app` when the bind failed. Without a developer overlay 
   in the app within a moment (the mount does not cache), so a watcher thread can poll a small command file.
 - The app can read everything in the mod folder, including `files/` and `recipes/`. Keep it to the mod itself.
 
+### A launch hook: loading a mod from the data volume
+
+The emulator does not run the firmware's `apl_start`. A firmware that loads a mod from the data volume (`/root/data`,
+which lives on the persistent eMMC image, outside the size-limited boot archives) does it with one shell line that
+`apl_start` runs just before it starts the app. To exercise that line, mark it: put a comment line
+`# SP16_APL_HOOK` directly above it in `apl_start`, for example
+
+```sh
+# SP16_APL_HOOK
+[ -f /root/data/mod.sh ] && (. /root/data/mod.sh)
+```
+
+Before each app start the guest runs only that one line, in the app's root, under the firmware's own `busybox sh`,
+after the developer overlay is applied. It is limited to 10 seconds and can never keep the app from starting. The
+console shows what happened:
+
+```text
+SP16_APL_HOOK run: [ -f /root/data/mod.sh ] && (. /root/data/mod.sh)
+SP16_APL_HOOK <whatever the script printed>
+SP16_APL_HOOK rc=0
+```
+
+- The line must be one printable-ASCII line (a tab character is tolerated) of at most 240 bytes; anything else is refused (`SP16_APL_HOOK_ERROR`).
+  Without the marker nothing runs and no `SP16_APL_HOOK` line appears.
+- `rc=124` means the 10 second limit stopped it (`rc=137`: it ignored the stop signal and was killed 2 seconds later); a syntax error in the script gives `rc=2` and the app still starts
+  (keep the `( … )` subshell so a broken script cannot stop the line itself).
+- Child programs (`cp`, `rm`, `sleep`) work: the guest registers a `binfmt_misc` handler for ARM ELF files the first
+  time a hook runs. It needs a guest image from this version (rebuild in place as above).
+- The overlay's record of written files is stored in the eMMC image's `.sp16` directory (outside the app's data
+  directory), which survives a VM restart. A file that would overwrite the record itself is refused.
+- Put the marker and the hook line in your own `files/root/pdj/apl_start`, which is a modified copy of a firmware
+  file: keep it in your private mod folder and never commit it.
+
 ## Package a mod
 
 ```sh
@@ -159,6 +194,14 @@ runs the firmware's `apl_start`, so it honours that launcher itself: when the ap
 `sp16-preload.so` and the firmware's `apl_start` contains the marker line `# SP16_PRELOAD_LAUNCHER`, the library is
 loaded after the hardware shim (and before any developer-overlay libraries), and the console shows `SP16_FW_LAUNCHER
 preload=<path>`. Both come from the hash-checked firmware image. A stock update carries neither, so it boots unchanged.
+
+### Boot read-length limits
+
+Firmware boot archives are read into fixed-length memory buffers during boot. When creating or unpacking repacked
+updates (`prepare.py` and `guest-firmware.py`), layer archive lengths are checked against `max_boot_read_bytes`
+from the product profile (`profiles/products/sp16.json`). Two archives are strictly enforced: `rootfs2.tar.gz`
+(maximum 2,422,834 bytes) and `pdj.tar.gz` (maximum 4,561,658 bytes). An archive exceeding its limit is refused
+at repack and unpack, reporting the archive, its size, the limit, and the excess bytes.
 
 A repacked update contains the vendor's firmware. Keep it in `private/`, never distribute it and never flash it to a
 device.

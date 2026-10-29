@@ -10,12 +10,41 @@ import tarfile
 REPO = Path(__file__).resolve().parents[1]
 
 
+def worktree_of(path):
+    """(working tree root, common git directory) of the repository holding `path`, from git itself, or None. Asking git
+    is what tells a sibling worktree of this repository apart from another repository that merely looks like one."""
+    start = path if path.is_dir() else path.parent
+    while not start.is_dir():
+        if start == start.parent:
+            return None
+        start = start.parent
+    try:
+        result = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = result.stdout.splitlines()
+    if result.returncode or len(lines) != 2:
+        return None
+    common = Path(lines[1])
+    return Path(lines[0]), (common if common.is_absolute() else start / common)
+
+
 def private_path(value, *, fresh=False):
+    """A build workspace or output path inside this repository, or inside another worktree of it (a worktree build
+    reuses the main checkout's firmware library and QEMU). It must be Git-ignored there and free of symlink parents."""
     path = Path(os.path.abspath(value))
-    if not path.is_relative_to(REPO) or any(p.is_symlink() for p in (path, *path.parents)):
+    if any(p.is_symlink() for p in (path, *path.parents)):
         raise ValueError("workspace/output must be inside the repository without symlink parents")
+    here = worktree_of(REPO)
+    elsewhere = None if path.is_relative_to(REPO) else worktree_of(path)
+    if elsewhere:
+        if not here or os.path.realpath(elsewhere[1]) != os.path.realpath(here[1]):
+            raise ValueError("workspace/output must be inside this repository or a worktree of it")
+    elif not path.is_relative_to(REPO):
+        raise ValueError("workspace/output must be inside this repository or a worktree of it")
     ignored = subprocess.run(
-        ["git", "check-ignore", "-q", "--", str(path)], cwd=REPO,
+        ["git", "check-ignore", "-q", "--", str(path)], cwd=elsewhere[0] if elsewhere else REPO,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     if ignored.returncode:
@@ -60,7 +89,27 @@ def destination(root, parts):
     return path
 
 
-def unpack_layer(archive, root, prefix=()):
+def check_boot_read(archive, limit, name=None):
+    """Refuse an archive longer than the length the unit's initramfs reads from flash at boot, and return its size.
+
+    The initramfs reads a fixed length per layer (product descriptor: max_boot_read_bytes), so anything past it is
+    silently dropped on the unit: a layer that boots in the emulator but would be truncated there is worse than a
+    refusal. A `limit` of None means the length is not known for that layer and nothing is checked."""
+    size = Path(archive).stat().st_size
+    if limit is None:
+        return size
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError(f"boot read limit {limit!r} for {name or Path(archive).name} is not a positive byte count")
+    if size > limit:
+        label = name or Path(archive).name
+        over = size - limit
+        raise ValueError(f"{label} is {size} bytes; the unit reads at most {limit} bytes of it at boot, so cut "
+                         f"{over} byte{'' if over == 1 else 's'}")
+    return size
+
+
+def unpack_layer(archive, root, prefix=(), boot_read_limit=None):
+    check_boot_read(archive, boot_read_limit)
     skipped = 0
     with tarfile.open(archive, "r:gz") as source:
         for member in source:
@@ -124,7 +173,8 @@ def assemble(images, root, extractor, layout):
     images = Path(images)
     skipped = 0
     for layer in layout["tar_layers"]:
-        skipped += unpack_layer(images / layer["file"], root, tuple(PurePosixPath(layer["root"]).parts[1:]))
+        limit = layer.get("max_boot_read_bytes") if layer.get("enforce_boot_read") else None
+        skipped += unpack_layer(images / layer["file"], root, tuple(PurePosixPath(layer["root"]).parts[1:]), limit)
     for layer in layout.get("squashfs_layers", []):
         mount = PurePosixPath(layer["root"]).relative_to("/")
         directory(root, tuple(mount.parts))

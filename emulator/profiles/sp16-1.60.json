@@ -288,10 +288,6 @@
         "mono",
         3
       ],
-      "shift": [
-        "mono",
-        4
-      ],
       "rec": [
         "mono",
         5
@@ -600,6 +596,50 @@
       504
     ],
     "default": 242
+  },
+  "settings": {
+    "path": "/root/data/Toraiz_SP16.dat",
+    "format": "8-byte header (magic 0x2a7b9e8f, version 0x00010004), then 0x8c-byte records sorted by id: int32 id at +0, int32 value at +0x88; no checksum (loader FUN_0056824c, writer FUN_005680d4, defaults FUN_0056a7f0)",
+    "header": "8f9e7b2a04000100",
+    "record_size": 140,
+    "value_offset": 136,
+    "defaults": {
+      "2": 0,
+      "3": 2,
+      "5": 3,
+      "6": 32,
+      "7": 48,
+      "9": 65,
+      "10": 112,
+      "12": 0,
+      "13": 0,
+      "14": 5,
+      "15": 5,
+      "16": 80,
+      "17": 96,
+      "18": 128,
+      "19": 144,
+      "22": 193,
+      "23": 0,
+      "24": 100,
+      "25": 208,
+      "26": 50,
+      "27": 224,
+      "28": 0,
+      "36": 388,
+      "37": 401,
+      "42": 272,
+      "43": 288,
+      "45": 240,
+      "46": 256,
+      "47": 4
+    },
+    "seed": {
+      "5": 5
+    },
+    "names": {
+      "5": "LCD BRIGHTNESS (step 1..5; the firmware maps it to /dev/backlight 0x13, 0x2c, 0x5b, 0x9e, 0xf8)"
+    }
   },
   "identity": {
     "version": "1.60",
@@ -1463,6 +1503,43 @@
       "left": 12,
       "right": 14
     },
+    "jacks": {
+      "MAIN": {
+        "aliases": [
+          "OUT1-2",
+          "MASTER"
+        ],
+        "stream": "hw:ak4458audio,0",
+        "left": 12,
+        "right": 14,
+        "grade": "O"
+      },
+      "OUT3-4": {
+        "stream": "hw:ak4458audio,0",
+        "left": 8,
+        "right": 10,
+        "grade": "I"
+      },
+      "OUT5-6": {
+        "stream": "hw:ak4458audio,0",
+        "left": 4,
+        "right": 6,
+        "grade": "I"
+      },
+      "OUT7-8": {
+        "stream": "hw:ak4458audio,0",
+        "left": 0,
+        "right": 2,
+        "grade": "O"
+      },
+      "PHONES": {
+        "stream": "hw:ak4452audio,0",
+        "left": 0,
+        "right": 1,
+        "grade": "O"
+      }
+    },
+    "jacks_note": "the transport channel each output jack carries, measured with the factory AUDIO TEST modes (see audio-jack-map.json next to this folder): MAIN and OUT7-8 observed, PHONES on the AK4452 stream observed, OUT3-4 and OUT5-6 inferred from the regular slot order",
     "default_bpm": 120,
     "step_lamps": "rgb 0-15",
     "playhead_colour": [
@@ -1584,7 +1661,16 @@
     "0x80047004"
   ],
   "hardware": {
-    "absent": []
+    "absent": [],
+    "known_failing": [
+      {
+        "check": "HW-35",
+        "reason": "OVER is the firmware's ClipMeter on the DSI drive input (threshold 1.8 = +5.1 dBFS, 500 ms hold): a full-scale master stays 5.1 dB below the threshold, so the lamp correctly stays dark, and no drive-overload test exists yet that pushes the DSI drive input past +5.1 dBFS",
+        "gap": "no check drives the DSI drive input past +5.1 dBFS (a 0 dBFS master peaks at 1.0, below the 1.8 threshold)",
+        "owner": "owner",
+        "date": "2026-10-28"
+      }
+    ]
   },
   "button_effects": {
     "selector": {
@@ -1997,5 +2083,5 @@
     "pad15",
     "pad16"
   ],
-  "lamp_required_note": "not required: shift (never driven), usb_stop (mono 24, the STBY LED on the USB STOP/WAKE UP key; never lit in any suite action), bar 2-4 and their position lamps (the default project has one bar)"
+  "lamp_required_note": "not required and not in lamp_roles: shift (mono 4 drives no LED), usb_stop (mono 24, the STBY LED on the USB STOP/WAKE UP key; never lit in any suite action), bar 2-4 and their position lamps (the default project has one bar)"
 }

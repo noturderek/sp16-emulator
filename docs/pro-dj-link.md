@@ -1,0 +1,189 @@
+---
+title: Pro DJ Link
+description: "How the emulated sampler joins a Pro DJ Link network: the segment relay, the segment tools, the keep-alive and following a tempo master."
+type: reference
+status: active
+created: 2026-10-28
+tags: [prodjlink, network, sync]
+author:
+  harness: pi
+  agent: lk8-docs
+  model: deepseek-v4.1-flash
+  thinking: high
+  tokens: unknown
+---
+
+# Pro DJ Link
+
+The emulated sampler can join a Pro DJ Link network, publish its keep-alive and follow a tempo master. This document
+covers the network modes, the host-side segment the emulator uses, the tools that fake and watch a segment, and how far
+each part of the feature goes. For a real CDJ on Ethernet, step by step, see [live-hardware.md](live-hardware.md).
+
+Grades: **O** observed in this emulator, **S** static, **I** inferred, **U** unknown. Nothing here was measured on a
+unit, and no device identity, MAC or IP of a real unit appears in this repository.
+
+## Network modes
+
+`./sp16 run --net MODE` (`--net-ip ADDR[/PREFIX]` for a static address) gives the guest a virtio-net NIC:
+
+| Mode | What it connects to | Needs |
+|---|---|---|
+| `none` (default) | no NIC | — |
+| `host` | the `socket_vmnet` daemon's shared network (`bridge100`) | the root `socket_vmnet` daemon running |
+| `bridged:IF` | a physical interface (for example `bridged:en0`), optionally with `--net-ip` | the daemon's bridged instance for that interface |
+| `mcast[:PORT]` | a local multicast segment, `230.0.0.1:34567` by default | nothing, no root |
+
+`host` and `bridged:IF` are the modes that can reach real hardware on your LAN. `mcast` links emulators and host tools
+on this Mac only, which is what the tests and the fake master below use.
+
+The two daemon modes need `socket_vmnet` (`brew install socket_vmnet`) with its daemon running as root: the host one
+listens on `/opt/homebrew/var/run/socket_vmnet` (or `/usr/local/var/run` on Intel), and a bridged one per interface on
+`/opt/homebrew/var/run/socket_vmnet.bridged.<if>`. Start the bridged daemon yourself with the helper (it finds the
+daemon, checks the interface and runs it with sudo until Ctrl-C):
+
+```sh
+emulator/net/vmnet-bridged.sh en0
+```
+
+which runs:
+
+```sh
+sudo /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-mode=bridged --vmnet-interface=en0 \
+  /opt/homebrew/var/run/socket_vmnet.bridged.en0
+```
+
+`--net host` and `--net bridged:IF` say which socket is missing when the daemon is not up. Each start takes a random locally
+administered MAC (`52:54:00:…`), so two instances never share one and none is a real unit's.
+
+The guest assigns itself a link-local `169.254.A.B` address on its own. The shim answers the firmware's GLINK carrier
+query with a fixed carrier=1 and passes the firmware's real ARP packets to the NIC, so the app believes the link is up
+even with no other peer present.
+
+A build made before this version has no network wrapper: `--net` on such a build says to rebuild it (`./sp16 build
+--rebuild`).
+
+## The segment relay
+
+`--net mcast` does not use QEMU's own `socket,mcast` backend. That backend binds its UDP socket to the multicast group
+address, and on macOS a datagram sent that way is never delivered to another local listener that joined the group — so
+the guest's keep-alive never reached a watcher on the same Mac.
+
+Instead the build's wrapper (`emulator/net/qemu-net.sh`) starts a host-side relay, `emulator/net/segment_relay.py`, and
+attaches QEMU to it over a unix `stream` with the framing socket_vmnet speaks (a 4-byte big-endian length, then the raw
+Ethernet frame). The relay:
+
+- joins the multicast group on a wildcard-bound socket pinned to the loopback interface (see below), the setup that
+  does deliver on macOS, and sends the guest's frames to `group:port`;
+- hands frames arriving from other relays (or any host process) back to the guest;
+- drops its own multicast echo by matching the frame's source MAC;
+- tolerates transient multicast errors and reports the traffic it forwards.
+
+Every host peer of the segment pins the group to the loopback interface (`IP_MULTICAST_IF` = 127.0.0.1 for the send
+path, `IP_MULTICAST_LOOP` = 1 so a peer's own datagrams loop back, and `IP_ADD_MEMBERSHIP` on 127.0.0.1 for the
+receive path). `net/segment.py`'s `multicast_socket` is the shared helper; the relay keeps the same options inline
+because the build deploys that one file standalone. This matters because multicast delivery between two host
+processes depends on the interface the OS picks for the group: a second default route (a `bridge100` from
+socket_vmnet, say) changes the default interface and breaks loopback delivery unless the group is pinned to the
+loop. The relay and the segment tests fail rather than silently losing frames when that default route is present.
+
+If the relay's socket never appears the wrapper exits 2. `SP16_NET_NO_RELAY=1` leaves the relay out (for an
+already-running relay named by `SP16_NET_SOCKET`), and `SP16_NET_SOCKET` overrides the socket path.
+
+## Tools
+
+All of them are stdlib-only Python under `emulator/net/`, and none needs root.
+
+| Tool | What it does |
+|---|---|
+| `segment_watch.py [--port 34567] [--group G] [--seconds 10] [--pcap FILE]` | Prints the Pro DJ Link traffic on the `--net mcast` segment: ARP, and UDP 50000–50002 with the Pro DJ Link magic (keep-alive type, name, MAC, IP). `--pcap` writes a file Wireshark opens, with hints for its dissectors |
+| `segment_master.py [--group G] [--port P] [--bpm 128] [--pitch 2] [--player 1] [--name CDJ-3000] [--duration S] [--change-after S --change-to BPM] [--log FILE]` | A fake tempo master that lives **on** the segment: keep-alive, beat and player-status frames as Ethernet frames, exactly where the relay picks them up. It reads frames back, so each guest keep-alive it sees is printed as proof the app accepted it. `--log` writes `beat <monotonic-ns> <beat-in-bar>` lines for phase measurement |
+| `fake_master.py --iface IF \| --bind-ip ADDR [--broadcast ADDR] [--bpm] [--pitch] [--player] [--name] [--duration] [--change-after/--change-to] [--log]` | The same packets through an interface's own sockets, for `host`/`bridged` runs and real hardware. SIGUSR1/SIGUSR2 change the tempo by ±4 BPM while it runs |
+| `timing_probe.py run --net mcast --build NAME [--master-bpm 128] [--master-pitch 2] …` | A follow run end to end: starts the segment master, launches its own `--net mcast` session, sets the firmware's sync source with the `sync-source-pdl` recipe, plays, and reports the jitter and panel-frame measurements plus a `follow` block (master effective BPM, measured tempo and error, the follower's residual phase modulo one step as `step_phase_median_ms` / `step_phase_max_ms`, and the downbeat error from the sequencer playhead as `downbeat_ms` median / max / n) |
+
+The packet layouts follow the public Pro DJ Link write-up. Names are decoded at the offset of their packet family: the
+54-byte keep-alive and the other port-50000 frames carry the name at 0x0c, the port-50001/50002 beat and status frames
+at 0x0b (`fake_master.packet_name`).
+
+## Following a master
+
+1. Start the emulator on a segment: `./sp16 run --name NAME --net mcast`.
+2. Start the master on the same segment: `python3 emulator/net/segment_master.py --bpm 128 --pitch 2 --duration 120`.
+3. Set the firmware's sync source with the menu recipe from [MIDI](midi.md#firmware-menu-settings):
+   `python3 emulator/menu/sync_source.py --build NAME sync-source-pdl`. The HOME header gains `LINK` once the app has
+   accepted the master.
+4. Press PLAY. `segment_master.py` prints each keep-alive it receives from the guest.
+
+All four steps in one command:
+
+```sh
+python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 --master-pitch 2 --seconds 60
+```
+
+### State
+
+- **Real traffic, both ways (O).** The guest binds UDP 50000, 50002 and 50001 and emits its 54-byte keep-alive
+  (type `0x06`, name `TORAIZ`) about every 2 s; the relay carries it to `segment_watch.py` and to `segment_master.py`,
+  which reads it back.
+- **Tempo follows (O).** With SYNC SOURCE = PRO DJ LINK the sequencer runs at the master's effective tempo: 130.56 BPM
+  against a master at 128 BPM +2 %, `tempo_error_bpm` 0.0. The gate was the player-status packet's play state: the
+  status frame's `P3` byte must say the player is loaded and playing forward, and the master-meaningful byte and the
+  rekordbox `Mv` multiplier must be set (`emulator/net/fake_master.py`).
+- **Downbeat alignment (measured).** The probe now reads the sequencer position, not just the click onsets: during
+  the follow window it decodes the panel frames, takes `hwsuite.playhead_steps` (step 0 = bar start) and reports
+  `downbeat_ms` (median, max, n) = the time the playhead enters step 0 minus the nearest master downbeat
+  (beat-in-bar 1). At 128 BPM +2 % (130.56) the follower's downbeat was **~473 ms late** when the master reported
+  the current beat, because the beat handler `FUN_0051e6b0` reads the beat packet's `Bb` (`0x5c`) as the beat that
+  just **completed** and follows the next-bar distance (`0x2c`) from that same convention. `segment_master.py` now
+  reports the completed beat, which aligns the bar to **~16 ms** (median, `n` 33; the residual is the emulator's
+  network latency, not a whole beat).
+- **Linking with an emulated CDJ-3000 (not attempted).** The downbeat is now measured and largely aligned
+  (~16 ms residual; see above), so this is no longer blocked on phase evidence, but it was still not attempted.
+
+## The sync bridge
+
+`emulator/sync/bridge.py` reads the master's beat and status packets straight off the segment and drives two
+followers, independently of whether the emulator's own follower is engaged:
+
+```sh
+python3 emulator/sync/bridge.py --clock-out "IAC Driver Bus 1"          # MIDI clock only
+python3 emulator/sync/bridge.py --clock-out "IAC Driver Bus 1" --link   # and Ableton Link
+python3 emulator/sync/bridge.py --link --duration 60                    # Link only, no clock destination
+```
+
+- **MIDI clock (works, unit-tested).** The master's effective BPM (base BPM times the actual pitch) retunes a 24 PPQN
+  0xF8 stream on a background thread; a tempo change lands on the next pulse without restarting the thread. The CoreMIDI
+  sink is a thin adapter, so the packet → tempo → clock pipeline is tested without CoreMIDI.
+- **Ableton Link (tempo works; phase not measured).** `--link` drives a minimal Carabiner client on TCP
+  `127.0.0.1:17000`: `bpm` on a tempo change and `force-beat-at-time` on every downbeat (beat 0 of the next bar, at the
+  Link clock's now, `:start + beat * 60e6 / bpm` from Carabiner's `status`). Carabiner is not bundled; build it from
+  [Deep-Symmetry/carabiner](https://github.com/Deep-Symmetry/carabiner) and run it yourself. Live, with the segment
+  master at 128 BPM +2 % changing to 140 BPM after 25 s, a second Carabiner on another port (an independent Link peer)
+  read 130.56 BPM, then 142.80 BPM within about 4 s of the change. Whether the forced downbeat lands on the master's
+  downbeat was not measured. With no Carabiner the bridge prints one diagnostic per outage
+  (`sync: no Carabiner listening on 127.0.0.1:17000 …; Link tempo/phase sync is off`) and keeps the MIDI clock running;
+  a later outage after a recovery warns once more.
+
+The bridge is stdlib only and reads the multicast segment (encapsulated Ethernet frames on `230.0.0.1:34567`), so it
+follows the fake master or another emulator on `--net mcast`. It does not read native Pro DJ Link UDP (ports
+50001/50002), so a real master on a `host` or `bridged` network must first have its traffic re-encapsulated onto the
+segment; that step is not automated today.
+
+## Diagnosing the network
+
+A build with `--research --trace gdb` and a NIC keeps the shim's network diagnostics on: `SP16_NET_DIAG=1` makes the
+shim print one line per address query, ioctl, bind, close, socket option and `sendto` with its numeric result, errno
+and port — never an address, a MAC or a payload. Ordinary sessions keep it off.
+
+The diagnostics themselves show up on the guest console, which is what makes a "the app binds but the segment sees
+nothing" question answerable: if the guest logs `sendto` returning 54 bytes and the relay or `segment_watch.py` sees no
+frame, the loss is host-side. `emulator/net/diag/carrier.py` is an optional LLDB probe script for the same session (it
+stops at the firmware's GLINK, autoconfiguration and socket routines, and its `force_up` switch only overrides a return
+register for observation — it is not validation of anything).
+
+## Not there
+
+- Beat/DJ-link features beyond tempo: track info, cue and seek messages, and the on-screen link view are not emulated
+  or verified.
+- The pass-through of real Pro DJ Link traffic between the guest and a physical network is untested on `host` and
+  `bridged` after the relay change; those modes reuse the unchanged socket_vmnet path.
+- No emulator-to-emulator link is tested beyond one guest and one fake master on the same `mcast` segment.

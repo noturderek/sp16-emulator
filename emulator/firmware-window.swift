@@ -103,6 +103,8 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
     let keyKind = NSSegmentedControl(labels: ["Key file", "GPL archive"], trackingMode: .selectOne, target: nil, action: nil)
     let status = NSTextField(labelWithString: "")
     let report = NSTextView()
+    let steps = NSTextField(labelWithString: "")
+    let progress = NSProgressIndicator()
     let importButton = NSButton(title: "Import", target: nil, action: nil)
     let startButton = NSButton(title: "Start", target: nil, action: nil)
     var keyPaths: [String] = []
@@ -119,8 +121,11 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
         window.title = firstRun ? "Import SP-16 firmware" : "Import firmware"
         window.delegate = self
         let intro = NSTextField(wrappingLabelWithString: firstRun
-            ? "This emulator ships without any firmware. Choose your SP-16 update (.UPD) and its key: the key file, or the official GPL source archive (the .tar.gz, or both official zip parts in order). The key is used only for this import and is never stored."
+            ? "Welcome. This emulator ships without any firmware, so it starts here. Three steps: choose your SP-16 update (.UPD), choose its key (the key file, or the official GPL source archive: the .tar.gz, or both official zip parts in order), then import. The import decrypts and checks the update inside the emulator's own VM; the key is used only for this import and is never stored or logged. When it is done, Start boots the firmware to its home screen. Nothing is downloaded for you; `./sp16 firmware download --info` shows the official update's source and size if you want it."
             : "Choose an SP-16 update (.UPD) and its key file or GPL archive parts.")
+        steps.font = .systemFont(ofSize: 12, weight: .medium)
+        progress.style = .bar; progress.isIndeterminate = true; progress.isHidden = true
+        progress.widthAnchor.constraint(equalToConstant: 600).isActive = true
         updateField.placeholderString = "SP-16 update (.UPD)"; updateField.isEditable = false
         keyField.placeholderString = "Key file or GPL archive parts"; keyField.isEditable = false
         nameField.placeholderString = "Name (optional)"
@@ -134,8 +139,8 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
         let scroll = NSScrollView(); scroll.documentView = report; scroll.hasVerticalScroller = true
         scroll.heightAnchor.constraint(equalToConstant: 200).isActive = true
         func row(_ views: [NSView]) -> NSStackView { let s = NSStackView(views: views); s.orientation = .horizontal; return s }
-        let stack = NSStackView(views: [intro, row([updateField, chooseUpdate]), keyKind, row([keyField, chooseKey]),
-                                        nameField, row([importButton, startButton, status]), scroll])
+        let stack = NSStackView(views: [intro, steps, row([updateField, chooseUpdate]), keyKind, row([keyField, chooseKey]),
+                                        nameField, row([importButton, startButton, status]), progress, scroll])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         for field in [updateField, keyField] { field.widthAnchor.constraint(equalToConstant: 480).isActive = true }
@@ -145,6 +150,20 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
         window.contentView = stack
         window.center()
         updateField.setAccessibilityLabel("Update file"); keyField.setAccessibilityLabel("Key source")
+        progress.setAccessibilityLabel("Import progress")
+        refreshSteps()
+    }
+
+    /// The wizard's checklist: ✓ when a step is done, ▸ for the one to do next.
+    enum Phase { case choosing, importing, imported, refused }
+    var phase = Phase.choosing
+    func refreshSteps() {
+        let haveUpdate = !updateField.stringValue.isEmpty, haveKey = !keyPaths.isEmpty
+        func mark(_ done: Bool, _ next: Bool) -> String { done ? "✓" : (next ? "▸" : "○") }
+        let importing = phase == .importing, imported = phase == .imported
+        steps.stringValue = "\(mark(haveUpdate, !haveUpdate)) 1 Update file     \(mark(haveKey, haveUpdate && !haveKey)) 2 Key     "
+            + "\(mark(imported, haveUpdate && haveKey && !imported)) 3 \(importing ? "Importing…" : "Import")     "
+            + "\(mark(false, imported)) 4 Start"
     }
 
     func show() {
@@ -160,12 +179,12 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
         DispatchQueue.main.async { close?() }
     }
 
-    @objc func keyKindChanged() { keyPaths = []; keyField.stringValue = "" }
+    @objc func keyKindChanged() { keyPaths = []; keyField.stringValue = ""; refreshSteps() }
 
     @objc func chooseUpdate() {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.message = "Choose the SP-16 update (.UPD)"
-        if panel.runModal() == .OK, let url = panel.url { updateField.stringValue = url.path }
+        if panel.runModal() == .OK, let url = panel.url { updateField.stringValue = url.path; refreshSteps() }
     }
 
     @objc func chooseKey() {
@@ -176,6 +195,7 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
         if panel.runModal() == .OK {
             keyPaths = panel.urls.map { $0.path }.sorted()
             keyField.stringValue = keyPaths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+            refreshSteps()
         }
     }
 
@@ -185,6 +205,8 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
         arguments += keyKind.selectedSegment == 0 ? ["--key-file", keyPaths[0]] : ["--gpl-archive"] + keyPaths
         if !nameField.stringValue.isEmpty { arguments += ["--name", nameField.stringValue] }
         importButton.isEnabled = false
+        phase = .importing; refreshSteps()
+        progress.isHidden = false; progress.startAnimation(nil)
         status.stringValue = "Importing… (the update is decrypted and checked inside the emulator VM)"
         report.string = ""
         // Which files, never the key: its kind and how many parts, not its name or path.
@@ -202,6 +224,7 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
 
     func finish(_ result: [String: Any]) {
         importButton.isEnabled = true
+        progress.stopAnimation(nil); progress.isHidden = true
         report.string = FirmwareTool.describe(result)
         let imported = result["report"] as? [String: Any]
         AppLog.log("import result: \(result["status"] ?? "?") id=\(result["id"] ?? "-") "
@@ -216,9 +239,12 @@ final class FirmwareImportWindow: NSObject, NSWindowDelegate {
             status.stringValue = verified ? "Imported \(id)."
                 : "Imported \(id). It is unverified (\(report?["reason"] ?? "no verified profile")) and runs on the reference measurements."
             startButton.isHidden = false
+            startButton.keyEquivalent = "\r"; importButton.keyEquivalent = ""   // Return now starts the firmware
+            phase = .imported; refreshSteps()
             _ = FirmwareTool.run(["select", "--library", library, "--id", id])
         } else {
             status.stringValue = "Import refused."
+            phase = .refused; refreshSteps()
         }
     }
 

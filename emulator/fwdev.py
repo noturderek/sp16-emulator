@@ -167,9 +167,20 @@ def running_session(build, since=None):
             if line.split(None, 1)[1:] and line.split(None, 1)[1].startswith(exe)]
     if not pids:
         return None, None
-    sessions = sorted((p for p in (Path(build) / "sessions").glob("native-*/runtime.json")
-                       if since is None or p.stat().st_mtime >= since - 1), key=lambda p: p.stat().st_mtime)
-    return pids[0], (json.loads(sessions[-1].read_text()) if sessions else None)
+    return pids[0], latest_runtime(build, since)
+
+
+def latest_runtime(build, since=None):
+    """The newest session runtime.json of the build created after `since`, or None. The app writes that file as it
+    starts, so a half-written or vanished one is skipped instead of raised: the session is simply not readable yet."""
+    paths = sorted((path for path in (Path(build) / "sessions").glob("native-*/runtime.json")
+                    if since is None or path.stat().st_mtime >= since - 1), key=lambda path: path.stat().st_mtime)
+    for path in reversed(paths):
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 class Socket:
@@ -227,10 +238,26 @@ def wait_settled(sock, deadline, minimum_start=0.0, stable=1.0, name="fwdev-prob
     raise ModError("the LCD did not settle in time")
 
 
-def console_since(runtime, offset):
+def console_since(runtime, offset, timeout=15.0):
+    """The session's console.txt from `offset`, waiting up to `timeout` seconds for the file to appear: the session
+    records one before the app has created its console, so a launch that just started can look for it too early. A
+    console that shrank below `offset` was recreated by an app restart, so its whole text is new."""
     path = Path(runtime["session"]) / "console.txt"
-    data = path.read_text(errors="replace")
-    return data[offset:], len(data)
+    if offset < 0:
+        raise ModError(f"console offset {offset} is negative")
+    if not timeout > 0:
+        raise ModError(f"console wait {timeout:g} s is not a positive timeout")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            data = path.read_text(errors="replace")
+        except FileNotFoundError:
+            if time.monotonic() > deadline:
+                raise ModError(f"the app wrote no console.txt at {path} within {timeout:g} s: check that the session "
+                               f"is still running and that the build launched the app") from None
+            time.sleep(.1)
+            continue
+        return (data[offset:] if offset <= len(data) else data), len(data)
 
 
 def same_overlay(runtime, folder):
@@ -271,7 +298,10 @@ def run(build, folder, firmware_id=None, timeout=90):
     while time.monotonic() < deadline:
         pid, runtime = running_session(build, since=wall)
         if runtime and same_overlay(runtime, folder):
-            console, _ = console_since(runtime, 0)
+            try:
+                console, _ = console_since(runtime, 0, timeout=2.0)
+            except ModError:
+                console = ""      # the app has not written its console yet; keep looking until the deadline
             if "SP16_NATIVE_READY" in console:
                 break
             if "SP16_FIRMWARE_ERROR" in console:

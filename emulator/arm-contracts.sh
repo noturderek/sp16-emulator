@@ -30,6 +30,23 @@ expect() { # log-line-regex: the stub's own log from the run just finished
 CC="arm-linux-gnueabi-gcc -Wall -Wextra"
 PRE="qemu-arm-static -L /usr/arm-linux-gnueabi -E LD_PRELOAD=/opt/sp16/libsp16-ui.so"
 run sp16_stub_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
+expect 'backlight level=0'
+expect 'backlight level=255'
+run sp16_network_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE -E SP16_NET_GLINK=1 /tmp/run/t up; $PRE -E SP16_NET_GLINK=0 /tmp/run/t down; $PRE /tmp/run/t off; $PRE /tmp/run/t arp; $PRE -E SP16_NET_ARP=1 /tmp/run/t arp"
+run sp16_network_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE -E SP16_NET_DIAG=1 /tmp/run/t diag"
+expect 'SP16_NET_DIAG bind fd=.* port=50002 result=0 errno=0'
+expect 'SP16_NET_DIAG setsockopt fd=.* option=SO_REUSEADDR result=0 errno=0'
+expect 'SP16_NET_DIAG setsockopt fd=.* option=SO_BROADCAST result=0 errno=0'
+expect 'SP16_NET_DIAG sendto fd=.* port=50000 bytes=4 result=4 errno=0'
+expect 'SP16_NET_DIAG ioctl request=0x8915 result=0 errno=0 address_nonzero=1'
+expect 'SP16_NET_DIAG ioctl request=0x891b result=0 errno=0 mask_nonzero=1'
+expect 'SP16_NET_DIAG close fd=.* port=50002 result=0 errno=0'
+run sp16_din_queue_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/t; /tmp/run/t"
+run sp16_usb_route_contract "gcc -Wall -Wextra /tmp/test.c -lasound -o /tmp/run/t; /tmp/run/t"
+run sp16_din_ioctl_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
+run sp16_din_contract "$CC /tmp/test.c /opt/sp16/libsp16-ui.so -o /tmp/run/t; $PRE /tmp/run/t"
+expect 'rawmidi hw:snddinmidi,0 ->'
+run sp16_seq_contract "$CC /tmp/test.c -o /tmp/run/t; $PRE /tmp/run/t"
 run sp16_pcm_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run /tmp/run/t"
 run sp16_hwparams_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run /tmp/run/t"
 expect 'PCM hw:ak4452audio,1 set_access requested=3(RW_INTERLEAVED) result=0'
@@ -42,9 +59,12 @@ expect 'media poll /proc/udev_usb1 (attempt 1)'
 expect 'blocked guest helper exec: /bin/sync argc=2 argv=\[sync -n\]'
 run sp16_pcm_tap_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_ANY_FORMAT=1 -E SP16_PCM_TAP=/tmp/run -E SP16_PCM_TAP_SECONDS=1 /tmp/run/t; rm -f /tmp/run/sp16-pcm-*; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_ANY_FORMAT=1 /tmp/run/t off"
 expect 'PCM tap hw:ak4458audio,0 -> /tmp/run/sp16-pcm-ak4458audio-0.raw cap_frames=44100'
-run sp16_audio_transport_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; : > /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_PORT=/tmp/run/port /tmp/run/t file; rm -f /tmp/run/port; mkfifo /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_PORT=/tmp/run/port /tmp/run/t stall; rm -f /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run /tmp/run/t off"
-expect 'audio transport hw:ak4458audio,0 -> /tmp/run/port stream=0 fmt=2 channels=12..15 of 16 rate=44100'
-run sp16_board_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_ANY_FORMAT=1 -E SP16_ANALOG=/tmp/run/analog -E SP16_MIDI_LOOPBACK=1 -E SP16_FAKE_ETH0=1 /tmp/run/t"
+run sp16_audio_transport_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; : > /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_PORT=/tmp/run/port /tmp/run/t file; rm -f /tmp/run/port; : > /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_PORT=/tmp/run/port /tmp/run/t s24; rm -f /tmp/run/port; mkfifo /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_PORT=/tmp/run/port /tmp/run/t stall; rm -f /tmp/run/port; $PRE -E LD_LIBRARY_PATH=/tmp/run /tmp/run/t off"
+expect 'audio transport hw:ak4458audio,0 -> /tmp/run/port stream=0 fmt=2 channels=0..15 of 16 rate=44100'
+expect 'audio transport hw:ak4452audio,1 -> /tmp/run/port stream=2 fmt=6 channels=0..1 of 2 rate=44100'
+expect 'converted bit-exact'
+run sp16_board_contract "$CC -DSP16_FAKE_ALSA -shared -fPIC /tmp/test.c -o /tmp/run/libsp16-fake-alsa.so; $CC /tmp/test.c -L/tmp/run -lsp16-fake-alsa -o /tmp/run/t; $PRE -E LD_LIBRARY_PATH=/tmp/run -E SP16_PCM_ANY_FORMAT=1 -E SP16_ANALOG=/tmp/run/analog -E SP16_MIDI_LOOPBACK=1 -E SP16_FAKE_ETH0=1 -E SP16_USB_OC_PATH=/tmp/run/usb-oc /tmp/run/t"
+expect 'gpio GPIO4_IO14=0 USBPWR_OC'
 expect 'dac hpf word=0x1fff ctrl=1 code=4095 writes=1'
 expect 'analog board state mapped from /tmp/run/analog'
 expect 'midi loopback /dev/ttymxc1 first bytes=4'

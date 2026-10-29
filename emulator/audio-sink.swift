@@ -11,6 +11,9 @@ final class AudioSink {
     struct StreamState {
         var name: String
         var format: Int, channels: Int, firstChannel: Int, totalChannels: Int, rate: Int
+        /// Channels of the payload that go into the WAV: the whole payload, except that the 16-channel master stream
+        /// keeps its historical file (channels 12...15) when the guest sends all 16 for the output monitor.
+        var wavFirst = 0, wavChannels = 0
         var fd: Int32 = -1
         var path: String
         var dataBytes: UInt64 = 0
@@ -70,8 +73,34 @@ final class AudioSink {
     var isRunning: () -> Bool
     let writeFiles: Bool
     let output: AudioOutput?
-    static let outputStream = 0            // ak4458audio-0: ch12 (L) and ch14 (R) are the decoded master pair
-    static let leftChannel = 12, rightChannel = 14
+    /// Output jacks the host can monitor (the API of the output monitor menu). `source` says where the jack's stereo
+    /// pair lives in the transport: the stream id (0 ak4458audio-0, 1 ak4452audio-0 = PHONES) and the left and right
+    /// channel inside that stream's own channel numbering (absolute, as the guest has them). The AK4458 stream is 16
+    /// S16 channels, 8 DAC slots of two channels each; only the even channel of a slot carries audio. Grades: MAIN and
+    /// OUT7-8 observed with AUDIO TEST MODE3 and MODE2, OUT3-4 and OUT5-6 inferred (a regular slot order), PHONES
+    /// observed (MODE1, MODE2). See audio-jack-map.json.
+    enum OutputJack: String, CaseIterable {
+        case main = "MAIN", out34 = "OUT3-4", out56 = "OUT5-6", out78 = "OUT7-8", phones = "PHONES"
+        var source: (stream: Int, left: Int, right: Int) {
+            switch self {
+            case .main: return (0, 12, 14)
+            case .out34: return (0, 8, 10)
+            case .out56: return (0, 4, 6)
+            case .out78: return (0, 0, 2)
+            case .phones: return (1, 0, 1)
+            }
+        }
+    }
+    private var monitorJack = OutputJack.main
+    /// The jack the CoreAudio output plays (MAIN by default). Thread safe; takes effect on the next packet. The WAVs
+    /// never depend on it.
+    var monitor: OutputJack {
+        get { lock.lock(); defer { lock.unlock() }; return monitorJack }
+        set {
+            lock.lock(); let changed = monitorJack != newValue; monitorJack = newValue; lock.unlock()
+            if changed { output?.flush() }
+        }
+    }
 
     init(socketPath: String, directory: String, writeFiles: Bool = true, output: AudioOutput? = nil,
          isRunning: @escaping () -> Bool) {
@@ -79,7 +108,16 @@ final class AudioSink {
         self.writeFiles = writeFiles; self.output = output
     }
 
+    /// Held while the sink runs. A session in the background (bench mode starts the app with `open -g`) is otherwise
+    /// subject to App Nap, which delays every thread of the app, the panel port reader as well as this one, by tens to
+    /// hundreds of milliseconds: panel frames reached the host in bursts after gaps of up to 200 ms, and up to about one
+    /// audio packet in a hundred arrived more than 20 ms late. With the assertion held, a 60 s window had 0 or 1 panel-frame
+    /// gaps above 40 ms instead of 4 to 58. (The speaker output already takes one of its own; file-only builds had none.)
+    private var activity: NSObjectProtocol?
+
     func start() {
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
+                                                         reason: "SP16 audio and panel transport")
         // Receipt latency is measured here, so the reader must not wait behind other host work.
         let thread = Thread { [weak self] in self?.run() }
         thread.qualityOfService = .userInteractive
@@ -88,6 +126,7 @@ final class AudioSink {
 
     func stop() {
         lock.lock(); stopping = true; lock.unlock()
+        if let held = activity { ProcessInfo.processInfo.endActivity(held); activity = nil }
     }
 
     static func nowNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
@@ -233,6 +272,7 @@ final class AudioSink {
         var state = StreamState(name: base, format: format, channels: channels, firstChannel: first, totalChannels: total,
                                 rate: rate, fd: fd, path: path)
         state.nextFrame = nil
+        if id == 0 && first == 0 && channels == 16 { state.wavFirst = 12; state.wavChannels = 4 } else { state.wavFirst = 0; state.wavChannels = channels }
         if let old = streams[id] { state.guestDrops = old.guestDrops }
         streams[id] = state
         updateHeader(id, force: true)
@@ -243,7 +283,7 @@ final class AudioSink {
 
     func updateHeader(_ id: Int, force: Bool) {
         guard var s = streams[id], s.fd >= 0, let width = AudioSink.sampleWidth(s.format) else { return }
-        if !force && s.dataBytes - s.lastHeaderUpdate < UInt64(s.rate * s.channels * width) { return }
+        if !force && s.dataBytes - s.lastHeaderUpdate < UInt64(s.rate * s.wavChannels * width) { return }
         s.lastHeaderUpdate = s.dataBytes
         streams[id] = s
         let dataSize = UInt32(truncatingIfNeeded: min(s.dataBytes, 0xFFFF_FFFF - 36))
@@ -251,15 +291,15 @@ final class AudioSink {
         func put32(_ v: UInt32) { for i in 0..<4 { h.append(UInt8((v >> UInt32(8 * i)) & 255)) } }
         func put16(_ v: UInt16) { h.append(UInt8(v & 255)); h.append(UInt8(v >> 8)) }
         h += Array("RIFF".utf8); put32(36 + dataSize); h += Array("WAVEfmt ".utf8); put32(16)
-        put16(s.format == 14 ? 3 : 1); put16(UInt16(s.channels)); put32(UInt32(s.rate))
-        put32(UInt32(s.rate * s.channels * width)); put16(UInt16(s.channels * width)); put16(UInt16(width * 8))
+        put16(s.format == 14 ? 3 : 1); put16(UInt16(s.wavChannels)); put32(UInt32(s.rate))
+        put32(UInt32(s.rate * s.wavChannels * width)); put16(UInt16(s.wavChannels * width)); put16(UInt16(width * 8))
         h += Array("data".utf8); put32(dataSize)
         _ = h.withUnsafeBytes { Darwin.pwrite(s.fd, $0.baseAddress!, 44, 0) }
     }
 
     func write(_ id: Int, payload: Data, frames: Int, index: UInt64) {
         guard var s = streams[id], let width = AudioSink.sampleWidth(s.format) else { return }
-        let bpf = s.channels * width
+        let bpf = s.channels * width, wavBpf = s.wavChannels * width
         guard frames > 0, payload.count >= frames * bpf else { badPackets += 1; return }
         var gapFrames: UInt64 = 0
         if let next = s.nextFrame {
@@ -270,20 +310,29 @@ final class AudioSink {
                 s.gapFrames += index - next
                 let zeros = [UInt8](repeating: 0, count: 65536)
                 while gap > 0 {
-                    let step = min(UInt64(zeros.count / bpf), gap)
-                    if s.fd >= 0 { _ = zeros.withUnsafeBytes { Darwin.write(s.fd, $0.baseAddress!, Int(step) * bpf) } }
-                    s.dataBytes += step * UInt64(bpf); s.frames += step; gap -= step
+                    let step = min(UInt64(zeros.count / wavBpf), gap)
+                    if s.fd >= 0 { _ = zeros.withUnsafeBytes { Darwin.write(s.fd, $0.baseAddress!, Int(step) * wavBpf) } }
+                    s.dataBytes += step * UInt64(wavBpf); s.frames += step; gap -= step
                 }
             } else if index < next { s.overlapFrames += next - index }
         }
-        if id == AudioSink.outputStream, let output = output { feedOutput(output, s, payload: payload, frames: frames, index: index, gap: gapFrames) }
+        if let output = output, id == monitorJack.source.stream { feedOutput(output, s, jack: monitorJack, payload: payload, frames: frames, index: index, gap: gapFrames) }
         s.nextFrame = index + UInt64(frames)
         payload.withUnsafeBytes { raw in
-            if s.fd >= 0 { _ = Darwin.write(s.fd, raw.baseAddress!, frames * bpf) }
+            if s.fd >= 0 {
+                if s.wavChannels == s.channels { _ = Darwin.write(s.fd, raw.baseAddress!, frames * bpf) }
+                else {
+                    var sliced = [UInt8](repeating: 0, count: frames * wavBpf)
+                    for f in 0..<frames {
+                        for b in 0..<wavBpf { sliced[f * wavBpf + b] = raw.load(fromByteOffset: f * bpf + s.wavFirst * width + b, as: UInt8.self) }
+                    }
+                    _ = sliced.withUnsafeBytes { Darwin.write(s.fd, $0.baseAddress!, frames * wavBpf) }
+                }
+            }
             let base = raw.baseAddress!
             for f in 0..<frames {
                 var any = false
-                for c in 0..<s.channels {
+                for c in s.wavFirst..<(s.wavFirst + s.wavChannels) {
                     let o = (f * s.channels + c) * width
                     var v = 0.0
                     switch s.format {
@@ -298,23 +347,31 @@ final class AudioSink {
                 if any { s.nonzeroFrames += 1 }
             }
         }
-        s.dataBytes += UInt64(frames * bpf); s.frames += UInt64(frames); s.packets += 1
+        s.dataBytes += UInt64(frames * wavBpf); s.frames += UInt64(frames); s.packets += 1
         streams[id] = s
         updateHeader(id, force: false)
     }
 
-    /// Decode the ch12/ch14 pair (S16) to float and hand it to the CoreAudio path. A guest drop leaves a gap in the
-    /// absolute frame index: short gaps are bridged with silence to keep the timeline, long ones flush the buffer.
-    func feedOutput(_ output: AudioOutput, _ s: StreamState, payload: Data, frames: Int, index: UInt64, gap: UInt64) {
-        guard s.format == 2 else { return }   // S16 only: that is what the ak4458 master carries
-        let li = AudioSink.leftChannel - s.firstChannel, ri = AudioSink.rightChannel - s.firstChannel
+    /// Decode the monitored jack's pair (S16, or float for the PHONES stream) and hand it to the CoreAudio path. A guest
+    /// drop leaves a gap in the absolute frame index: short gaps are bridged with silence to keep the timeline, long
+    /// ones flush the buffer.
+    func feedOutput(_ output: AudioOutput, _ s: StreamState, jack: OutputJack, payload: Data, frames: Int, index: UInt64, gap: UInt64) {
+        guard s.format == 2 || s.format == 14 else { return }   // S16 (AK4458 master) or float (the AK4452 playback)
+        let pair = jack.source
+        let li = pair.left - s.firstChannel, ri = pair.right - s.firstChannel
         guard li >= 0, ri >= 0, li < s.channels, ri < s.channels else { return }
         var left = [Float](repeating: 0, count: frames), right = left
+        let width = s.format == 2 ? 2 : 4
         payload.withUnsafeBytes { raw in
+            func sample(_ offset: Int) -> Float {
+                if s.format == 2 { return Float(raw.loadUnaligned(fromByteOffset: offset, as: Int16.self).littleEndian) / 32768 }
+                let value = Float(bitPattern: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian)
+                return value.isFinite ? value : 0
+            }
             for f in 0..<frames {
-                let base = (f * s.channels) * 2
-                left[f] = Float(raw.loadUnaligned(fromByteOffset: base + li * 2, as: Int16.self).littleEndian) / 32768
-                right[f] = Float(raw.loadUnaligned(fromByteOffset: base + ri * 2, as: Int16.self).littleEndian) / 32768
+                let base = (f * s.channels) * width
+                left[f] = sample(base + li * width)
+                right[f] = sample(base + ri * width)
             }
         }
         if gap > 0 {
@@ -333,7 +390,8 @@ final class AudioSink {
         var out: [String: Any] = [:]
         for (id, s) in streams {
             out[AudioSink.streamNames[id] ?? "stream\(id)"] = [
-                "format": AudioSink.formatName(s.format), "channels": s.channels, "first_channel": s.firstChannel,
+                "format": AudioSink.formatName(s.format), "channels": s.wavChannels, "first_channel": s.firstChannel + s.wavFirst,
+                "transport_channels": s.channels, "transport_first_channel": s.firstChannel,
                 "total_channels": s.totalChannels, "rate": s.rate, "frames": s.frames, "packets": s.packets,
                 "gap_frames": s.gapFrames, "overlap_frames": s.overlapFrames, "guest_drops": s.guestDrops,
                 "peak": s.peak, "nonzero_frames": s.nonzeroFrames, "wav": writeFiles ? s.path : ""] as [String: Any]
@@ -343,7 +401,7 @@ final class AudioSink {
         if let offset = offsetNs { clock["offset_ns"] = offset }
         var result: [String: Any] = ["mode": output == nil ? (writeFiles ? "file" : "counters") : (writeFiles ? "both" : "coreaudio"), "connected": connected, "packets": packets, "bytes": bytes, "seq_gaps": seqGaps,
                 "bad_packets": badPackets, "clock": clock, "latency_ms": latency.summary(), "late_over_20ms": late20,
-                "late_log": lateLog, "streams": out]
+                "late_log": lateLog, "monitor": monitorJack.rawValue, "streams": out]
         if let output = output { result["output"] = output.snapshot() }
         return result
     }

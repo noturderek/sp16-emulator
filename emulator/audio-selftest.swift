@@ -67,7 +67,45 @@ struct SelfTest {
         if !ok { failures += 1 }
     }
 
+    /// The file sink and the output monitor table, on synthetic packets: the 16-channel master stream goes into the WAV
+    /// as its historical channels 12...15 whatever the guest sends, and the monitored jack is selectable.
+    static func sinkTests() {
+        let dir = NSTemporaryDirectory() + "sp16-sink-\(getpid())"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let sink = AudioSink(socketPath: "unused", directory: dir, writeFiles: true, output: nil, isRunning: { true })
+        func packet(type: UInt8, frames: Int, first: Int, channels: Int, payload: [Int16]) -> Data {
+            var h = [UInt8](repeating: 0, count: 48)
+            h.replaceSubrange(0..<4, with: Array("SPCM".utf8)); h[4] = type; h[5] = 0; h[6] = 2
+            h[7] = UInt8(channels); h[8] = 16; h[9] = UInt8(first)
+            func put(_ v: UInt32, _ o: Int) { for i in 0..<4 { h[o + i] = UInt8((v >> UInt32(8 * i)) & 255) } }
+            put(44100, 12); put(UInt32(frames), 20); put(UInt32(payload.count * 2), 44)
+            var d = Data(h)
+            for v in payload { d.append(UInt8(truncatingIfNeeded: v)); d.append(UInt8(truncatingIfNeeded: v >> 8)) }
+            return d
+        }
+        let frames = 100
+        var payload = [Int16]()
+        for f in 0..<frames { for c in 0..<16 { payload.append(Int16(c * 1000 + f)) } }
+        sink.handle(packet(type: 2, frames: frames, first: 0, channels: 16, payload: payload), received: 0)
+        sink.lock.lock(); sink.updateHeader(0, force: true); let path = sink.streams[0]?.path ?? ""; sink.lock.unlock()
+        let file = (try? Data(contentsOf: URL(fileURLWithPath: path))) ?? Data()
+        func u16(_ o: Int) -> Int { Int(file[o]) | Int(file[o + 1]) << 8 }
+        func s16(_ o: Int) -> Int { Int(Int16(truncatingIfNeeded: u16(o))) }
+        let sliced = file.count == 44 + frames * 4 * 2 && u16(22) == 4 && u16(32) == 8
+            && (0..<frames).allSatisfy { f in (0..<4).allSatisfy { c in s16(44 + (f * 4 + c) * 2) == (12 + c) * 1000 + f } }
+        check("sink-wav-slice", sliced, "wav \(file.count) bytes, channels \(file.count > 23 ? u16(22) : -1)")
+        // a guest that sends only 12...15 (the default) is written as it is
+        sink.handle(packet(type: 2, frames: 1, first: 12, channels: 4, payload: [1, 2, 3, 4]), received: 0)
+        sink.lock.lock(); let s = sink.streams[0]; sink.lock.unlock()
+        check("sink-default-channels", s?.wavChannels == 4 && s?.wavFirst == 0, "wav channels \(s?.wavChannels ?? -1) first \(s?.wavFirst ?? -1)")
+        sink.monitor = .out56
+        check("monitor-jack", sink.monitor == .out56 && AudioSink.OutputJack.out56.source == (0, 4, 6)
+              && AudioSink.OutputJack.allCases.count == 5, "\(sink.monitor.rawValue)")
+        try? FileManager.default.removeItem(atPath: dir)
+    }
+
     static func unitTests() {
+        sinkTests()
         var r = simulate(inRate: 44100, inPPM: 0, outRate: 44100, outPPM: 0, block: 128, seconds: 120)
         check("equal-rates", r.underrunsAfterWarmup == 0 && r.overflows == 0 && abs(r.adjustPPM) < 300 && r.monotonic, "\(r)")
         r = simulate(inRate: 44100, inPPM: 0, outRate: 44100, outPPM: -120, block: 128, seconds: 180)

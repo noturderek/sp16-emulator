@@ -15,14 +15,17 @@ FEEDBACK: >IBH generation/flags/count then count x (>BBBB lamp id, r, g, b). Fla
   live firmware output has been decoded; entries only cover lamps with a proven mapping.
 RESEARCH: one-byte operation then payload (host research socket only). 1 = raw frame
   bytes (offset, data), 2 = raw CDC bytes (4), 3 = clear raw overrides, 4 = TX log on/off,
-  5 = RX frame period in milliseconds (1..50).
+  5 = RX frame period in milliseconds (1..50), 6 = USB over-current input (0 idle, 1 asserted).
 TX_FRAME: >BBB then up to 128 bytes: multi/part id/part count of an OEM panel TX frame
   (guest -> host, research logging only).
 STATS: UTF-8 JSON object of guest panel counters (guest -> host, about 1 Hz).
+STANDBY: >B standby flag (0/1) (guest -> host, always, on transition only). The window
+  ignores the flag until the home screen has settled, because the firmware's start-up
+  frames also set it.
 """
 import struct
 
-FRAME, TOUCH, ACK, WHEEL, KEY, CONTROL, INPUT_RESULT, FEEDBACK, RESEARCH, TX_FRAME, STATS = range(1, 12)
+FRAME, TOUCH, ACK, WHEEL, KEY, CONTROL, INPUT_RESULT, FEEDBACK, RESEARCH, TX_FRAME, STATS, STANDBY = range(1, 13)
 INPUT_OK, INPUT_UNSUPPORTED, INPUT_FAILED, INPUT_INVALID = range(4)
 CONTROL_ACTIONS = ("release", "press", "delta", "value")
 MAX_FEEDBACK_LAMPS = 128
@@ -130,6 +133,8 @@ def decode_research(payload):
         return "txlog", data[0], b""
     if operation == 5 and len(data) == 1 and 1 <= data[0] <= 50:
         return "period", data[0], b""
+    if operation == 6 and len(data) == 1 and data[0] in (0, 1):
+        return "usb-oc", data[0], b""
     raise ValueError("invalid research operation")
 
 
@@ -139,6 +144,16 @@ def encode_stats(counters):
     if len(body) > 2048:  # the board-model report added about 200 bytes to the roughly 700 of the panel counters
         raise ValueError("guest stats too large")
     return message(STATS, body)
+
+
+def encode_standby(standby):
+    return message(STANDBY, bytes((1 if standby else 0,)))
+
+
+def decode_standby(payload):
+    if len(payload) != 1 or payload[0] not in (0, 1):
+        raise ValueError("invalid standby flag")
+    return bool(payload[0])
 
 
 def frame_pixels(source):

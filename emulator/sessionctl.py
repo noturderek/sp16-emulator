@@ -13,12 +13,25 @@ import socket
 import sys
 import time
 
-from panel_map import CONTROL_IDS
+from panel_map import CONTROL_IDS, decode_tx
 
 ACTIONS = {"release": 0, "press": 1, "delta": 2, "value": 3}
 # How long a call waits for the app's reply. A host under heavy load can take well over 10 s to answer (the app serves
 # the socket on a background queue); SP16_CONTROL_TIMEOUT or --timeout overrides it.
 DEFAULT_TIMEOUT = 60.0
+TX_LOG = "tx-frames.jsonl"
+# The power key puts the app in standby, which a real unit's M1 follows by cutting the power; the emulator has no M1,
+# so the app stays in standby, the USB stick is unmounted and saves stop until the app is restarted.
+STANDBY_WARNING = ("the app enters standby: the USB stick is unmounted and saves stop until the app is restarted "
+                   "(the emulator has no M1 to wake it)")
+# The factory test's pad calibration page (test page 3, a build made with --app-arg testmode): one press of the WAKE UP key
+# (the USB STOP key) measures one pass, a 3 s spare period and a 1 s average, so about 4.5 s with the page's redraw;
+# three passes make one calibration and write the pad's value if it is inside the valid range.
+CALIBRATION_PASSES = 3
+CALIBRATION_PASS_SECONDS = 7.0
+CALIBRATION_RAW = 300           # inside the valid range of 48..504; the synthetic default calibration is 242
+CALIBRATION_NOTE = ("test page 3 must be on the LCD (a build made with --app-arg testmode; HOME and BACK step the pages); "
+                    "a pad's value is recorded only inside 48..504")
 
 
 class ControlError(RuntimeError):
@@ -166,10 +179,82 @@ class Session:
         self.call(op="panelshot", name=name)
         return self.dir / name
 
-    def usb(self, action):
+    def usb(self, action, path=None):
         """Virtual USB stick: "eject" (guest flushes and unmounts, then the app sees it removed; replies usb-busy
-        and leaves the stick mounted if something still holds it) or "attach" (remount and announce again)."""
-        return self.call(op="usb", action=action)
+        and leaves the stick mounted if something still holds it) or "attach" (remount and announce again; with a
+        `path`, hot-swap to a different image while QEMU runs)."""
+        command = {"op": "usb", "action": action}
+        if path is not None:
+            command["path"] = path
+        return self.call(**command)
+
+    def usb_oc(self, on):
+        return self.call(op="usb-oc", on=on)
+
+    def pressure(self, pad, raw):
+        """Hold a pad's raw pressure word (0..1023) until it is set to 0: the AD value the factory test's pad
+        calibration page shows, not a velocity. `pad` is 1..16 or a name such as pad3."""
+        number = int(str(pad).removeprefix("pad"))
+        if not 1 <= number <= 16:
+            raise ValueError(f"pad {pad!r} is not 1..16")
+        return self.event(f"pressure{number}", "value", int(raw))
+
+    def calibrate(self, pad, raw=CALIBRATION_RAW, passes=CALIBRATION_PASSES, pass_seconds=CALIBRATION_PASS_SECONDS):
+        """The pad calibration walkthrough of the factory test: hold `pad` at `raw`, press WAKE UP (the USB STOP key)
+        once per pass and wait out each pass, then let go. The pad is let go even if a call fails."""
+        self.pressure(pad, raw)
+        try:
+            time.sleep(2.5)                             # the page redraws the held value before the first pass
+            for _ in range(passes):
+                self.press("usb_stop", 0.4)
+                time.sleep(pass_seconds)
+        finally:
+            self.pressure(pad, 0)
+
+    def power(self, seconds=0.3):
+        """The POWER/STANDBY key (a host control, no place on the panel): press, hold, release. The release is what
+        makes the app go to standby."""
+        self.press("power", seconds)
+
+    def tx_standby(self, window=1.0):
+        """The TX standby flag (byte 0x67 bit 0) of the newest OEM frame logged in the next `window` seconds, or None
+        when no frame arrived. Switches the TX log on."""
+        self.call(op="txlog", on=1)
+        path = self.dir / TX_LOG
+        start = path.stat().st_size if path.exists() else 0
+        time.sleep(window)
+        if not path.exists():
+            return None
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            data = handle.read()
+        flag = None
+        for line in data.splitlines():
+            try:
+                decoded = decode_tx(bytes.fromhex(json.loads(line)["hex"])[3:])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if decoded:
+                flag = decoded["standby"]
+        return flag
+
+    def standby(self, wait=8.0):
+        """Press POWER and wait for the TX standby flag to latch: {"before", "standby", "seconds"}."""
+        before = self.tx_standby(0.5)
+        started = time.monotonic()
+        self.power()
+        flag = self.tx_standby(0.5)
+        while not flag and time.monotonic() - started < wait:
+            flag = self.tx_standby(0.5)
+        return {"before": before, "standby": bool(flag), "seconds": round(time.monotonic() - started, 1)}
+
+    def fault(self, on):
+        """Force the power-fault display (QRT1001 p24): dark panel, WAKE UP blinking red; off restores."""
+        return self.call(op="fault", on=on)
+
+    def monitor(self, name):
+        """Choose which output jack pair the CoreAudio output plays (MAIN, PHONES, OUT3-4, OUT5-6, OUT7-8)."""
+        return self.call(op="monitor", name=name)
 
     def metrics(self):
         return self.call(op="metrics")
@@ -193,7 +278,8 @@ def main():
     parser.add_argument("--runtime", required=True, help="session runtime.json")
     parser.add_argument("command", choices=["event", "press", "turn", "touch", "raw", "clear",
                                             "snapshot", "metrics", "txlog", "period", "panelshot", "resize", "adc", "usb",
-                                            "app-restart", "firmware"])
+                                            "app-restart", "firmware", "power", "standby", "pressure", "calibrate",
+                                            "fault", "monitor", "usb-oc"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=None,
                         help=f"seconds to wait for each reply (default SP16_CONTROL_TIMEOUT or {DEFAULT_TIMEOUT:g})")
@@ -235,9 +321,38 @@ def run_command(session, command, a):
     elif command == "panelshot":
         result = {"path": str(session.panelshot(a[0]))}
     elif command == "usb":
-        result = session.usb(a[0] if a else "eject")
+        action = a[0] if a else "eject"
+        result = session.usb(action, a[1] if len(a) > 1 else None)
+    elif command == "usb-oc":
+        if a != ["on"] and a != ["off"]:
+            raise RuntimeError("usb-oc needs on|off")
+        result = session.usb_oc(a[0] == "on")
     elif command == "adc":
         result = session.adc()
+    elif command == "pressure":
+        session.pressure(a[0], a[1])
+        result = {"ok": True}
+    elif command == "calibrate":
+        print(f"sessionctl: {CALIBRATION_NOTE}", file=sys.stderr)
+        raw = int(a[1]) if len(a) > 1 else CALIBRATION_RAW
+        session.calibrate(a[0], raw)
+        result = {"ok": True, "pad": a[0], "raw": raw, "passes": CALIBRATION_PASSES}
+    elif command == "power":
+        print(f"sessionctl: {STANDBY_WARNING}", file=sys.stderr)
+        session.power(float(a[0]) if a else 0.3)
+        result = {"ok": True, "standby": session.tx_standby()}
+    elif command == "standby":
+        if a[:1] != ["yes"]:
+            raise RuntimeError(f"standby needs the argument yes: {STANDBY_WARNING}")
+        result = session.standby()
+    elif command == "fault":
+        if a != ["on"] and a != ["off"]:
+            raise RuntimeError("fault needs on|off")
+        result = session.fault(a[0] == "on")
+    elif command == "monitor":
+        if not a or a[0] not in ("MAIN", "PHONES", "OUT3-4", "OUT5-6", "OUT7-8"):
+            raise RuntimeError("monitor needs MAIN|PHONES|OUT3-4|OUT5-6|OUT7-8")
+        result = session.monitor(a[0])
     elif command == "app-restart":
         result = session.app_restart()
     elif command == "firmware":

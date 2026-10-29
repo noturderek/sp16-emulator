@@ -80,12 +80,36 @@ struct PanelLayout: Decodable {
         let radius: CGFloat?, lineWidth: CGFloat?, from: CGFloat?, to: CGFloat?, tick: CGFloat?
         let count: Int?
         let gaps: [[CGFloat]]?, points: [[CGFloat]]?
+        let width0: CGFloat?, width1: CGFloat?    // "arc": stroke width at `from` and at `to` (tapered scale)
         var rect: CGRect { CGRect(x: x ?? 0, y: y ?? 0, width: w ?? 0, height: h ?? 0) }
+    }
+
+    /// The rear I/O panel: drawn in code, traced from the product's rear view; no controls, no input.
+    struct Rear: Decodable {
+        struct Canvas: Decodable {
+            let width: CGFloat, height: CGFloat, plateTop: CGFloat, plateBottom: CGFloat
+            var size: CGSize { CGSize(width: width, height: height) }
+        }
+        struct Group: Decodable {
+            let label: String
+            let x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
+            var rect: CGRect { CGRect(x: x, y: y, width: w, height: h) }
+        }
+        struct Item: Decodable {
+            let kind: String
+            let cx: CGFloat, cy: CGFloat
+            let text: String?, size: CGFloat?, weight: String?, y2: CGFloat?
+            var center: CGPoint { CGPoint(x: cx, y: cy) }
+        }
+        let canvas: Canvas
+        let groups: [Group]
+        let items: [Item]
     }
 
     let version: Int
     let canvas: Canvas
     let lcd: LCD
+    let rear: Rear?
     let controls: [Control]
     let decor: [Decor]
 
@@ -218,6 +242,12 @@ struct PanelRenderState {
     var stripTouch: Int?
     var lcdImage: CGImage?
     var debugOverlay = false
+    var bootStage = "Starting the virtual machine"   // shown on the dark LCD until the first firmware frame
+    var bootSeconds = 0
+    var lcdBrightness: CGFloat = 1      // the firmware's LCD backlight level, 0...1 (1 = full, as before)
+    var bloom = false                   // additive glow around lit keys, buttons and LEDs (View > Lamp Glow; off by default)
+    var panelDark = false               // standby/fault: black LCD, every lamp off except WAKE UP
+    var fault = false                   // power fault: dark panel, WAKE UP blinking red
 
     func look(_ id: UInt8) -> LampLook {
         guard feedbackLive else { return .unknown }
@@ -235,7 +265,7 @@ final class PanelRenderer {
     // MARK: Static layer
 
     /// Renders backdrop + chassis + printed art + empty control shapes into a top-down bitmap.
-    func makeStaticLayer(viewSize: CGSize, scale: CGFloat, transform: PanelTransform, lcdOnly: Bool) -> CGImage? {
+    func makeStaticLayer(viewSize: CGSize, scale: CGFloat, transform: PanelTransform, lcdOnly: Bool, rear: Bool = false, skin: CGImage? = nil) -> CGImage? {
         guard let ctx = CGContext(data: nil, width: Int(ceil(viewSize.width * scale)), height: Int(ceil(viewSize.height * scale)),
                                   bitsPerComponent: 8, bytesPerRow: 0, space: sRGB,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
@@ -257,11 +287,136 @@ final class PanelRenderer {
         ctx.translateBy(x: transform.origin.x, y: transform.origin.y)
         ctx.scaleBy(x: transform.scale, y: transform.scale)
         let s = transform.scale
+        if rear {
+            if let r = layout.rear { drawRear(ctx, r) }
+            return ctx.makeImage()
+        }
         drawChassis(ctx, s)
         for d in layout.decor { drawDecor(ctx, d) }
         for c in layout.controls { drawControlStatic(ctx, c, s) }
         drawLCDBezel(ctx)
+        if let skin {
+            // The user's own overlay (logos, printing), stretched over the whole canvas; lamps still draw on top.
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: layout.canvas.height); ctx.scaleBy(x: 1, y: -1)
+            ctx.interpolationQuality = .high
+            ctx.draw(skin, in: CGRect(origin: .zero, size: layout.canvas.size))
+            ctx.restoreGState()
+        }
         return ctx.makeImage()
+    }
+
+    // MARK: Rear I/O panel
+
+    private func drawRear(_ ctx: CGContext, _ r: PanelLayout.Rear) {
+        let cv = r.canvas
+        let plate = CGRect(x: 0, y: cv.plateTop, width: cv.width, height: cv.plateBottom - cv.plateTop)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 6), blur: 14, color: hexColor(0, 0.6))
+        ctx.fill(path: roundedPath(plate, 6), color: hexColor(0x141517))
+        ctx.restoreGState()
+        ctx.saveGState(); ctx.addPath(roundedPath(plate, 6)); ctx.clip()
+        if let metal = brushedMetal(plate.size, base: 30, rowSigma: 2.5, streakSigma: 5, seed: 71) { ctx.draw(metal, in: plate) }
+        ctx.fillLinear([(0, hexColor(0xffffff, 0.07)), (0.2, hexColor(0, 0)), (1, hexColor(0, 0.25))],
+                       from: CGPoint(x: 0, y: plate.minY), to: CGPoint(x: 0, y: plate.maxY))
+        ctx.restoreGState()
+        ctx.stroke(path: roundedPath(plate.insetBy(dx: 0.5, dy: 0.5), 6), color: hexColor(0xffffff, 0.12), width: 1)
+
+        for g in r.groups {
+            // A white-outlined box under a white header tab, as printed on the unit.
+            let box = g.rect, tab = CGRect(x: box.minX, y: box.minY, width: box.width, height: 28)
+            ctx.stroke(path: roundedPath(box, 4), color: hexColor(0xf2f3f4), width: 1.8)
+            ctx.fill(path: roundedPath(tab, 4), color: hexColor(0xe6e7e9))
+            drawText(g.label, at: CGPoint(x: tab.midX, y: tab.midY), size: g.label.count > 9 ? 14 : 16, weight: .bold,
+                     color: hexColor(0x1a1b1d))
+        }
+        for i in r.items { drawRearItem(ctx, i) }
+    }
+
+    private func drawRearItem(_ ctx: CGContext, _ i: PanelLayout.Rear.Item) {
+        let c = i.center
+        switch i.kind {
+        case "text":
+            drawText(i.text ?? "", at: c, size: i.size ?? 14, weight: PanelRenderer.weight(i.weight ?? "semibold"), color: hexColor(0xf2f3f4))
+        case "rule":
+            ctx.line(c, CGPoint(x: c.x, y: i.y2 ?? c.y), hexColor(0xf2f3f4), 1.6)
+        case "jack":
+            // 6.3 mm TRS socket: gold ring, dark bore.
+            ctx.fillCircle(c, 17, hexColor(0x0b0b0c))
+            ctx.fillRadial([(0, hexColor(0xf3d46a)), (0.6, hexColor(0xb8892a)), (1, hexColor(0x6b4d14))], center: c, radius: 16)
+            ctx.fillCircle(c, 11, hexColor(0x070708))
+            ctx.fillCircle(c, 6, hexColor(0x1c1d20))
+            ctx.strokeCircle(c, 16, hexColor(0xffffff, 0.2), 1)
+        case "knob":
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 0, height: 3), blur: 6, color: hexColor(0, 0.8))
+            ctx.fillCircle(c, 21, hexColor(0x0d0d0f))
+            ctx.restoreGState()
+            spunMetal(ctx, c, radius: 18, low: 0.05, high: 0.22, rings: false)
+            ctx.line(CGPoint(x: c.x, y: c.y - 5), CGPoint(x: c.x, y: c.y - 16), hexColor(0xe4e5e8), 2.5, cap: .round)
+        case "din":
+            drawDIN(ctx, c)
+        case "rj45":
+            let body = CGRect(x: c.x - 24, y: c.y - 22, width: 48, height: 44)
+            ctx.fill(path: roundedPath(body, 3), color: hexColor(0xb9bbc0))
+            ctx.saveGState(); ctx.addPath(roundedPath(body, 3)); ctx.clip()
+            ctx.fillLinear([(0, hexColor(0xffffff, 0.35)), (1, hexColor(0, 0.25))], from: CGPoint(x: 0, y: body.minY), to: CGPoint(x: 0, y: body.maxY))
+            ctx.restoreGState()
+            let socket = body.insetBy(dx: 6, dy: 6)
+            ctx.fill(path: roundedPath(socket, 2), color: hexColor(0x0a0a0b))
+            for k in 0..<8 { ctx.line(CGPoint(x: socket.minX + 4 + CGFloat(k) * 4.2, y: socket.minY + 2), CGPoint(x: socket.minX + 4 + CGFloat(k) * 4.2, y: socket.minY + 9), hexColor(0xc9a243), 1.4) }
+        case "usbb":
+            let body = CGRect(x: c.x - 19, y: c.y - 20, width: 38, height: 40)
+            ctx.fill(path: roundedPath(body, 3), color: hexColor(0xb0b2b7))
+            let port = body.insetBy(dx: 5, dy: 5)
+            ctx.fill(path: roundedPath(port, 2), color: hexColor(0x0a0a0b))
+            ctx.fill(path: roundedPath(port.insetBy(dx: 4, dy: 5).offsetBy(dx: 0, dy: 2), 1.5), color: hexColor(0x3a3b3f))
+            ctx.fillCircle(CGPoint(x: c.x, y: body.minY - 9), 4, hexColor(0xe6e7e9, 0.8))
+        case "dc":
+            ctx.fillCircle(c, 17, hexColor(0x0b0b0c))
+            ctx.strokeCircle(c, 15, hexColor(0x4a4c50), 2)
+            ctx.fillCircle(c, 8, hexColor(0x060607))
+            ctx.fillCircle(c, 3, hexColor(0x8d8f93))
+        case "power":
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 4, color: hexColor(0, 0.8))
+            ctx.fillCircle(c, 19, hexColor(0x1b1c1f))
+            ctx.restoreGState()
+            ctx.strokeCircle(c, 19, hexColor(0x3c3e42), 1.5)
+            // Standby glyph printed above the button: an open ring with a stroke through the gap.
+            let g = CGPoint(x: c.x, y: c.y - 41)
+            ctx.setLineCap(.round); ctx.setStrokeColor(hexColor(0xe6e7e9)); ctx.setLineWidth(1.8)
+            ctx.addArc(center: g, radius: 7, startAngle: -.pi * 0.3, endAngle: .pi * 1.3, clockwise: false)
+            ctx.strokePath()
+            ctx.line(CGPoint(x: g.x, y: g.y - 9), CGPoint(x: g.x, y: g.y - 1), hexColor(0xe6e7e9), 1.8, cap: .round)
+        case "screw":
+            ctx.fillCircle(c, 8, hexColor(0x0c0c0e))
+            ctx.strokeCircle(c, 7, hexColor(0x3a3b3f), 1.4)
+            ctx.line(CGPoint(x: c.x - 4, y: c.y), CGPoint(x: c.x + 4, y: c.y), hexColor(0x55575b), 1.6)
+        case "lock":
+            ctx.fill(path: roundedPath(CGRect(x: c.x - 14, y: c.y - 8, width: 28, height: 16), 3), color: hexColor(0x0b0b0c))
+            ctx.stroke(path: roundedPath(CGRect(x: c.x - 14, y: c.y - 8, width: 28, height: 16), 3), color: hexColor(0x55575b), width: 1)
+            drawText("K", at: CGPoint(x: c.x, y: c.y - 24), size: 15, weight: .black, color: hexColor(0xf2f3f4))
+        case "clip":
+            ctx.fill(path: roundedPath(CGRect(x: c.x - 26, y: c.y - 36, width: 52, height: 72), 14), color: hexColor(0x0b0b0c))
+            ctx.stroke(path: roundedPath(CGRect(x: c.x - 25, y: c.y - 35, width: 50, height: 70), 14), color: hexColor(0x3a3b3f), width: 1.5)
+            ctx.fill(path: roundedPath(CGRect(x: c.x - 12, y: c.y - 14, width: 24, height: 28), 8), color: hexColor(0x1d1e21))
+        default:
+            break
+        }
+    }
+
+    /// 5-pin DIN socket with its two mounting screws drawn separately as `screw` items.
+    private func drawDIN(_ ctx: CGContext, _ c: CGPoint) {
+        ctx.fillCircle(c, 25, hexColor(0xb3b5ba))
+        ctx.fillRadial([(0, hexColor(0xffffff, 0.3)), (1, hexColor(0, 0.25))], center: c, radius: 25)
+        ctx.fillCircle(c, 20, hexColor(0x0a0a0b))
+        ctx.strokeCircle(c, 20, hexColor(0x4a4c50), 1.2)
+        ctx.fill(path: roundedPath(CGRect(x: c.x - 5, y: c.y - 21, width: 10, height: 5), 1), color: hexColor(0xb3b5ba))
+        for k in 0..<5 {
+            let a = CGFloat.pi + CGFloat(k) * .pi / 4
+            ctx.fillCircle(CGPoint(x: c.x + cos(a) * 11, y: c.y + 5 + sin(a) * 11), 2.2, hexColor(0xc9a243))
+        }
     }
 
     private func drawChassis(_ ctx: CGContext, _ s: CGFloat) {
@@ -275,9 +430,10 @@ final class PanelRenderer {
 
         ctx.saveGState()
         ctx.addPath(body); ctx.clip()
-        ctx.fillLinear([(0, hexColor(0x2b2c2f)), (0.012, hexColor(0x1f2022)), (0.5, hexColor(0x161719)), (1, hexColor(0x101112))],
+        let face = CGRect(x: 0, y: 0, width: cv.width, height: cv.plinthTop)
+        if let metal = brushedMetal(face.size, base: 29, rowSigma: 5.5, streakSigma: 5, seed: 7) { ctx.draw(metal, in: face) }
+        ctx.fillLinear([(0, hexColor(0xffffff, 0.10)), (0.012, hexColor(0xffffff, 0)), (0.8, hexColor(0, 0)), (1, hexColor(0, 0.18))],
                        from: .zero, to: CGPoint(x: 0, y: cv.plinthTop))
-        brush(ctx, CGRect(x: 0, y: 0, width: cv.width, height: cv.plinthTop), strength: 0.055, seed: 7)
 
         // Side rails
         let rw = cv.railWidth
@@ -297,15 +453,51 @@ final class PanelRenderer {
         // Plinth
         let plinth = CGRect(x: 0, y: cv.plinthTop, width: cv.width, height: cv.height - cv.plinthTop)
         ctx.saveGState(); ctx.clip(to: plinth)
-        ctx.fillLinear([(0, hexColor(0x2c2d30)), (0.15, hexColor(0x202123)), (1, hexColor(0x161719))],
+        if let metal = brushedMetal(plinth.size, base: 47, rowSigma: 3.5, streakSigma: 8, seed: 29) { ctx.draw(metal, in: plinth) }
+        ctx.fillLinear([(0, hexColor(0xffffff, 0.08)), (0.15, hexColor(0, 0)), (1, hexColor(0, 0.22))],
                        from: CGPoint(x: 0, y: plinth.minY), to: CGPoint(x: 0, y: plinth.maxY))
-        brush(ctx, plinth, strength: 0.09, seed: 29)
         ctx.restoreGState()
         ctx.line(CGPoint(x: rw, y: cv.plinthTop), CGPoint(x: cv.width - rw, y: cv.plinthTop), hexColor(0, 0.8), 2)
         ctx.line(CGPoint(x: rw, y: cv.plinthTop + 2), CGPoint(x: cv.width - rw, y: cv.plinthTop + 2), hexColor(0xffffff, 0.1), 1)
         ctx.restoreGState()
 
         ctx.stroke(path: roundedPath(rect.insetBy(dx: 0.5, dy: 0.5), cv.cornerRadius), color: hexColor(0xffffff, 0.14), width: 1)
+    }
+
+    /// Hairline-brushed aluminium, measured on the product's top-view render: a flat grey base, crisp per-row offsets
+    /// (row-to-row sigma about 5.5) and long horizontal streaks (along-row sigma about 5). Generated once per size at
+    /// 2x canvas resolution and cached; the panel only rebuilds it when the canvas changes.
+    private var metalCache: [String: CGImage] = [:]
+
+    private func brushedMetal(_ size: CGSize, base: Double, rowSigma: Double, streakSigma: Double, seed: UInt64) -> CGImage? {
+        let key = "\(Int(size.width))x\(Int(size.height))/\(base)/\(seed)"
+        if let cached = metalCache[key] { return cached }
+        let w = max(1, Int(size.width * 2)), h = max(1, Int(size.height * 2))
+        var rng = SeededRandom(state: seed)
+        func gauss() -> Double { Double(rng.next() + rng.next() + rng.next() + rng.next() - 2) * 1.732 }
+        var pixels = [UInt8](repeating: 255, count: w * h * 4)
+        var row = [Double](repeating: 0, count: w)
+        for y in 0..<h {
+            let offset = gauss() * rowSigma
+            for x in 0..<w { row[x] = offset + gauss() * 1.2 }
+            for _ in 0..<max(2, w / 110) {
+                let x0 = Int(rng.next() * CGFloat(w)), len = Int(40 + rng.next() * 1600), amp = gauss() * streakSigma
+                let end = min(w, x0 + len)
+                guard end > x0 else { continue }
+                for x in x0..<end { row[x] += amp * sin(Double(x - x0) / Double(len) * .pi) }
+            }
+            for x in 0..<w {
+                let v = max(0, min(253, base + row[x])), o = (y * w + x) * 4
+                pixels[o] = UInt8(v); pixels[o + 1] = UInt8(v); pixels[o + 2] = UInt8(v + 2)
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+              let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: sRGB,
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue), provider: provider,
+                                  decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        metalCache[key] = image
+        return image
     }
 
     private func brush(_ ctx: CGContext, _ r: CGRect, strength: CGFloat, seed: UInt64) {
@@ -352,6 +544,9 @@ final class PanelRenderer {
         default: return .semibold
         }
     }
+
+    /// Button styles lit through a rim light pipe rather than a translucent cap.
+    static let rimLitStyles: Set<String> = ["white", "mode", "rec", "stop", "play"]
 
     static func color(_ name: String?) -> CGColor {
         switch name {
@@ -427,6 +622,35 @@ final class PanelRenderer {
                     ctx.fillCircle(CGPoint(x: c.x + dir.x * r, y: c.y + dir.y * r), (d.size ?? 3) / 2, ink)
                 }
             }
+        case "arc":
+            // Printed tapered scale around a CUTOFF knob: width runs from width0 at `from` to width1 at `to` (degrees,
+            // clockwise from 12 o'clock); `gaps` are [start, end] angle pairs left unprinted.
+            let c = CGPoint(x: d.cx ?? 0, y: d.cy ?? 0), r = d.r ?? 0
+            let a0 = d.from ?? -140, a1 = d.to ?? 140, w0 = d.width0 ?? 2, w1 = d.width1 ?? 2
+            let steps = 120
+            let gaps = (d.gaps ?? []).filter { $0.count == 2 }
+            var run: [(CGFloat, CGFloat)] = []    // (angle, width) of the current unbroken stretch
+            func flush() {
+                guard run.count > 1 else { run.removeAll(); return }
+                let path = CGMutablePath()
+                for (i, (a, w)) in run.enumerated() {
+                    let rad = a * .pi / 180, p = CGPoint(x: c.x + sin(rad) * (r + w / 2), y: c.y - cos(rad) * (r + w / 2))
+                    i == 0 ? path.move(to: p) : path.addLine(to: p)
+                }
+                for (a, w) in run.reversed() {
+                    let rad = a * .pi / 180
+                    path.addLine(to: CGPoint(x: c.x + sin(rad) * (r - w / 2), y: c.y - cos(rad) * (r - w / 2)))
+                }
+                path.closeSubpath()
+                ctx.fill(path: path, color: ink)
+                run.removeAll()
+            }
+            for i in 0...steps {
+                let t = CGFloat(i) / CGFloat(steps), a = a0 + (a1 - a0) * t
+                if gaps.contains(where: { a >= $0[0] && a <= $0[1] }) { flush(); continue }
+                run.append((a, w0 + (w1 - w0) * t))
+            }
+            flush()
         case "insert":
             let r = d.rect
             ctx.fill(path: roundedPath(r.insetBy(dx: -2, dy: -2), (d.radius ?? 0) + 2), color: hexColor(0xffffff, 0.06))
@@ -550,18 +774,24 @@ final class PanelRenderer {
             ctx.fill(path: roundedPath(groove, 3.5), color: hexColor(0x0a0a0b))
             ctx.stroke(path: roundedPath(groove, 3.5), color: hexColor(0xffffff, 0.14), width: 1)
         case "gray":
+            // SHIFT has no LED: a dark rubber key carrying a light printed label plate.
             ctx.fill(path: roundedPath(f.insetBy(dx: -3, dy: -3), c.cornerRadius + 3), color: hexColor(0x050506))
             ctx.saveGState()
             ctx.addPath(roundedPath(f, c.cornerRadius)); ctx.clip()
-            ctx.fillLinear([(0, hexColor(0x3a3c40)), (1, hexColor(0x1f2023))], from: CGPoint(x: 0, y: f.minY), to: CGPoint(x: 0, y: f.maxY))
+            ctx.fillLinear([(0, hexColor(0x2a2b2e)), (1, hexColor(0x141517))], from: CGPoint(x: 0, y: f.minY), to: CGPoint(x: 0, y: f.maxY))
             ctx.restoreGState()
-            ctx.stroke(path: roundedPath(f.insetBy(dx: 0.7, dy: 0.7), c.cornerRadius), color: hexColor(0x7e8084), width: 1.4)
+            let plate = f.insetBy(dx: 7, dy: 8)
+            ctx.saveGState()
+            ctx.addPath(roundedPath(plate, 2)); ctx.clip()
+            ctx.fillLinear([(0, hexColor(0xe4e5e8)), (1, hexColor(0xc4c5c9))], from: CGPoint(x: 0, y: plate.minY), to: CGPoint(x: 0, y: plate.maxY))
+            ctx.restoreGState()
         default:
+            // Unlit light-pipe rim; drawButtonLamp lights it in the lamp colour.
             let outline: CGColor
             switch style {
-            case "rec": outline = hexColor(0xff3030)
-            case "play": outline = hexColor(0x35ee48)
-            default: outline = hexColor(0xf4f5f6)
+            case "rec": outline = hexColor(0x4a1a24)
+            case "play": outline = hexColor(0x1d4322)
+            default: outline = hexColor(0x55575b)
             }
             ctx.fill(path: roundedPath(f.insetBy(dx: -3.5, dy: -3.5), c.cornerRadius + 3.5), color: hexColor(0x050506))
             if style == "mode" {
@@ -573,7 +803,7 @@ final class PanelRenderer {
                 ctx.stroke(path: roundedPath(f.insetBy(dx: -2, dy: -2), c.cornerRadius + 2), color: hexColor(0x8e9094), width: 1.3)
             }
             ctx.fill(path: roundedPath(f, c.cornerRadius), color: hexColor(0x070708))
-            ctx.stroke(path: roundedPath(f.insetBy(dx: 1.5, dy: 1.5), max(0, c.cornerRadius - 1)), color: outline, width: 3)
+            ctx.stroke(path: roundedPath(f.insetBy(dx: 2, dy: 2), max(0, c.cornerRadius - 1)), color: outline, width: 4)
         }
         drawButtonGlyph(ctx, c)
     }
@@ -600,7 +830,7 @@ final class PanelRenderer {
         if let label = c.label, !label.isEmpty {
             let gray = style == "gray"
             drawText(label, at: ctr, size: gray ? 14.5 : 15.5, weight: gray ? .medium : .bold,
-                     color: labelColor ?? (gray ? hexColor(0xd2d3d6) : PanelRenderer.color(nil)))
+                     color: labelColor ?? (gray ? hexColor(0x1b1c1f) : PanelRenderer.color(nil)))
         }
     }
 
@@ -632,39 +862,81 @@ final class PanelRenderer {
         ctx.strokeCircle(ctr, r * 0.66, hexColor(0x8a8c90, 0.55), 1.2)
     }
 
-    private func drawAnalogBody(_ ctx: CGContext, _ c: PanelLayout.Control) {
-        let ctr = c.center, r = c.r ?? 30
-        ctx.fillCircle(ctr, r + 3, hexColor(0x050506))
-        ctx.fillRadial([(0, hexColor(0x26272a)), (1, hexColor(0x070708))], center: ctr, radius: r)
-        for i in 0..<30 {
-            let a = CGFloat(i) / 30 * 2 * .pi
-            ctx.line(CGPoint(x: ctr.x + sin(a) * r * 0.82, y: ctr.y - cos(a) * r * 0.82),
-                     CGPoint(x: ctr.x + sin(a) * r * 0.97, y: ctr.y - cos(a) * r * 0.97), hexColor(0x5c5e63, 0.8), 1.8)
+    /// Knob silhouette with `lobes` rounded flutes; `depth` is how far the cusps between flutes sit inside `r`.
+    private func flutedPath(_ ctr: CGPoint, r: CGFloat, lobes: Int, depth: CGFloat) -> CGPath {
+        let path = CGMutablePath(), n = lobes * 16
+        for i in 0...n {
+            let a = CGFloat(i) / CGFloat(n) * 2 * .pi
+            let rr = r - depth * (1 - abs(sin(CGFloat(lobes) * a / 2)))
+            let p = CGPoint(x: ctr.x + sin(a) * rr, y: ctr.y - cos(a) * rr)
+            i == 0 ? path.move(to: p) : path.addLine(to: p)
         }
-        let cap = r * 0.8
-        if c.style == "matte" {
-            ctx.fillRadial([(0, hexColor(0x34363a)), (1, hexColor(0x0d0d0f))], center: ctr, radius: cap,
-                           focus: CGPoint(x: ctr.x - cap * 0.25, y: ctr.y - cap * 0.3))
-        } else {
-            ctx.saveGState()
-            ctx.addEllipse(in: CGRect(x: ctr.x - cap, y: ctr.y - cap, width: 2 * cap, height: 2 * cap)); ctx.clip()
-            let tones: [(UInt32, UInt32)] = [(0xe2e3e6, 0xa9abaf), (0x9a9ca1, 0x6a6c70), (0x55575b, 0x2e2f32), (0xb4b6ba, 0x7b7d81)]  // TL, TR, BR, BL
-            for (i, tone) in tones.enumerated() {
-                let q = CGRect(x: i == 0 || i == 3 ? ctr.x - cap : ctr.x, y: i < 2 ? ctr.y - cap : ctr.y, width: cap, height: cap)
-                ctx.saveGState(); ctx.clip(to: q)
-                ctx.fillLinear([(0, hexColor(tone.0)), (1, hexColor(tone.1))], from: CGPoint(x: q.minX, y: q.minY), to: CGPoint(x: q.maxX, y: q.maxY))
-                ctx.restoreGState()
-            }
-            ctx.restoreGState()
-            ctx.strokeCircle(ctr, cap, hexColor(0x1a1b1d), 1.4)
-        }
+        path.closeSubpath()
+        return path
     }
 
+    /// Analog pots as on the product render: a fluted skirt (gunmetal for the filter, black for MAIN OUT) under a
+    /// smooth spun-metal cap whose sheen is light top-right and bottom-left. The white pointer is dynamic.
+    private func drawAnalogBody(_ ctx: CGContext, _ c: PanelLayout.Control) {
+        let ctr = c.center, r = c.r ?? 30, matte = c.style == "matte"
+        let skirt = flutedPath(ctr, r: r, lobes: 14, depth: r * 0.08)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 3), blur: 7, color: hexColor(0, 0.75))
+        ctx.fill(path: skirt, color: hexColor(matte ? 0x0f1012 : 0x1c1b21))
+        ctx.restoreGState()
+        ctx.saveGState(); ctx.addPath(skirt); ctx.clip()
+        let rim: [(CGFloat, CGColor)] = matte
+            ? [(0, hexColor(0x55565b)), (0.42, hexColor(0x1a1b1e)), (0.7, hexColor(0x0c0c0e)), (1, hexColor(0x3a3b40))]
+            : [(0, hexColor(0xb9b6c4)), (0.4, hexColor(0x3b3a43)), (0.68, hexColor(0x1b1a20)), (1, hexColor(0x8a7f99))]
+        ctx.fillLinear(rim, from: CGPoint(x: ctr.x - r * 0.7, y: ctr.y - r), to: CGPoint(x: ctr.x + r * 0.7, y: ctr.y + r))
+        ctx.restoreGState()
+        ctx.stroke(path: skirt, color: hexColor(0, 0.65), width: 1)
+
+        spunMetal(ctx, ctr, radius: r * 0.72, low: matte ? 0.09 : 0.20, high: matte ? 0.19 : 0.56)
+    }
+
+    /// Spun-metal disc: a two-lobed sheen (light top-right and bottom-left, as lit on the product render) between grey
+    /// levels `low` and `high`, with optional fine concentric spin rings and a dark rim.
+    private func spunMetal(_ ctx: CGContext, _ ctr: CGPoint, radius cap: CGFloat, low: CGFloat, high: CGFloat, rings: Bool = false) {
+        ctx.saveGState()
+        ctx.addEllipse(in: CGRect(x: ctr.x - cap, y: ctr.y - cap, width: 2 * cap, height: 2 * cap)); ctx.clip()
+        let wedges = 96
+        for i in 0..<wedges {
+            let a0 = CGFloat(i) / CGFloat(wedges) * 2 * .pi, a1 = CGFloat(i + 1) / CGFloat(wedges) * 2 * .pi + 0.01
+            let sheen = 0.5 + 0.5 * cos(2 * ((a0 + a1) / 2 - .pi / 4))      // peaks top-right and bottom-left
+            let v = low + (high - low) * sheen
+            let wedge = CGMutablePath()
+            wedge.move(to: ctr)
+            wedge.addLine(to: CGPoint(x: ctr.x + sin(a0) * cap * 1.1, y: ctr.y - cos(a0) * cap * 1.1))
+            wedge.addLine(to: CGPoint(x: ctr.x + sin(a1) * cap * 1.1, y: ctr.y - cos(a1) * cap * 1.1))
+            wedge.closeSubpath()
+            ctx.fill(path: wedge, color: CGColor(colorSpace: sRGB, components: [v, v * 0.98, v * 1.04, 1])!)
+        }
+        if rings {
+            var k = cap * 0.08
+            while k < cap { ctx.strokeCircle(ctr, k, hexColor(0xffffff, 0.035), 0.6); k += 2.2 }
+        }
+        ctx.fillRadial([(0, hexColor(0xffffff, 0.05)), (0.8, hexColor(0, 0)), (1, hexColor(0, 0.45))], center: ctr, radius: cap)
+        ctx.restoreGState()
+        ctx.strokeCircle(ctr, cap, hexColor(0, 0.6), 1.2)
+    }
+
+    /// The selector's fixed parts, as on the product render: the printed white ring, a black well and a soft rubber
+    /// collar around the knob (no tick marks).
     private func drawSelectorWell(_ ctx: CGContext, _ c: PanelLayout.Control) {
         let ctr = c.center, r = c.r ?? 60
         ctx.fillCircle(ctr, r + 2, hexColor(0x040405))
         ctx.strokeCircle(ctr, r, hexColor(0xf0f1f2), 2.4)
-        ctx.fillRadial([(0, hexColor(0x15161a)), (1, hexColor(0x050506))], center: ctr, radius: r - 2)
+        ctx.fillCircle(ctr, r - 2, hexColor(0x060607))
+        let collar = r * 0.9
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 6, color: hexColor(0, 0.8))
+        ctx.fillCircle(ctr, collar, hexColor(0x141518))
+        ctx.restoreGState()
+        ctx.fillRadial([(0.6, hexColor(0x0c0d0f)), (0.82, hexColor(0x202125)), (0.94, hexColor(0x16171a)), (1, hexColor(0x0a0a0c))],
+                       center: ctr, radius: collar, focus: CGPoint(x: ctr.x - collar * 0.12, y: ctr.y - collar * 0.16))
+        ctx.strokeCircle(ctr, collar - 0.5, hexColor(0xffffff, 0.07), 1)
+        ctx.strokeCircle(ctr, collar * 0.74, hexColor(0, 0.7), 1.5)
     }
 
     private func drawStripFrame(_ ctx: CGContext, _ f: CGRect) {
@@ -712,12 +984,69 @@ final class PanelRenderer {
 
     // MARK: Dynamic layer
 
+    /// The WAKE UP (USB STOP / STBY) key: the only lamp lit while the panel is dark (standby or fault), red as the
+    /// service manual's LED matrix has it (MONO_COLORS usb_stop).
+    static let wakeUpName = "usb_stop"
+    static let wakeUpColor = LampColor(r: 1, g: 60.0 / 255, b: 60.0 / 255)
+
+    /// Effective lamp look: in the dark state every lamp is off except WAKE UP, regardless of firmware feedback.
+    private func look(_ c: PanelLayout.Control, _ st: PanelRenderState) -> LampLook {
+        if st.panelDark || st.fault {
+            guard c.name == PanelRenderer.wakeUpName else { return .off }
+            if st.fault {
+                // QRT1001 p24: a fault blinks the WAKE UP LED red (about 1 Hz) and everything else is dark.
+                return Int(ProcessInfo.processInfo.systemUptime * 2) % 2 == 0 ? .lit(PanelRenderer.wakeUpColor) : .off
+            }
+            return .lit(PanelRenderer.wakeUpColor)
+        }
+        return st.look(c.id)
+    }
+
     func drawDynamic(_ ctx: CGContext, state: PanelRenderState, scale s: CGFloat, dirty: CGRect) {
         drawLCD(ctx, state: state, dirty: dirty)
-        for c in layout.controls where c.frame.insetBy(dx: -30, dy: -30).intersects(dirty) {
+        for c in layout.controls where c.frame.insetBy(dx: -PanelRenderer.dirtyReach, dy: -PanelRenderer.dirtyReach).intersects(dirty) {
             drawControlDynamic(ctx, c, state, s)
         }
+        if state.bloom && state.feedbackLive && !state.panelDark && !state.fault { drawBloom(ctx, state: state, dirty: dirty) }
         if state.debugOverlay { drawDebug(ctx) }
+    }
+
+    /// Canvas units around a control that its drawing (shadow glow, bloom) may reach; the dirty-rect margin.
+    static let dirtyReach: CGFloat = 40
+    static let bloomReach: CGFloat = 34
+
+    /// Soft additive halo over the frame around every lit key, button and LED, drawn after all controls so it also
+    /// lights its neighbours and the chassis. Static lamps cost one gradient each and only inside the dirty rect;
+    /// nothing animates, so an idle panel repaints nothing. The LCD glass is excluded from the halo.
+    private func drawBloom(_ ctx: CGContext, state: PanelRenderState, dirty: CGRect) {
+        let reach = PanelRenderer.bloomReach
+        var lit: [(PanelLayout.Control, LampColor)] = []
+        for c in layout.controls where c.kind != .knob && c.kind != .analog && c.kind != .selector && c.kind != .strip {
+            guard !(c.kind == .lamp && c.shape == "text"), case .lit(let col) = look(c, state),
+                  c.frame.insetBy(dx: -reach, dy: -reach).intersects(dirty) else { continue }
+            lit.append((c, col))
+        }
+        guard !lit.isEmpty else { return }
+        ctx.saveGState()
+        ctx.clip(to: dirty)
+        // Keep the halo off the LCD glass (even-odd: everything but the bezel).
+        ctx.addRect(dirty.insetBy(dx: -reach, dy: -reach)); ctx.addRect(layout.lcd.bezel.rect); ctx.clip(using: .evenOdd)
+        ctx.setBlendMode(.plusLighter)
+        for (c, col) in lit {
+            let f = c.frame
+            let big = max(f.width, f.height)
+            let strength: CGFloat = c.kind == .lamp ? 0.5 : (big > 60 ? 0.34 : 0.42)
+            let halfH = f.height / 2, outer = halfH + reach
+            let edge = halfH / outer
+            ctx.saveGState()
+            ctx.translateBy(x: f.midX, y: f.midY)
+            ctx.scaleBy(x: (f.width / 2 + reach) / outer, y: 1)
+            ctx.fillRadial([(0, col.lighter(0.25).cg(strength * 0.5)), (edge * 0.9, col.cg(strength * 0.55)),
+                            (edge + (1 - edge) * 0.35, col.cg(strength * 0.22)), (1, col.cg(0))],
+                           center: .zero, radius: outer)
+            ctx.restoreGState()
+        }
+        ctx.restoreGState()
     }
 
     func drawLCD(_ ctx: CGContext, state: PanelRenderState, dirty: CGRect, rect: CGRect? = nil) {
@@ -727,6 +1056,11 @@ final class PanelRenderer {
         ctx.clip(to: r)
         ctx.setFillColor(hexColor(0))
         ctx.fill(r)
+        if state.panelDark || state.fault {
+            // Standby/fault: the glass is dark; no firmware image and no boot overlay.
+            ctx.restoreGState()
+            return
+        }
         if let image = state.lcdImage {
             ctx.interpolationQuality = .none
             ctx.translateBy(x: 0, y: r.minY + r.maxY)
@@ -734,20 +1068,40 @@ final class PanelRenderer {
             ctx.draw(image, in: r)
         } else {
             ctx.restoreGState(); ctx.saveGState()
-            drawText("Waiting for OEM LCD frame", at: CGPoint(x: r.midX, y: r.midY), size: max(10, r.width / 40), weight: .regular,
-                     color: hexColor(0x6b6d72))
+            drawBootOverlay(ctx, in: r, stage: state.bootStage, seconds: state.bootSeconds)
         }
         ctx.restoreGState()
+        if state.lcdImage != nil, state.lcdBrightness < 1 {
+            // A dimmed backlight: a black veil over the glass, never fully dark so the screen stays readable.
+            ctx.setFillColor(hexColor(0, 1 - max(0.2, state.lcdBrightness)))
+            ctx.fill(r)
+        }
+    }
+
+    /// Shown on the dark LCD until the firmware's first frame arrives: what the emulator is doing and for how long, with an
+    /// indeterminate bar, instead of a bare "waiting" line.
+    private func drawBootOverlay(_ ctx: CGContext, in r: CGRect, stage: String, seconds: Int) {
+        let size = max(11, r.width / 34)
+        drawText("SP-16 EMULATOR", at: CGPoint(x: r.midX, y: r.midY - size * 2.6), size: size * 0.8, weight: .semibold, color: hexColor(0x6b6d72),
+                 tracking: 2)
+        drawText(stage + "…", at: CGPoint(x: r.midX, y: r.midY - size * 0.6), size: size, weight: .regular, color: hexColor(0xd7d9dd))
+        let bar = CGRect(x: r.midX - r.width * 0.22, y: r.midY + size * 0.9, width: r.width * 0.44, height: 4)
+        ctx.fill(path: roundedPath(bar, 2), color: hexColor(0x2a2c30))
+        let t = CGFloat(seconds % 3) / 3
+        let seg = CGRect(x: bar.minX + (bar.width * 0.7) * t, y: bar.minY, width: bar.width * 0.3, height: bar.height)
+        ctx.fill(path: roundedPath(seg, 2), color: hexColor(0x4aa3ff))
+        drawText("\(seconds) s", at: CGPoint(x: r.midX, y: r.midY + size * 2.2), size: size * 0.75, weight: .regular, color: hexColor(0x6b6d72))
     }
 
     private func drawControlDynamic(_ ctx: CGContext, _ c: PanelLayout.Control, _ st: PanelRenderState, _ s: CGFloat) {
         let f = c.frame
         let held = st.held.contains(c.id)
+        let look = self.look(c, st)
         switch c.kind {
         case .pad, .step, .bar:
-            drawGlassKey(ctx, f, c.cornerRadius, st.look(c.id), held, s)
+            drawGlassKey(ctx, f, c.cornerRadius, look, held, s)
         case .button:
-            drawButtonLamp(ctx, c, st.look(c.id), held, s)
+            drawButtonLamp(ctx, c, look, held, s)
         case .knob:
             drawIndicator(ctx, c, angle: st.knobAngle[c.id] ?? 0, long: false)
         case .analog:
@@ -757,7 +1111,7 @@ final class PanelRenderer {
         case .strip:
             if let pos = st.stripTouch { drawStripThumb(ctx, f, pos) }
         case .lamp:
-            if c.shape == "text" { drawLampText(ctx, c, st.look(c.id)) } else { drawLED(ctx, c, st.look(c.id), s) }
+            if c.shape == "text" { drawLampText(ctx, c, look) } else { drawLED(ctx, c, look, s) }
         }
     }
 
@@ -803,7 +1157,16 @@ final class PanelRenderer {
     private func drawButtonLamp(_ ctx: CGContext, _ c: PanelLayout.Control, _ look: LampLook, _ held: Bool, _ s: CGFloat) {
         let f = c.frame
         let path: CGPath = c.isCircle ? CGPath(ellipseIn: f, transform: nil) : roundedPath(f, c.cornerRadius)
-        if case .lit(let col) = look {
+        if case .lit(let col) = look, !c.isCircle, PanelRenderer.rimLitStyles.contains(c.style ?? "white") {
+            // As on the unit: the light pipe around the key glows; the face stays black with its printed label.
+            let rim = roundedPath(f.insetBy(dx: 2, dy: 2), max(0, c.cornerRadius - 1))
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 12 * s, color: col.cg(0.85))
+            ctx.stroke(path: rim, color: col.cg(), width: 4)
+            ctx.restoreGState()
+            ctx.stroke(path: rim, color: col.lighter(0.55).cg(), width: 1.6)
+            drawButtonGlyph(ctx, c)
+        } else if case .lit(let col) = look {
             ctx.saveGState()
             ctx.setShadow(offset: .zero, blur: 14 * s, color: col.cg(0.9))
             ctx.fill(path: path, color: col.cg(0.85))
@@ -855,8 +1218,9 @@ final class PanelRenderer {
         ctx.translateBy(x: c.cx, y: c.cy)
         ctx.rotate(by: angle * .pi / 180)
         if long {
-            ctx.line(CGPoint(x: 0, y: -r * 0.08), CGPoint(x: 0, y: -r * 0.9), hexColor(0x050506, 0.6), 6, cap: .round)
-            ctx.line(CGPoint(x: 0, y: -r * 0.08), CGPoint(x: 0, y: -r * 0.9), hexColor(0xf4f5f6), 4, cap: .round)
+            // A white bar from inside the cap out over the skirt's edge, as on the product.
+            ctx.line(CGPoint(x: 0, y: -r * 0.12), CGPoint(x: 0, y: -r * 0.96), hexColor(0x050506, 0.6), r * 0.17 + 2, cap: .round)
+            ctx.line(CGPoint(x: 0, y: -r * 0.12), CGPoint(x: 0, y: -r * 0.96), hexColor(0xf4f5f6), r * 0.17, cap: .round)
         } else {
             ctx.line(CGPoint(x: 0, y: -r * 0.32), CGPoint(x: 0, y: -r * 0.6), hexColor(0xe4e5e8), 3, cap: .round)
         }
@@ -864,23 +1228,28 @@ final class PanelRenderer {
     }
 
     private func drawSelector(_ ctx: CGContext, _ c: PanelLayout.Control, angle: CGFloat, held: Bool) {
-        let ctr = c.center, r = c.r ?? 60, cap = c.capR ?? 40
-        // Rotating ring: knurl notches.
+        let ctr = c.center, ring = c.capR ?? 40, cap = ring * 0.78
+        // Chrome band with dimples notched into its outer edge: the dimples turn with the selector; the light stays fixed.
+        let band = CGRect(x: ctr.x - ring, y: ctr.y - ring, width: 2 * ring, height: 2 * ring)
         ctx.saveGState()
-        ctx.translateBy(x: ctr.x, y: ctr.y)
-        ctx.rotate(by: angle * .pi / 180)
-        for i in 0..<30 {
-            let a = CGFloat(i) / 30 * 2 * .pi
-            let p0 = CGPoint(x: sin(a) * (cap + 4), y: -cos(a) * (cap + 4)), p1 = CGPoint(x: sin(a) * (r - 4), y: -cos(a) * (r - 4))
-            ctx.line(p0, p1, i % 5 == 0 ? hexColor(0x8d8f94, 0.85) : hexColor(0x3a3b3f, 0.9), i % 5 == 0 ? 2.4 : 1.8, cap: .round)
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 5, color: hexColor(0, 0.85))
+        ctx.fillCircle(ctr, ring, hexColor(0x6d6f74))
+        ctx.restoreGState()
+        ctx.saveGState(); ctx.addEllipse(in: band); ctx.clip()
+        ctx.fillLinear([(0, hexColor(0xf4f5f8)), (0.3, hexColor(0xa4a6ac)), (0.52, hexColor(0x45464b)), (0.74, hexColor(0xcfd1d6)),
+                        (1, hexColor(0x707277))],
+                       from: CGPoint(x: ctr.x - ring, y: ctr.y - ring), to: CGPoint(x: ctr.x + ring, y: ctr.y + ring))
+        let dimples = 12, spin = angle * .pi / 180
+        for i in 0..<dimples {
+            let a = spin + CGFloat(i) / CGFloat(dimples) * 2 * .pi
+            let p = CGPoint(x: ctr.x + sin(a) * ring * 1.0, y: ctr.y - cos(a) * ring * 1.0)
+            ctx.fillRadial([(0, hexColor(0x050506)), (0.7, hexColor(0x111214)), (1, hexColor(0x2a2b2f, 0))], center: p, radius: ring * 0.17)
         }
         ctx.restoreGState()
-        // Cap
-        ctx.fillCircle(ctr, cap + 2.5, hexColor(0x040405))
-        ctx.fillRadial([(0, hexColor(0x3b3d41)), (0.6, hexColor(0x18191b)), (1, hexColor(0x0b0b0c))], center: ctr, radius: cap,
-                       focus: CGPoint(x: ctr.x - cap * 0.25, y: ctr.y - cap * 0.3))
-        ctx.strokeCircle(ctr, cap - 0.8, hexColor(0xc8cacd, 0.8), 1.8)
-        for k in 1...4 { ctx.strokeCircle(ctr, cap * CGFloat(k) / 5, hexColor(0xffffff, 0.05), 1) }
+        ctx.strokeCircle(ctr, ring - 0.5, hexColor(0, 0.5), 1)
+        // Spun-metal top cap.
+        ctx.fillCircle(ctr, cap + 1.5, hexColor(0x0a0a0c))
+        spunMetal(ctx, ctr, radius: cap, low: 0.05, high: 0.30, rings: true)
         if held {
             ctx.saveGState()
             ctx.addEllipse(in: CGRect(x: ctr.x - cap, y: ctr.y - cap, width: 2 * cap, height: 2 * cap)); ctx.clip()
@@ -1081,6 +1450,41 @@ final class PanelView: NSView, NSViewToolTipOwner {
             NSAccessibility.post(element: self, notification: .layoutChanged)
         }
     }
+    /// View > Rear I/O Panel: the back of the unit (jacks, no controls) replaces the front; input is ignored meanwhile.
+    var showRear = false {
+        didSet {
+            guard showRear != oldValue, panelLayout?.rear != nil else { showRear = oldValue; return }
+            releaseAll()
+            axElements = nil
+            needsDisplay = true
+            NSAccessibility.post(element: self, notification: .layoutChanged)
+        }
+    }
+    /// Optional private artwork: a transparent PNG with the panel's canvas proportions (1773 x 1011 or any multiple),
+    /// loaded by the app from the git-ignored private/ folder. The repository ships none; the overlay is off until
+    /// the user turns it on (View > Private Skin Overlay).
+    private var skinImage: CGImage?
+    var hasSkin: Bool { skinImage != nil }
+    var showSkin = false { didSet { if showSkin != oldValue { staticCache.removeAll(); needsDisplay = true } } }
+    private var skinActive: Bool { showSkin && skinImage != nil && !showRear }
+
+    /// Loads the overlay image; nil clears it. Returns false when the file is not a readable image.
+    @discardableResult
+    func loadSkin(from url: URL?) -> Bool {
+        defer { staticCache.removeAll(); needsDisplay = true }
+        guard let url else { skinImage = nil; return true }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            skinImage = nil
+            return false
+        }
+        skinImage = image
+        return true
+    }
+    /// Lit keys, buttons and LEDs throw an additive halo (View > Lamp Glow).
+    var lampBloom: Bool {
+        get { state.bloom }
+        set { state.bloom = newValue; needsDisplay = true }
+    }
     /// Draws hit regions and control ids for calibration.
     var debugOverlay = false { didSet { state.debugOverlay = debugOverlay; needsDisplay = true } }
     /// False in bench mode (`--no-ui-input`): the window drops every click, drag, scroll, key and accessibility action,
@@ -1103,12 +1507,14 @@ final class PanelView: NSView, NSViewToolTipOwner {
     private var loadError: String?
     private let toolbar = PanelToolbar(frame: .zero)
     private var state = PanelRenderState()
-    private var staticCache: (image: CGImage, key: StaticKey)?
+    /// The last two static layers: the window's scale and the offscreen scale of panelshot/cacheDisplay alternate, and
+    /// one slot would rebuild the whole chassis on every switch.
+    private var staticCache: [(image: CGImage, key: StaticKey)] = []
     private var axElements: [PanelAccessibilityElement]?
     private var input = InputState()
     private var observers: [NSObjectProtocol] = []
 
-    private struct StaticKey: Equatable { var size: CGSize, scale: CGFloat, lcdOnly: Bool }
+    private struct StaticKey: Equatable { var size: CGSize, scale: CGFloat, lcdOnly: Bool, rear: Bool, skin: Bool }
 
     // MARK: Setup
 
@@ -1127,7 +1533,11 @@ final class PanelView: NSView, NSViewToolTipOwner {
         } catch {
             loadError = "\(error)"
         }
+        // A fault set while the layout was not loaded yet would have left the blink clock nil: start it now that the
+        // layout (and the WAKE UP control it names) is available. A no-op when no fault is on or the load failed.
+        startFaultClock()
         addSubview(toolbar)
+        startBootClock()
         toolbar.latch.target = self; toolbar.latch.action = #selector(toolbarLatchChanged(_:))
         toolbar.velocity.target = self; toolbar.velocity.action = #selector(toolbarVelocityChanged(_:))
         toolbar.releaseAll.target = self; toolbar.releaseAll.action = #selector(toolbarReleaseAll(_:))
@@ -1193,6 +1603,12 @@ final class PanelView: NSView, NSViewToolTipOwner {
     var panelTransform: PanelTransform? {
         guard let layout = panelLayout else { return nil }
         let footer = PanelToolbar.height
+        if showRear, let rear = layout.rear {
+            let m = Self.margin
+            let avail = CGRect(x: m, y: m, width: bounds.width - 2 * m, height: bounds.height - footer - 2 * m)
+            guard avail.width > 1, avail.height > 1 else { return nil }
+            return .fit(canvas: rear.canvas.size, in: avail)
+        }
         if lcdOnly {
             let m = Self.lcdOnlyMargin
             let avail = CGRect(x: m, y: m, width: bounds.width - 2 * m, height: bounds.height - footer - 2 * m)
@@ -1210,19 +1626,19 @@ final class PanelView: NSView, NSViewToolTipOwner {
 
     /// Frame of a control in view coordinates (.zero when unknown or hidden by LCD-only mode).
     func controlFrame(_ id: UInt8) -> NSRect {
-        guard !lcdOnly, let t = panelTransform, let c = controlIndex[id] else { return .zero }
+        guard !lcdOnly, !showRear, let t = panelTransform, let c = controlIndex[id] else { return .zero }
         return t.toView(c.frame)
     }
 
     /// The OEM LCD active area in view coordinates.
     var lcdFrame: NSRect {
-        guard let layout = panelLayout, let t = panelTransform else { return .zero }
+        guard let layout = panelLayout, !showRear, let t = panelTransform else { return .zero }
         return t.toView(layout.lcd.active.rect)
     }
 
     /// Control id under a view-space point; nil for background, LCD and lamp-only controls.
     func hitTest(point: NSPoint) -> UInt8? {
-        guard !lcdOnly, let t = panelTransform, let layout = panelLayout else { return nil }
+        guard !lcdOnly, !showRear, let t = panelTransform, let layout = panelLayout else { return nil }
         let p = t.toCanvas(point)
         return layout.controls.first { $0.isInput && $0.contains(p) }?.id
     }
@@ -1257,9 +1673,81 @@ final class PanelView: NSView, NSViewToolTipOwner {
         if liveChanged { needsDisplay = true } else { invalidate(changed) }
     }
 
+    /// The firmware's LCD backlight level, 0...1; the research op can override it.
+    var lcdBacklight: CGFloat {
+        get { state.lcdBrightness }
+        set {
+            let level = min(1, max(0, newValue))
+            if level != state.lcdBrightness {
+                state.lcdBrightness = level
+                setNeedsDisplay(lcdFrame)
+            }
+        }
+    }
+
+    /// What the guest is doing before the first LCD frame (host-side knowledge only: VM started, bridge connected, ...).
+    func setBootStage(_ stage: String) {
+        guard state.lcdImage == nil, stage != state.bootStage else { return }
+        state.bootStage = stage
+        setNeedsDisplay(lcdFrame)
+    }
+
+    private var bootClock: Timer?
+    private let bootBegan = ProcessInfo.processInfo.systemUptime
+
+    /// One tick a second while there is no LCD image; stops by itself at the first frame, so a running panel has no timer.
+    private func startBootClock() {
+        bootClock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self, self.state.lcdImage == nil else { timer.invalidate(); self?.bootClock = nil; return }
+            self.state.bootSeconds = Int(ProcessInfo.processInfo.systemUptime - self.bootBegan)
+            self.setNeedsDisplay(self.lcdFrame)
+        }
+    }
+
     func setStatus(_ text: String) {
+        guard toolbar.status.stringValue != text else { return }
         toolbar.status.stringValue = text
         toolbar.status.toolTip = text
+    }
+
+    /// Enter or leave the dark panel state (standby or fault): every lamp off except WAKE UP, and a black LCD with no
+    /// boot overlay. The host drives this from the TX standby flag; on wake the LCD is cleared so the boot overlay
+    /// shows until the firmware's next frame.
+    func setPanelDark(_ dark: Bool) {
+        guard dark != state.panelDark else { return }
+        state.panelDark = dark
+        if dark { state.lcdImage = nil }
+        needsDisplay = true
+    }
+
+    /// Force the power-fault display (QRT1001 p24): dark panel with the WAKE UP LED blinking red; off restores the live
+    /// screen. The firmware keeps running behind the veil, so the LCD image is not cleared.
+    func setFault(_ on: Bool) {
+        guard on != state.fault else { return }
+        state.fault = on
+        if on { startFaultClock() } else { stopFaultClock() }
+        needsDisplay = true
+    }
+
+    /// The two independent dark-panel overlay flags: standby (panelDark) and fault. Drawing combines them, so the order
+    /// they are set never changes the drawn state; exposed for the fault/standby order tests.
+    var overlayFlags: (standby: Bool, fault: Bool) { (state.panelDark, state.fault) }
+
+    private var faultClock: Timer?
+
+    /// Repaints the WAKE UP lamp a few times a second while the fault state is on, so the blink is smooth.
+    private func startFaultClock() {
+        guard faultClock == nil, state.fault,
+              let id = panelLayout?.controls.first(where: { $0.name == PanelRenderer.wakeUpName })?.id else { return }
+        faultClock = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self else { return }
+            guard self.state.fault else { timer.invalidate(); self.faultClock = nil; return }
+            self.invalidate([id])
+        }
+    }
+
+    private func stopFaultClock() {
+        faultClock?.invalidate(); faultClock = nil
     }
 
     var heldControls: Set<UInt8> { state.held }
@@ -1270,20 +1758,59 @@ final class PanelView: NSView, NSViewToolTipOwner {
 
     // MARK: Drawing
 
+    /// Host redraw cost, for metrics.json: passes through draw(_:), their wall time and how much of the view each
+    /// repainted (dirty-rect area as a fraction of the view).
+    struct RedrawStats {
+        var passes = 0, totalMs = 0.0, maxMs = 0.0, areaFraction = 0.0, full = 0
+        mutating func add(ms: Double, fraction: Double) {
+            passes += 1; totalMs += ms; maxMs = max(maxMs, ms); areaFraction += fraction
+            if fraction > 0.95 { full += 1 }
+        }
+        var json: [String: Any] {
+            ["passes": passes, "total_ms": totalMs, "ms_per_pass": passes > 0 ? totalMs / Double(passes) : 0, "max_ms": maxMs,
+             "mean_area_fraction": passes > 0 ? areaFraction / Double(passes) : 0, "full_passes": full]
+        }
+    }
+    private(set) var redrawStats = RedrawStats()
+
+    /// Forces `count` whole-view repaints and returns their mean wall time in ms: the cost without dirty rects.
+    func benchmarkFullRedraw(count: Int) -> Double {
+        let saved = redrawStats
+        // cacheDisplay always paints the whole view, even when the window is hidden or occluded (displayIfNeeded may not).
+        // One warm-up pass builds the static layer for the bitmap's scale, so the timed passes are the dynamic layer only.
+        var start = ProcessInfo.processInfo.systemUptime
+        if let rep = bitmapImageRepForCachingDisplay(in: bounds) {
+            cacheDisplay(in: bounds, to: rep)
+            start = ProcessInfo.processInfo.systemUptime
+            for _ in 0..<max(1, count) { cacheDisplay(in: bounds, to: rep) }
+        }
+        let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000 / Double(max(1, count))
+        redrawStats = saved
+        return ms
+    }
+
     override func draw(_ dirtyRect: NSRect) {
+        let began = ProcessInfo.processInfo.systemUptime
+        defer {
+            redrawStats.add(ms: (ProcessInfo.processInfo.systemUptime - began) * 1000,
+                            fraction: Double(dirtyRect.width * dirtyRect.height / max(1, bounds.width * bounds.height)))
+        }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         guard let renderer, let t = panelTransform else {
             drawFailure(ctx)
             return
         }
         let scale = abs(ctx.convertToDeviceSpace(CGSize(width: 1, height: 0)).width)
-        let key = StaticKey(size: bounds.size, scale: scale, lcdOnly: lcdOnly)
-        if staticCache?.key != key {
-            staticCache = renderer.makeStaticLayer(viewSize: bounds.size, scale: scale, transform: t, lcdOnly: lcdOnly).map { ($0, key) }
+        let key = StaticKey(size: bounds.size, scale: scale, lcdOnly: lcdOnly, rear: showRear, skin: skinActive)
+        if let hit = staticCache.firstIndex(where: { $0.key == key }) {
+            if hit != 0 { staticCache.insert(staticCache.remove(at: hit), at: 0) }
+        } else if let image = renderer.makeStaticLayer(viewSize: bounds.size, scale: scale, transform: t, lcdOnly: lcdOnly, rear: showRear, skin: skinActive ? skinImage : nil) {
+            staticCache.insert((image, key), at: 0)
+            if staticCache.count > 2 { staticCache.removeLast() }
         }
         ctx.saveGState()
         ctx.clip(to: dirtyRect)
-        if let image = staticCache?.image {
+        if let image = staticCache.first?.image {
             ctx.translateBy(x: 0, y: bounds.height)
             ctx.scaleBy(x: 1, y: -1)
             ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
@@ -1293,7 +1820,9 @@ final class PanelView: NSView, NSViewToolTipOwner {
         ctx.translateBy(x: t.origin.x, y: t.origin.y)
         ctx.scaleBy(x: t.scale, y: t.scale)
         let dirty = t.toCanvas(dirtyRect)
-        if lcdOnly {
+        if showRear {
+            // The rear panel is entirely static.
+        } else if lcdOnly {
             renderer.drawLCD(ctx, state: state, dirty: dirty)
         } else {
             renderer.drawDynamic(ctx, state: state, scale: t.scale, dirty: dirty)
@@ -1313,16 +1842,16 @@ final class PanelView: NSView, NSViewToolTipOwner {
     }
 
     private func invalidate<S: Sequence>(_ ids: S) where S.Element == UInt8 {
-        guard !lcdOnly, let t = panelTransform else { return }
+        guard !lcdOnly, !showRear, let t = panelTransform else { return }
         for id in ids {
             guard let c = controlIndex[id] else { continue }
-            setNeedsDisplay(t.toView(c.frame.insetBy(dx: -30, dy: -30)))
+            setNeedsDisplay(t.toView(c.frame.insetBy(dx: -PanelRenderer.dirtyReach, dy: -PanelRenderer.dirtyReach)))
         }
     }
 
     // MARK: Hold bookkeeping
 
-    private enum HoldSource: Hashable { case mouse, key(UInt16), shift, latch, accessibility }
+    private enum HoldSource: Hashable { case mouse, key(UInt16), shift, latch, accessibility, boot }
 
     private enum Drag { case hold(UInt8), knob(UInt8), analog(UInt8), ring, strip, lcd }
 
@@ -1362,6 +1891,18 @@ final class PanelView: NSView, NSViewToolTipOwner {
         state.held.remove(id)
         emit(id, 0, 0)
         invalidate([id])
+    }
+
+    /// Holds the named controls as the host's own "keys held at power-on" (Power On With Keys Held); the release
+    /// comes from `releaseBootHolds`, or from releaseAll when the window loses focus.
+    func holdForBoot(_ names: [String]) {
+        for name in names {
+            if let id = panelLayout?.controls.first(where: { $0.name == name })?.id { addSource(id, .boot) }
+        }
+    }
+
+    func releaseBootHolds() {
+        for id in input.holds.keys.sorted() { removeSource(id, .boot) }
     }
 
     /// Emits a release for every held or latched control and ends any LCD touch. Safe to call repeatedly.

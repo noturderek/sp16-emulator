@@ -1,7 +1,7 @@
 /* Contract for the audio transport. Build twice like sp16_pcm_tap_contract.c
  * (-DSP16_FAKE_ALSA -shared -fPIC -> libsp16-fake-alsa.so; normal -> test) and run with the ARM UI preload plus
  * SP16_PCM_PORT=/tmp/run/port (a regular file in mode "file", a FIFO nobody reads in mode "stall") and no tap.
- *   file : every written frame arrives bit-exact (channels 12..15 of the 16-channel stream), packets carry a
+ *   file : every written frame arrives bit-exact (all 16 channels of the master stream), packets carry a
  *          contiguous sequence, config comes first, drops are zero, the ping gets a pong, pacing is intact.
  *   stall: a consumer that never reads must not delay snd_pcm_writei beyond the 44.1 kHz pacing; overflow is
  *          dropped (the frame index keeps advancing) and the drop counter in the packet stream is not zero.
@@ -59,6 +59,50 @@ static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v,p,4); return v; }
 static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v,p,8); return v; }
 int main(int argc,char **argv) {
     const char *mode=argc>1?argv[1]:"file";
+    if (!strcmp(mode,"s24")) {
+        /* S24_LE in, FLOAT_LE out: the transport sign-extends the low 24 bits of each 32-bit word and divides by
+         * 2^23. The send/return playback carries 2 channels, so the conversion is exercised without the 16-channel
+         * master stream (whose 4 bytes x 16 channels exceed the transport's 32-byte-per-frame slot). */
+        snd_pcm_t *s24;
+        assert(snd_pcm_open(&s24,"hw:ak4452audio,1",0,0)==0);
+        configure(s24,6,2);
+        for (unsigned i=0;i<200;i++) {
+            int32_t s[FRAMES*2];
+            for (unsigned f=0;f<FRAMES;f++) for (unsigned c=0;c<2;c++) {
+                uint32_t u=(i*2654435761u+f*1103515245u+c*12345u)&0xffffffu;
+                s[f*2+c]=(int32_t)(u<<8)>>8;
+            }
+            assert(snd_pcm_writei(s24,s,FRAMES)==FRAMES);
+        }
+        struct timespec nap={ .tv_nsec=150000000 }; nanosleep(&nap,NULL);   /* let the forwarder drain */
+        int fd=open("/tmp/run/port",O_RDONLY); assert(fd>=0);
+        static uint8_t data[8*1024*1024]; ssize_t size=read(fd,data,sizeof data); assert(size>0);
+        size_t at=0; unsigned frames=0; int saw_data=0;
+        while ((size_t)size-at>=48) {
+            const uint8_t *h0=data+at; assert(!memcmp(h0,"SPCM",4));
+            unsigned type=h0[4]; uint32_t n=rd32(h0+20), payload=rd32(h0+44);
+            assert(h0[5]==2 && h0[6]==14 && h0[7]==2 && h0[8]==2 && h0[9]==0);   /* send/return, FLOAT_LE, 2 ch */
+            assert(rd32(h0+12)==44100);
+            if (type==1) { at+=48; continue; }
+            assert(type==2 && payload==n*8);
+            assert((size_t)size-at>=48+payload);
+            for (uint32_t f=0;f<n;f++) {
+                uint64_t abs_frame=rd64(h0+32)+f;
+                unsigned period=(unsigned)(abs_frame/FRAMES), off=(unsigned)(abs_frame%FRAMES);
+                for (unsigned c=0;c<2;c++) {
+                    uint32_t u=(period*2654435761u+off*1103515245u+c*12345u)&0xffffffu;
+                    int32_t v=(int32_t)(u<<8)>>8;
+                    float got; memcpy(&got,h0+48+(f*2+c)*4,4);
+                    assert(got==(float)v/8388608.0f);
+                }
+            }
+            frames+=n; saw_data=1; at+=48+payload;
+        }
+        assert(saw_data && at==(size_t)size);
+        assert(snd_pcm_close(s24)==0);
+        printf("s24 frames=%u converted bit-exact\n",frames);
+        return 0;
+    }
     snd_pcm_t *h;
     assert(snd_pcm_open(&h,"hw:ak4458audio,0",0,0)==0);
     configure(h,2,CH);
@@ -82,15 +126,15 @@ int main(int argc,char **argv) {
         const uint8_t *h0=data+at; assert(!memcmp(h0,"SPCM",4));
         unsigned type=h0[4]; uint32_t n=rd32(h0+20), payload=rd32(h0+44);
         assert(rd32(h0+16)==seq); seq++;                       /* contiguous sequence */
-        assert(h0[5]==0 && h0[6]==2 && h0[7]==4 && h0[8]==16 && h0[9]==12);   /* stream, S16_LE, ch12..15 of 16 */
+        assert(h0[5]==0 && h0[6]==2 && h0[7]==16 && h0[8]==16 && h0[9]==0);   /* stream, S16_LE, all 16 channels */
         assert(rd32(h0+12)==44100);
         if (type==1) { assert(packets==0 && !config_first); config_first=1; at+=48; continue; }
-        assert(type==2 && config_first && payload==n*8);
+        assert(type==2 && config_first && payload==n*32);
         assert((size_t)size-at>=48+payload);
         assert(rd64(h0+32)==next_index);                       /* no frame lost without a gap in the index */
         for (uint32_t f=0;f<n;f++) {
             uint64_t abs_frame=next_index+f; int16_t ref[FRAMES*CH]; fill(ref,(unsigned)(abs_frame/FRAMES));
-            assert(!memcmp(h0+48+f*8,&ref[(abs_frame%FRAMES)*CH+12],8));
+            assert(!memcmp(h0+48+f*32,&ref[(abs_frame%FRAMES)*CH],32));
         }
         next_index+=n; frames+=n; packets++; at+=48+payload;
         assert(rd32(h0+40)==0);                                /* no drops while the consumer keeps up */
