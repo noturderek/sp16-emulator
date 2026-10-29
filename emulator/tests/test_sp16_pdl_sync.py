@@ -210,6 +210,7 @@ class BridgeTests(unittest.TestCase):
                 self.forced = []
             def set_tempo(self, bpm):
                 self.tempos.append(bpm)
+                return True
             def force_beat_at_time(self, beat, when, quantum):
                 self.forced.append((beat, when, quantum))
         link = FakeLink()
@@ -219,12 +220,28 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(link.tempos), 1)  # one tempo, no repeat for the same BPM
         self.assertAlmostEqual(link.tempos[0], 130.56, delta=0.01)
 
+    def test_bridge_retries_a_failed_tempo_delivery(self):
+        class FailingLink:
+            def __init__(self):
+                self.tempos = []
+            def set_tempo(self, bpm):
+                self.tempos.append(bpm)
+                return False  # Carabiner not reachable: the delivery failed
+            def force_beat_at_time(self, beat, when, quantum):
+                pass
+        link = FailingLink()
+        bridge = pdl.PdlClockBridge(link=link)
+        bridge.feed_beat(beat_packet(128.0, 0.02, 1), 0.0)
+        bridge.feed_beat(beat_packet(128.0, 0.02, 2), 1.0)  # the same effective BPM
+        self.assertEqual(len(link.tempos), 2)  # the failed delivery was not remembered, so it retried
+        self.assertIsNone(bridge._sent_bpm)
+
     def test_bridge_forces_phase_on_the_downbeat(self):
         class FakeLink:
             def __init__(self):
                 self.forced = []
             def set_tempo(self, bpm):
-                pass
+                return True
             def force_beat_at_time(self, beat, when, quantum):
                 self.forced.append((beat, when, quantum))
         link = FakeLink()
@@ -242,7 +259,7 @@ class BridgeTests(unittest.TestCase):
             def __init__(self):
                 self.forced = []
             def set_tempo(self, bpm):
-                pass
+                return True
             def force_beat_at_time(self, beat, when, quantum):
                 self.forced.append((beat, when, quantum))
         link = FakeLink()
