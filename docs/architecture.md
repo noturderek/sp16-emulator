@@ -72,7 +72,7 @@ audio paths run as on the hardware:
   as before. The cutoff laws (20 Hz to 20 kHz, exponential over the pot or DAC range) are assumptions, not
   measurements of the hardware.
 - The panel knobs start with the filter wide open: DRIVE, RESONANCE and HP CUTOFF at minimum, LP CUTOFF at maximum,
-  MAIN OUT centred (`ANALOG_DEFAULTS` in `panel_map.py`, mirrored as `initial` in `panel-layout.json`; a test keeps the
+  MAIN OUT at full, which is the unity gain the board model plays before the knob is moved (`ANALOG_DEFAULTS` in `panel_map.py`, mirrored as `initial` in `panel-layout.json`; a test keeps the
   two equal). LP CUTOFF and RESONANCE are never sent at start because "never moved" already means exactly those positions.
 - ACTIVE starts off. The stock app lights it (filter-select line high) at every start, on a fresh and on a saved data
   image, so the guest bridge presses the button once its lamp has stayed lit for 3 s, repeating a press the app missed

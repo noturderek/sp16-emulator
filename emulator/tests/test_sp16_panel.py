@@ -101,7 +101,7 @@ class PanelModelTests(unittest.TestCase):
 
     def test_analog_knobs_start_with_the_filter_wide_open(self):
         frame = panel.PanelModel().frame()
-        self.assertEqual(counter(frame, 0x28), 512)    # MAIN OUT centred, read directly
+        self.assertEqual(counter(frame, 0x28), 1023)   # MAIN OUT at full (unity), read directly
         self.assertEqual(counter(frame, 0x26), 1023)   # DRIVE at minimum (shown as 1023 - raw = 0)
         self.assertEqual(counter(frame, 0x2a), 1023)   # HP CUTOFF at minimum (shown as 1023 - raw = 0)
 
@@ -756,6 +756,10 @@ class MapTests(unittest.TestCase):
         initial = {c["name"]: c.get("initial") for c in layout["controls"] if c["kind"] == "analog"}
         self.assertEqual(initial, panel_map.ANALOG_DEFAULTS)
         self.assertTrue(all(0 <= value <= 1000 for value in initial.values()))
+        # MAIN OUT is drawn where its level is: untouched it plays at unity, and only full scale has unity gain.
+        import analog_laws
+        self.assertEqual(analog_laws.main_out_gain(analog_laws.NEVER_MOVED), 1.0)
+        self.assertEqual(analog_laws.main_out_gain(initial["main_out"]), 1.0)
 
     def test_tx_channel_tables_cover_the_wire_frame_without_overlap(self):
         self.assertEqual(len(panel_map.RGB_CHANNELS), 32)

@@ -99,10 +99,12 @@ ANALOG_WORDS = {name: (offset, inverted) for name, (offset, inverted) in PROFILE
 ANALOG_FULL_SCALE = 1023
 # Where each analog knob starts, host value 0..1000 (the panel view starts its knobs from the same numbers: "initial" in
 # panel-layout.json, checked by a test). DRIVE, RESONANCE and HP CUTOFF at minimum with LP CUTOFF at maximum is the
-# filter wide open, the state the service manual's audio tests (MODE3) set; MAIN OUT starts centred. LP CUTOFF and
+# filter wide open, the state the service manual's audio tests (MODE3) set; MAIN OUT starts at full (unity). LP CUTOFF and
 # RESONANCE are host-only analog state and stay "never moved" until touched, which the shim treats as exactly these
 # positions (20 kHz, minimum resonance), so no value is sent for them at start.
-ANALOG_DEFAULTS = {"main_out": 500, "drive": 0, "lp_cutoff": 1000, "lp_resonance": 0, "hp_cutoff": 0}
+# MAIN OUT starts at full: the board model plays it at unity until it is moved (analog_laws.main_out_gain), and full
+# scale is the one position whose law also gives unity, so the drawn knob and the level agree from the first frame.
+ANALOG_DEFAULTS = {"main_out": 1000, "drive": 0, "lp_cutoff": 1000, "lp_resonance": 0, "hp_cutoff": 0}
 ANALOG_DEFAULT = 500  # any firmware-visible pot not listed above
 
 # Toggle buttons that start off. The stock app lights ACTIVE (the Send & Return filter in the signal path, filter-select

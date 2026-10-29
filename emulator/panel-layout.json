@@ -124,7 +124,7 @@
     {"id": 58, "name": "strip", "kind": "strip", "group": "strip", "shape": "roundRect", "radius": 4, "cx": 141.5, "cy": 600, "w": 93, "h": 332, "accessibility": "Touch strip"},
     {"id": 59, "name": "usb_stop", "kind": "button", "group": "usb", "shape": "circle", "style": "round", "cx": 1506, "cy": 107, "r": 22, "accessibility": "USB stop"},
     {"id": 60, "name": "active", "kind": "button", "group": "analog", "shape": "circle", "style": "round", "cx": 866, "cy": 106, "r": 17, "accessibility": "Filter active"},
-    {"id": 61, "name": "main_out", "kind": "analog", "group": "analog", "shape": "circle", "style": "matte", "cx": 141, "cy": 106, "r": 36, "accessibility": "Main out", "initial": 500},
+    {"id": 61, "name": "main_out", "kind": "analog", "group": "analog", "shape": "circle", "style": "matte", "cx": 141, "cy": 106, "r": 36, "accessibility": "Main out", "initial": 1000},
     {"id": 62, "name": "drive", "kind": "analog", "group": "analog", "shape": "circle", "style": "metal", "cx": 302, "cy": 104, "r": 33, "accessibility": "Drive", "initial": 0},
     {"id": 63, "name": "lp_cutoff", "kind": "analog", "group": "analog", "shape": "circle", "style": "metal", "cx": 455, "cy": 104, "r": 33, "accessibility": "Low-pass cutoff", "initial": 1000},
     {"id": 64, "name": "lp_resonance", "kind": "analog", "group": "analog", "shape": "circle", "style": "metal", "cx": 610, "cy": 104, "r": 33, "accessibility": "Resonance", "initial": 0},
