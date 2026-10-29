@@ -48,7 +48,7 @@ def parse_beat_packet(payload: bytes) -> dict:
 def parse_status_packet(payload: bytes) -> dict:
     """The master's 0x0a status packet: pitch factor, base BPM (x100), beat counter, beat in bar and the play/master
     flags (offset 0x89 bits, as net/fake_master.py sets them)."""
-    if len(payload) < 0x93 or payload[:10] != MAGIC or payload[10] != 0x0a:
+    if len(payload) < 0xa7 or payload[:10] != MAGIC or payload[10] != 0x0a:
         raise ValueError("not a 0x0a status packet")
     scaled_pitch = struct.unpack(">I", payload[0x8c:0x90])[0]
     bpm_x100 = struct.unpack(">H", payload[0x92:0x94])[0]

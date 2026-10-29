@@ -151,6 +151,27 @@ class RunTests(unittest.TestCase):
         self.assertEqual(fed, 1)
         self.assertGreater(len(sent), 20)  # the emitter ran at 130.56 BPM for the window
 
+    def test_run_survives_a_malformed_frame(self):
+        class FakeSeg:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            def settimeout(self, t):
+                pass
+
+            def recvfrom(self, n):
+                if self.frames:
+                    return self.frames.pop(0), None
+                time.sleep(0.01)
+                raise socket.timeout()
+
+        malformed = b"Qspt1WmJOL" + b"\x28" + b"\x00" * 20   # the magic and beat type, far short of a beat packet
+        beat = fake_master.beat_packet("CDJ-3000", 1, 128.0, 0.02, 1, 100)
+        sent = []
+        fed = bridge.run(FakeSeg([framed(malformed, 50001), framed(beat, 50001)]), sent.append, duration=0.6)
+        self.assertEqual(fed, 1)           # the bad frame was skipped, the good one still fed
+        self.assertGreater(len(sent), 20)
+
 
 if __name__ == "__main__":
     unittest.main()

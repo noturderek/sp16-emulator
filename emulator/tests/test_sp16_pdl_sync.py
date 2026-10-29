@@ -52,6 +52,14 @@ class TempoTests(unittest.TestCase):
         self.assertEqual((status["beat_in_bar"], status["beat_count"]), (2, 7))
         self.assertTrue(status["playing"] and status["master"])
 
+    def test_parse_status_rejects_packets_shorter_than_the_fields_it_reads(self):
+        # The last field is beat_in_bar at offset 0xa6, so anything under 0xa7 bytes is too short and must be a
+        # ValueError, not an IndexError or struct.error escaping the receive loop.
+        full = status_packet()
+        for length in (0x93, 0xa0, 0xa6):
+            with self.assertRaises(ValueError, msg=f"length {length}"):
+                pdl.parse_status_packet(full[:length])
+
 
 class TrackerTests(unittest.TestCase):
     def test_tracker_tracks_tempo_and_downbeat(self):
