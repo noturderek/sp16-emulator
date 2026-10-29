@@ -1,6 +1,6 @@
 ---
 title: MIDI
-description: How MIDI gets in and out of the emulated sampler: the sequencer proxy, DIN and USB-B host endpoints, routing preferences and the settings that gate MIDI.
+description: "How MIDI gets in and out of the emulated sampler: the sequencer proxy, DIN and USB-B host endpoints, routing preferences and the settings that gate MIDI."
 type: reference
 status: active
 created: 2026-10-28

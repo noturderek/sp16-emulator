@@ -1,6 +1,6 @@
 ---
 title: Pro DJ Link
-description: How the emulated sampler joins a Pro DJ Link network: the segment relay, the segment tools, the keep-alive and following a tempo master.
+description: "How the emulated sampler joins a Pro DJ Link network: the segment relay, the segment tools, the keep-alive and following a tempo master."
 type: reference
 status: active
 created: 2026-10-28
