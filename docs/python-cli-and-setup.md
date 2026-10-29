@@ -41,6 +41,18 @@ tool (`emulator/layout_overlay.py`), `pillow` is required: `python3 -m pip insta
 ./sp16 ctl snapshot screen.png      # drive a running research session
 ```
 
+Some tools are plain scripts under `emulator/` rather than `./sp16` commands. They read a running research session
+(or need none at all) and are documented in their guides:
+
+| Script | What it does | Guide |
+|---|---|---|
+| `emulator/timing_probe.py run \| wav \| tx` | Step jitter and panel-frame stalls of a session; `--net mcast` runs a whole Pro DJ Link follow | [pro-dj-link.md](pro-dj-link.md), [architecture.md](architecture.md#research-socket) |
+| `emulator/net/segment_watch.py`, `segment_master.py`, `fake_master.py` | Watch or fake the Pro DJ Link traffic on a segment | [pro-dj-link.md](pro-dj-link.md) |
+| `emulator/sync/bridge.py` | Pro DJ Link tempo to MIDI clock (`--clock-out`), optionally Ableton Link (`--link`) | [pro-dj-link.md](pro-dj-link.md#the-sync-bridge) |
+| `emulator/menu/sync_source.py` | Set the firmware's sync source and MIDI output settings by OCR | [midi.md](midi.md#firmware-menu-settings) |
+| `emulator/probes/over_led.py`, `ak4458_transport.py`, `filter_send.py` | Live audio and lamp measurements against a build | [audio-jack-map.md](audio-jack-map.md) |
+| `emulator/gdb-bridge.py` | Host side of `--trace gdb`, for lldb on a unix socket | [architecture.md](architecture.md#research-traces---trace) |
+
 Firmware and GPL sources are not included. Import only files supplied by the user, and keep firmware, keys, imported
 images and session data in the ignored `build/` or `private/` directories. See the [README](../README.md) for the full
 fresh-clone workflow, firmware import, audio, virtual USB storage, builds and troubleshooting. The agent setup workflows
