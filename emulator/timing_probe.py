@@ -390,7 +390,10 @@ def run(args):
         hwsuite.write_sparse(stick, payload, total)
         if args.net:
             master_log = out / "master-beats.txt"
-            master = start_master(args.master_bpm, args.master_pitch, args.lead + args.seconds + 20, master_log)
+            # The master's beats must still be running when the measurement window opens. That window can start over
+            # a minute after the master spawns (the emulator boots and the follow setup runs before PLAY), so the
+            # master is given a margin that covers the worst-case boot + setup, not just lead + seconds.
+            master = start_master(args.master_bpm, args.master_pitch, args.lead + args.seconds + 300, master_log)
             pid, runtime = launch_net(build, stick, args.net)
         else:
             pid, runtime, _ = hwsuite.launch(build, None, stick, ephemeral=True)
@@ -449,7 +452,10 @@ def run(args):
         if args.net and master_log is not None and master_log.exists():
             effective = args.master_bpm * (1 + args.master_pitch / 100.0)
             master_beats = read_master_beats(master_log)
-            started = window_t0_ns / 1e9 - float((session.metrics() or {}).get("uptime_seconds", 0.0))
+            # The tx-frame clock is the app's systemUptime (== time.monotonic on macOS), so the app's launch time is
+            # the offset between the two: read uptime_seconds and the monotonic clock at the same instant.
+            now = time.monotonic()
+            started = now - float((session.metrics() or {}).get("uptime_seconds", 0.0))
             report["follow"] = {
                 "master_bpm": args.master_bpm, "master_pitch_pct": args.master_pitch,
                 "master_effective_bpm": effective,
