@@ -203,6 +203,47 @@ which jack pair plays through your Mac. The master stream sends all 16 channels 
 (channels 12 and 14). Research builds can inject an input WAV (`input.wav`, up to 64 MB) from a `--dev-overlay` folder,
 metered with peak-equivalent dBu readouts (`in_dbu_peak`, `out_dbu_peak`); see [docs/audio-jack-map.md](docs/audio-jack-map.md).
 
+## MIDI
+
+`./sp16 run --midi` starts two CoreMIDI bridges for the session: `SP-16 DIN [<build>]` on the DIN socket and
+`SP-16 USB [<build>]` for the firmware's USB-B MIDI. Both are **virtual CoreMIDI endpoints, not a physical USB or MIDI
+interface**; `./sp16 midi ports` lists them.
+
+- The shim serves the ALSA sequencer ABI the firmware's application opens and publishes its two peers (DIN, and the USB
+  gadget's `g_midi` while the app has USB-B in MIDI mode), so the app discovers and subscribes both.
+- The app's **MIDI > Routing…** window has one row per endpoint with In, Out, Send clock and Receive clock, a clock
+  source picker and a BPM/lock/jitter readout. Choices persist and are written to
+  `~/Library/Application Support/SP-16 Emulator/midi-routing.json`, which both bridges read live (`--config PATH`
+  points them elsewhere).
+- Generated output is gated by the firmware's own settings; OCR recipes set them on a running research session:
+  `python3 emulator/menu/sync_source.py --build NAME usb-note-out` (and `sync-source-pdl`, `usb-out`).
+
+DIN input and output are observed (a host note triggers a loaded sample; PLAY sends `FA`, 24 PPQN `F8`, `FC`), and the
+USB-B route carries the same transport and CC. USB-B **pad notes are not finished**: the route works, but a pad hit
+has no project content to turn into a note. [docs/midi.md](docs/midi.md) has the details.
+
+## Pro DJ Link
+
+`./sp16 run --net MODE` gives the guest a network: `host` and `bridged:IF` reach your LAN through the root
+`socket_vmnet` daemon, and `mcast` links emulators and host tools on this Mac without root. `mcast` runs through a
+host-side relay, because QEMU's own multicast backend cannot deliver to another local listener on macOS.
+
+On the segment the firmware binds UDP 50000, 50002 and 50001 and emits its keep-alive about every 2 s. Host tools
+decode and fake that traffic:
+
+```sh
+./sp16 run --name NAME --net mcast                        # one terminal: the emulator, on the segment
+python3 emulator/net/segment_watch.py --seconds 20        # decode what the guest sends
+python3 emulator/net/segment_master.py --bpm 128 --pitch 2 --duration 120   # a fake tempo master
+python3 emulator/timing_probe.py run --build NAME --net mcast --master-bpm 128 --master-pitch 2
+```
+
+With SYNC SOURCE = PRO DJ LINK (the `sync-source-pdl` menu recipe) the sequencer follows the master's effective tempo
+exactly: 130.56 BPM against 128 BPM +2 %, with no tempo error. The downbeat does not align yet (about 495 ms off), so
+linking with a second emulator was left parked. [docs/pro-dj-link.md](docs/pro-dj-link.md) covers the tools, the sync
+bridge that turns a master's tempo into MIDI clock (`emulator/sync/bridge.py`, optionally driving Carabiner for Ableton
+Link), and what is still open.
+
 ## Commands and Makefile
 
 `./sp16 help` lists every command; `./sp16 help <command>` (or `<command> --help`) shows its options and
@@ -286,11 +327,18 @@ To turn an unverified version into a verified one, see [docs/architecture.md](do
   (up to 64 MB); HP CUTOFF DAC code; filter loop passes a research test tone through low-pass and high-pass.
 - MIDI controller bridge: `./sp16 midi` maps CoreMIDI controllers to emulator actions with lamp LED echo; built-in
   SP-16 mirror preset.
+- MIDI routing and the DIN/USB-B routes: the shim serves the app's ALSA sequencer ABI, so it discovers both peers and
+  subscribes them; `./sp16 run --midi` publishes `SP-16 DIN` and `SP-16 USB`, the app's MIDI > Routing… window writes the
+  preferences both bridges honour, and DIN in/out and USB-B transport with CC are observed. Menu recipes set the
+  firmware's own sync source and MIDI output settings ([docs/midi.md](docs/midi.md)).
+- Pro DJ Link on the `mcast` segment: the guest's keep-alive is decoded by the host tools, and with SYNC SOURCE = PRO DJ
+  LINK the sequencer follows a master's effective tempo exactly ([docs/pro-dj-link.md](docs/pro-dj-link.md)).
 - Factory test mode (`--research --app-arg testmode`): PAGE 8 DEVICE TEST MIDI check (touch button at 115, 112)
   verified live against DIN loopback; hardware suite extras tier checks HW-47..HW-54.
 - Research tools: the control socket (`./sp16 ctl` including `power`, `standby`, `pressure`, `calibrate`, `fault`,
   `monitor`, `usb-oc`), `--trace` (strace, gdb, pcmtap, exec), the hardware suite with screenshot regression layer
-  (`--shots`), smoke test and mod tooling.
+  (`--shots`), smoke test, mod tooling, the Pro DJ Link segment tools and the probes in `emulator/probes/`
+  (`over_led.py`, `ak4458_transport.py`, `filter_send.py`).
 
 **Not there yet:**
 
@@ -300,12 +348,12 @@ To turn an unverified version into a verified one, see [docs/architecture.md](do
   model: the firmware reads the pot as an ADC word and applies it itself.
 - Audio input and live sampling: a research test tone or injected `input.wav` stands in for the input ADC; master
   channels map to output jacks (see [docs/audio-jack-map.md](docs/audio-jack-map.md)); output routing beyond the
-  monitored pairs is not emulated.
-- DIN MIDI and USB-B: DIN MIDI transport (`--midi`) provides host virtual CoreMIDI endpoints, but firmware-side MIDI
-  discovery, sequencer routing and audio-position clock output remain parked. USB-B MIDI device emulation is not
-  implemented.
-- Pro DJ Link: guest NIC (`--net host|bridged:IF|mcast`) and GLINK/ARP compatibility are present, but the firmware does
-  not emit port 50000 UDP keep-alives; tempo following and Ableton Link sync remain parked.
+  monitored pairs is not emulated. The filter send stays silent: the app never writes its send stream in the sessions
+  tried, and why needs a debugger.
+- USB-B pad notes: the route works (transport and CC arrive on `SP-16 USB`), but a pad hit produces no note; the
+  project needs playable content and the per-track MIDI channel and NOTE/CC send.
+- Pro DJ Link: the tempo follows, the downbeat is about 495 ms off, and linking with a second emulator was not
+  attempted. The Ableton Link half of the sync bridge is untested (it needs a Carabiner you run yourself).
 - A version is only `verified` by a full-tier hardware suite run ([docs/hardware-suite.md](docs/hardware-suite.md)).
 
 ## Load a modified firmware
@@ -345,7 +393,10 @@ make build-dev build-control      # build/sp16-dev and build/sp16-dev-uncal, sha
 ```
 
 The smoke tier takes about 8 minutes. Without the control build, check HW-24 (uncalibrated pads) is `BLOCKED` and the
-run exits 2, which is not a failure. See [docs/hardware-suite.md](docs/hardware-suite.md) for the full steps.
+run exits 2, which is not a failure. HW-35 (the OVER lamp) is declared known-failing in the 1.60 profile, so it reports
+`KNOWN-FAIL` with its measured figures instead of failing the run: the lamp watches the DSI drive input, whose threshold
+is +5.1 dBFS, and sampler playback does not drive it that far. See
+[docs/hardware-suite.md](docs/hardware-suite.md) for the full steps.
 
 ## Troubleshooting
 
@@ -413,7 +464,8 @@ such as an external drive's name, are kept.
 sp16, Makefile    the command line (`./sp16 help`) and the ready-made build configurations (`make help`)
 emulator/            sp16emu.py (the command), build tool, firmware importer, Linux guest base, hardware shim, panel model, macOS app,
                      compatibility profiles, developer tools, hardware suite, unit tests
-docs/                Python CLI/setup, architecture, modding guide, hardware suite, profile reference
+docs/                Python CLI/setup, architecture, MIDI, Pro DJ Link, modding guide, audio jack map, hardware suite,
+                     profile reference
 .agents/skills/      agent skills: sp16-bootstrap (fresh clone to a running emulator) and sp16-emulator-setup (setup details, mods, troubleshooting)
 ```
 
