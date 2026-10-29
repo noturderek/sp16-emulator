@@ -97,8 +97,16 @@ class Routing:
         file never silently reopens a direction the user closed. Returns the routes."""
         try:
             stat = self.path.stat()
-        except OSError:
+        except FileNotFoundError:
+            # No preferences file: every route carries, exactly as a bridge started before the window ever opened.
             self.ports, self.stamp, self.checked, self.problem = {}, None, self.clock(), None
+            return self.ports
+        except OSError as error:
+            # A permission (or other) stat error must not clear routes the user already closed: reopening a disabled
+            # direction is worse than keeping it closed. Keep the routes and their stamp; report the problem so the
+            # next refresh retries.
+            self.checked = self.clock()
+            self.problem = f"{self.path}: {error}"
             return self.ports
         self.checked = self.clock()
         stamp = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
