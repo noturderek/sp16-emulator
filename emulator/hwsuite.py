@@ -4208,7 +4208,7 @@ class Runner:
             time.sleep(1.0)
         records = s.lamps_since(offset)
         s.press("stop")
-        s.event("main_out", "value", 500)
+        s.event("main_out", "value", 1000)   # back to the start: full, the unity the board model plays untouched
         self.select_track(2)
         for n in steps:
             s.press(f"step{n}")

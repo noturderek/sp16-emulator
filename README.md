@@ -130,7 +130,7 @@ under another name, `./sp16 run --name <name>` launches that one; if the build d
 which `./sp16 build` command creates it.
 
 **What a start looks like.** The panel starts with the filter wide open (DRIVE, RESONANCE and HIGH PASS CUTOFF at
-minimum, LOW PASS CUTOFF at maximum, MAIN OUT centred) and ACTIVE off: the firmware lights ACTIVE at every start, so the
+minimum, LOW PASS CUTOFF at maximum, MAIN OUT at full, matching the full volume it plays at) and ACTIVE off: the firmware lights ACTIVE at every start, so the
 emulator presses it once after boot (see [the analog board model](docs/architecture.md#analog-board-model)). A normal
 launch resumes the project saved in the firmware's data image, so the mixer comes back as you left it. `./sp16 run
 --ephemeral` uses a disposable data image instead: nothing you do persists and there is no saved project, so the mixer
