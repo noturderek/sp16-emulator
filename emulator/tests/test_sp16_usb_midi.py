@@ -1,9 +1,11 @@
 """The separate USB MIDI byte stream reaches its CoreMIDI endpoints."""
 import socket
+import os
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import uuid
 from pathlib import Path
@@ -12,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from midi.usb import bridge, signal_stop  # noqa: E402
-from midi_bridge.midi import Message, Port, list_ports  # noqa: E402
+from midi_bridge.midi import HELPER_SOURCE, Message, Port, helper_binary, list_ports  # noqa: E402
 
 
 class SignalStopTests(unittest.TestCase):
@@ -60,6 +62,60 @@ class SignalStopTests(unittest.TestCase):
                 mock.patch.object(time, "monotonic", side_effect=[0.0, 0.001, 1.0]):
             self.assertFalse(signal_stop(pending, timeout=1.0))
         self.assertTrue(sleeps, "signal_stop spun without sleeping")
+
+
+class CoreMIDIHelperBuildTests(unittest.TestCase):
+    """The DIN and USB bridges both compile the CoreMIDI helper on first use; the build must be serialised so two
+    bridges starting together do not race swiftc's linker on the same output path ("ld: File exists")."""
+
+    def test_concurrent_bridges_compile_the_helper_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            build_dir = Path(folder)
+            compiling = threading.Event()   # set when the (fake) swiftc starts, so both threads are racing
+            release = threading.Event()     # lets the fake swiftc finish
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                compiling.set()
+                release.wait(5)
+                binary = Path(args[-1])          # the -o output path
+                binary.write_text("#!/bin/sh\n")  # stand in for a real compile
+                binary.chmod(0o755)
+                return types.SimpleNamespace(returncode=0, stderr="")
+
+            errors, results = [], [None, None]
+
+            def build(index):
+                try:
+                    results[index] = helper_binary(build_dir)
+                except Exception as error:  # noqa: BLE001 - surfaced below
+                    errors.append(error)
+
+            with mock.patch("midi_bridge.midi.subprocess.run", side_effect=fake_run):
+                threads = [threading.Thread(target=build, args=(i,)) for i in range(2)]
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(compiling.wait(5), "the fake swiftc never started")
+                release.set()
+                for thread in threads:
+                    thread.join(5)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(results[0], results[1])   # both bridges got the same helper
+            self.assertTrue(str(results[0]).endswith("coremidi-io"))
+            self.assertEqual(len(calls), 1, "both bridges compiled the helper; the build is not serialised")
+
+    def test_an_up_to_date_helper_is_not_rebuilt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            build_dir = Path(folder)
+            (build_dir / "midi-bridge").mkdir(parents=True)
+            binary = build_dir / "midi-bridge" / "coremidi-io"
+            binary.write_text("#!/bin/sh\n")
+            os.utime(binary, (HELPER_SOURCE.stat().st_mtime + 10, HELPER_SOURCE.stat().st_mtime + 10))
+            with mock.patch("midi_bridge.midi.subprocess.run") as run:
+                self.assertEqual(helper_binary(build_dir), binary)
+            run.assert_not_called()
 
 
 class USBMidiTests(unittest.TestCase):
