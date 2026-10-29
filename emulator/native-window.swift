@@ -880,6 +880,18 @@ final class NativeApplication: NSObject, NSApplicationDelegate, NSWindowDelegate
                     try QMP.restoreUSB(socketPath: config.socket + ".qmp", imagePath: oldImage)
                     AppLog.log("usb hot attach: re-attached the previous stick")
                     message += "; re-attached the previous stick"
+                    // The eject made the guest unmount and unannounce the stick; the QMP restore only re-adds the
+                    // device, so ask the guest to mount and announce the restored stick again (a silent re-add
+                    // would leave it unmounted despite the "re-attached" report above).
+                    if let result = DataImage.requestControl(socketPath: config.socket + ".ctl",
+                                                             message: "usb-attach",
+                                                             until: ["usb-attached", "usb-error"], timeout: 30) {
+                        message += result == "usb-attached" ? "; the guest remounted the previous stick"
+                                                            : "; the guest could not remount the previous stick"
+                        AppLog.log("usb hot attach: restored stick usb-attach: \(result)")
+                    } else {
+                        message += "; the guest gave no reply to remounting the previous stick"
+                    }
                 } catch {
                     AppLog.log("usb hot attach: could not re-attach the previous stick: \(error)")
                     message += "; could not re-attach the previous stick either (retry ctl usb attach)"
