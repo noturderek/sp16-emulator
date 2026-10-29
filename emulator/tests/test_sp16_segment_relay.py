@@ -129,6 +129,82 @@ class RelayTests(unittest.TestCase):
                     proc.terminate()
                     proc.wait(timeout=5)
 
+    def test_relay_survives_backpressure_when_qemu_stops_reading(self):
+        port = free_udp_port()
+        group, mac = "230.0.0.1", "52:54:00:00:00:01"
+        with tempfile.TemporaryDirectory() as folder:
+            sock_path = os.path.join(folder, "relay.sock")
+            proc = subprocess.Popen([sys.executable, str(TOOLS / "net" / "segment_relay.py"),
+                                     "--socket", sock_path, "--target", f"{group}:{port}",
+                                     "--mac", mac, "--idle-timeout", "10"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            watcher = None
+            qemu = None
+            try:
+                deadline = time.time() + 5
+                while not os.path.exists(sock_path) and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(os.path.exists(sock_path), "relay socket did not appear")
+
+                watcher = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                watcher.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    watcher.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+                watcher.bind(("", port))
+                watcher.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                   socket.inet_aton(group) + socket.inet_aton("0.0.0.0"))
+
+                qemu = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                qemu.settimeout(5)
+                qemu.connect(sock_path)
+
+                # The guest never reads: flood the segment (a foreign MAC) so the relay must buffer for a stalled peer.
+                other = ethernet("52:54:00:00:00:02", bytes([0xBB] * 1200))
+                sent = 2000
+                for _ in range(sent):
+                    watcher.sendto(other, (group, port))
+                time.sleep(0.5)
+                self.assertIsNone(proc.poll(), "the relay crashed under backpressure")
+
+                # The guest now drains: every forwarded frame must arrive (buffering lost none).
+                qemu.settimeout(10)
+                got = 0
+                deadline = time.time() + 10
+                while got < sent and time.time() < deadline:
+                    try:
+                        recv_frame(qemu, timeout=1.0)
+                        got += 1
+                    except socket.timeout:
+                        break
+                self.assertGreaterEqual(got, 0.9 * sent, f"only {got}/{sent} frames arrived")
+
+                qemu.close()
+                qemu = None
+                self.assertEqual(proc.wait(timeout=5), 0)
+            finally:
+                if qemu is not None:
+                    qemu.close()
+                if watcher is not None:
+                    watcher.close()
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+    def test_flush_stream_buffers_a_full_socket_without_losing_bytes(self):
+        class Blocked:
+            def send(self, data):
+                raise BlockingIOError()
+        data = b"x" * 100
+        self.assertEqual(segment_relay.flush_stream(Blocked(), data), data)
+
+    def test_flush_stream_keeps_the_unsent_tail_of_a_partial_send(self):
+        class Partial:
+            def send(self, data):
+                return 10
+        self.assertEqual(segment_relay.flush_stream(Partial(), b"x" * 100), b"x" * 90)
+
 
 if __name__ == "__main__":
     unittest.main()

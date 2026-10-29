@@ -63,6 +63,18 @@ def join_group(port, group, iface=None):
     return sock
 
 
+def flush_stream(sock, buffer):
+    """Send `buffer` to the nonblocking stream `sock`; return the part not yet sent.
+
+    Backpressure (BlockingIOError / InterruptedError) is not an error: the caller keeps the remainder and retries when
+    the socket is writable again. A partial send keeps only the unsent tail."""
+    try:
+        sent = sock.send(buffer)
+    except (BlockingIOError, InterruptedError):
+        return buffer
+    return buffer[sent:] if sent > 0 else buffer
+
+
 def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.stderr):
     """Run until QEMU disconnects (returns 0) or no QEMU connects in `idle_timeout` (returns 1)."""
     group, port = parse_target(target)
@@ -106,8 +118,10 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
         qemu.setblocking(False)
         seg.setblocking(False)
         pending = b""
+        to_qemu = b""
         while True:
-            readable, _, _ = select.select([seg, qemu], [], [], 1.0)
+            writable = [qemu] if to_qemu else []
+            readable, ready_write, _ = select.select([seg, qemu], writable, [], 1.0)
             for ready in readable:
                 if ready is seg:
                     try:
@@ -124,7 +138,7 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
                     if own and frame[6:12].hex() == own:
                         continue  # our own send echoed back: never hand it to our guest
                     stats["to_guest"] += 1
-                    qemu.sendall(struct.pack(">I", len(frame)) + frame)
+                    to_qemu += struct.pack(">I", len(frame)) + frame
                 else:
                     try:
                         chunk = qemu.recv(65536)
@@ -147,6 +161,16 @@ def relay(sock_path, target, own_mac="", iface=None, idle_timeout=30.0, log=sys.
                                 continue
                             raise
                         stats["to_segment"] += 1
+            if ready_write and to_qemu:
+                # The guest has not kept up: only write when the socket is writable, keep the rest for the next
+                # writable turn instead of letting BlockingIOError end the relay.
+                try:
+                    to_qemu = flush_stream(qemu, to_qemu)
+                except OSError as err:
+                    if err.errno in transient:
+                        note("send", err)
+                    else:
+                        raise
             heartbeat()
     finally:
         if qemu is not None:
