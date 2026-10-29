@@ -237,6 +237,37 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(link.tempos), 2)  # the failed delivery was not remembered, so it retried
         self.assertIsNone(bridge._sent_bpm)
 
+    def test_bridge_retunes_the_generator_independent_of_link_delivery(self):
+        # Sol's sequence: 120 delivered, 140 fails, back to 120. The MIDI generator must follow every tempo change
+        # even when Link delivery fails, and only the delivered tempo may be cached (so a repeated 140 retries).
+        from midi import clock
+
+        class FlakyLink:
+            def __init__(self):
+                self.tempos = []
+                self.fail_next = False
+            def set_tempo(self, bpm):
+                self.tempos.append(bpm)
+                return not self.fail_next
+            def force_beat_at_time(self, beat, when, quantum):
+                pass
+        generator = clock.ClockGenerator(bpm=120.0)
+        link = FlakyLink()
+        bridge = pdl.PdlClockBridge(generator=generator, link=link)
+        bridge.feed_beat(beat_packet(120.0, 0.0, 1), 0.0)       # 120 delivered and cached
+        self.assertAlmostEqual(generator.bpm, 120.0, delta=0.01)
+        self.assertEqual(link.tempos, [120.0])
+        link.fail_next = True
+        bridge.feed_beat(beat_packet(140.0, 0.0, 2), 1.0)       # 140: delivery fails
+        self.assertAlmostEqual(generator.bpm, 140.0, delta=0.01)  # the generator still follows the change
+        self.assertEqual(len(link.tempos), 2)                     # 140 was attempted (and failed)
+        bridge.feed_beat(beat_packet(120.0, 0.0, 3), 2.0)       # back to 120
+        self.assertAlmostEqual(generator.bpm, 120.0, delta=0.01)  # not stuck at 140
+        self.assertAlmostEqual(bridge._sent_bpm, 120.0, delta=0.01)  # only what Link accepted is cached
+        self.assertEqual(len(link.tempos), 2)                     # 120 already held by Link: no re-delivery
+        bridge.feed_beat(beat_packet(140.0, 0.0, 4), 3.0)       # 140 again: retried, not gated off by the cache
+        self.assertEqual(len(link.tempos), 3)
+
     def test_bridge_forces_phase_on_the_downbeat(self):
         class FakeLink:
             def __init__(self):

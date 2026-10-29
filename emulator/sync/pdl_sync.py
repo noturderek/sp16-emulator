@@ -247,9 +247,10 @@ class PdlClockBridge:
         return int(time.monotonic() * 1e6)
 
     def _on_tempo(self, bpm: float) -> None:
+        if abs(self.generator.bpm - bpm) >= 1e-6:
+            self.generator.set_bpm(bpm)
         if self._sent_bpm is not None and abs(self._sent_bpm - bpm) < 1e-6:
-            return
-        self.generator.set_bpm(bpm)
+            return  # Link already has this tempo; nothing to deliver
         if self.link is not None and self.link.set_tempo(bpm) is not True:
             return  # not recorded, so the next packet with this BPM retries the delivery
         self._sent_bpm = bpm
