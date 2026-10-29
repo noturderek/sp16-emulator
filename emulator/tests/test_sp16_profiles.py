@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -277,6 +278,34 @@ class VersionDataTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     guest.stage_calibration(bad, profiles.legacy(), folder)
 
+    def test_guest_stages_default_settings_with_lcd_brightness_five(self):
+        spec = importlib.util.spec_from_file_location("guest_firmware_settings", TOOLS / "guest-firmware.py")
+        guest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guest)
+        profile = profiles.legacy()
+        settings = profile["settings"]
+        with tempfile.TemporaryDirectory() as folder:
+            data = guest.stage_settings(profile, folder).read_bytes()
+        # the layout the firmware itself saves: 8-byte header, 29 records of 0x8c bytes, sorted by id (4068 bytes)
+        self.assertEqual(data[:8], bytes.fromhex("8f9e7b2a04000100"))
+        self.assertEqual(len(data), 8 + 29 * 0x8c)
+        records = [data[8 + i * 0x8c:8 + (i + 1) * 0x8c] for i in range(29)]
+        ids = [struct.unpack_from("<i", r, 0)[0] for r in records]
+        self.assertEqual(ids, sorted(int(k) for k in settings["defaults"]))
+        values = {i: struct.unpack_from("<i", r, 0x88)[0] for i, r in zip(ids, records)}
+        self.assertEqual(values[5], 5)                       # LCD BRIGHTNESS: the brightest step, not the default 3
+        self.assertEqual(struct.unpack_from("<i", data, 424)[0], 5)   # file offset of id 5's value in a full save
+        self.assertEqual({k: v for k, v in values.items() if k != 5},
+                         {int(k): v for k, v in settings["defaults"].items() if k != "5"})
+        no_settings = copy.deepcopy(profile)
+        del no_settings["settings"]
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertIsNone(guest.stage_settings(no_settings, folder))
+
+    def test_shipped_profiles_keep_the_settings_seed(self):
+        self.assertIn("settings", profiles.RUNTIME_FIELDS)
+        self.assertEqual(native.shipped_profile(profiles.legacy())["settings"]["seed"], {"5": 5})
+
     def test_enter_cwd_comes_from_the_profile(self):
         import enter
         with mock.patch.dict(os.environ, {"SP16_APP_CWD": "/root/pdj"}):
@@ -296,6 +325,16 @@ class ProfileValidationTests(unittest.TestCase):
         mutate(profile)
         with self.assertRaises(ValueError):
             profiles.validate(profile)
+
+    def test_rejects_malformed_settings(self):
+        def mutations():
+            yield lambda p: p["settings"].update(path="relative/file")
+            yield lambda p: p["settings"].update(header="xyz")
+            yield lambda p: p["settings"].update(value_offset=200)
+            yield lambda p: p["settings"].update(seed={"99": 5})          # a seed for an id the firmware has no default for
+            yield lambda p: p["settings"]["defaults"].update({"x": 1})
+        for mutate in mutations():
+            self.check_invalid(mutate)
 
     def test_rejects_malformed_profiles(self):
         self.check_invalid(lambda p: p.update(status="trusted"))
